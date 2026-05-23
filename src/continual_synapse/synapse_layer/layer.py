@@ -35,6 +35,11 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from continual_synapse.synapse_layer.topk import (
+    apply_topk_mask_inplace,
+    compute_topk_mask,
+)
+
 
 _EVIDENCE_NORM_EPS = 1e-6
 
@@ -67,6 +72,8 @@ class SynapseLayer(nn.Module):
         n_neurons: int,
         learning_rate: float = 1e-3,
         resistance_beta: float = 0.0,
+        sparse: bool = False,
+        top_k: int = 64,
     ) -> None:
         super().__init__()
         if n_neurons <= 0:
@@ -79,9 +86,13 @@ class SynapseLayer(nn.Module):
             raise ValueError(
                 f"resistance_beta must be >= 0, got {resistance_beta}"
             )
+        if top_k <= 0:
+            raise ValueError(f"top_k must be positive, got {top_k}")
         self.n_neurons = n_neurons
         self.learning_rate = float(learning_rate)
         self.resistance_beta = float(resistance_beta)
+        self.sparse = bool(sparse)
+        self.top_k = int(top_k)
 
         zeros_f = torch.zeros(n_neurons, n_neurons, dtype=torch.float32)
         zeros_l = torch.zeros(n_neurons, n_neurons, dtype=torch.long)
@@ -152,6 +163,24 @@ class SynapseLayer(nn.Module):
         self._prev_abs_outer.copy_(abs_outer)
         self.global_step.add_(1)
 
+        # ---- sparse eviction after every update ----
+        # Mask is computed from the *post-update* strengths so that
+        # eviction reflects what the synapse layer most recently
+        # learned, not what it knew before this batch.
+        if self.sparse and self.top_k < self.n_neurons:
+            mask = compute_topk_mask(self.strengths, self.top_k)
+            apply_topk_mask_inplace(
+                [
+                    self.strengths,
+                    self.evidence,
+                    self.confidence,
+                    self.age,
+                    self.access_count,
+                    self._prev_abs_outer,
+                ],
+                mask,
+            )
+
     @torch.no_grad()
     def record_access(
         self, features: torch.Tensor, threshold: float = 1e-3
@@ -192,9 +221,13 @@ class SynapseLayer(nn.Module):
                 getattr(self, buf_name).zero_()
 
     def extra_repr(self) -> str:
+        sparsity = (
+            f"sparse=True, top_k={self.top_k}" if self.sparse else "sparse=False"
+        )
         return (
             f"n_neurons={self.n_neurons}, "
             f"learning_rate={self.learning_rate}, "
             f"resistance_beta={self.resistance_beta}, "
+            f"{sparsity}, "
             f"global_step={int(self.global_step.item())}"
         )

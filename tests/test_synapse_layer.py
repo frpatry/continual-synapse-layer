@@ -356,6 +356,101 @@ def test_record_access_validates_shape() -> None:
         layer.record_access(torch.zeros(2, 5))
 
 
+# ---- Phase 3 follow-up: sparse top-k partner selection ----
+
+
+def test_sparse_false_unchanged() -> None:
+    """sparse=False default reproduces dense behaviour bit-for-bit."""
+    g = torch.Generator().manual_seed(0)
+    a = torch.randn(8, 5, generator=g)
+
+    dense = SynapseLayer(n_neurons=5, learning_rate=0.1)
+    sparse_off = SynapseLayer(n_neurons=5, learning_rate=0.1, sparse=False)
+    for _ in range(3):
+        dense.consolidate(a)
+        sparse_off.consolidate(a)
+    torch.testing.assert_close(dense.strengths, sparse_off.strengths)
+    torch.testing.assert_close(dense.evidence, sparse_off.evidence)
+
+
+def test_sparse_top_k_equal_to_n_is_dense() -> None:
+    """sparse=True with top_k=n keeps everything; equivalent to dense."""
+    g = torch.Generator().manual_seed(1)
+    a = torch.randn(6, 4, generator=g)
+
+    dense = SynapseLayer(n_neurons=4, learning_rate=0.1)
+    sparse = SynapseLayer(
+        n_neurons=4, learning_rate=0.1, sparse=True, top_k=4
+    )
+    for _ in range(3):
+        dense.consolidate(a)
+        sparse.consolidate(a)
+    torch.testing.assert_close(dense.strengths, sparse.strengths)
+
+
+def test_sparse_keeps_at_most_k_partners_per_row() -> None:
+    layer = SynapseLayer(
+        n_neurons=8, learning_rate=0.5, sparse=True, top_k=3
+    )
+    g = torch.Generator().manual_seed(2)
+    for _ in range(5):
+        layer.consolidate(torch.randn(16, 8, generator=g))
+    non_zero_per_row = (layer.strengths != 0).sum(dim=1)
+    assert torch.all(non_zero_per_row <= 3)
+
+
+def test_sparse_evicts_weakest_partner() -> None:
+    """A new strong co-activation should displace the weakest partner."""
+    layer = SynapseLayer(
+        n_neurons=4, learning_rate=1.0, sparse=True, top_k=2
+    )
+    # Hand-place strengths so partners (0,1) and (0,2) are weak (~0.1, 0.2)
+    # and (0,0), (0,3) are zero. The next consolidate should fill (0,0)
+    # and (0,3) with strong co-activations and evict (0,1), (0,2).
+    with torch.no_grad():
+        layer.strengths[0, 1] = 0.1
+        layer.strengths[0, 2] = 0.2
+        # Pre-populate matching evidence so the resistance path also
+        # has consistent state.
+        layer.evidence[0, 1] = 0.1
+        layer.evidence[0, 2] = 0.2
+    # Activations: neuron 0 fires strongly with 3, very weakly with 1, 2.
+    a = torch.tensor([[3.0, 0.01, 0.01, 3.0]])
+    layer.consolidate(a)
+    row0 = layer.strengths[0]
+    # Top-2 should now be the new (0, 0) and (0, 3) co-activations.
+    assert row0[0] != 0
+    assert row0[3] != 0
+    assert row0[1] == 0  # evicted
+    assert row0[2] == 0  # evicted
+    # All co-state for evicted positions should also be zero.
+    assert layer.evidence[0, 1] == 0
+    assert layer.evidence[0, 2] == 0
+
+
+def test_sparse_state_buffers_all_zero_where_strengths_zero() -> None:
+    """After an eviction every state field follows the strength mask."""
+    layer = SynapseLayer(
+        n_neurons=6, learning_rate=0.1, sparse=True, top_k=2
+    )
+    g = torch.Generator().manual_seed(3)
+    for _ in range(4):
+        layer.consolidate(torch.randn(8, 6, generator=g))
+    mask = layer.strengths != 0
+    for name in ("evidence", "confidence", "_prev_abs_outer"):
+        buf = getattr(layer, name)
+        # Wherever strength is zero, the other float buffers are zero.
+        assert torch.all(buf[~mask] == 0), name
+    for name in ("age", "access_count"):
+        buf = getattr(layer, name)
+        assert torch.all(buf[~mask] == 0), name
+
+
+def test_constructor_rejects_bad_top_k() -> None:
+    with pytest.raises(ValueError, match="top_k"):
+        SynapseLayer(n_neurons=8, top_k=0)
+
+
 def test_reset_clears_all_phase3_buffers() -> None:
     layer = SynapseLayer(n_neurons=2)
     layer.consolidate(torch.tensor([[1.0, 1.0]]))
