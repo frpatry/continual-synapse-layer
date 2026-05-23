@@ -141,3 +141,100 @@ def test_to_device_moves_buffers() -> None:
     moved = layer.to(torch.device("cpu"))  # CPU is the available device in CI
     assert moved.strengths.device.type == "cpu"
     assert moved.global_step.device.type == "cpu"
+    assert moved.evidence.device.type == "cpu"
+
+
+# ---- Phase 3: evidence buffer + resistance ----
+
+
+def test_evidence_initialised_to_zero() -> None:
+    layer = SynapseLayer(n_neurons=4)
+    assert layer.evidence.shape == (4, 4)
+    assert torch.all(layer.evidence == 0.0)
+
+
+def test_evidence_accumulates_absolute_co_activations() -> None:
+    """Evidence ← mean_b(|a_i| · |a_j|), regardless of sign."""
+    layer = SynapseLayer(n_neurons=3, learning_rate=0.1)
+    a = torch.tensor([[1.0, -2.0, 0.0]])
+    layer.consolidate(a)
+    expected = a.abs().transpose(-1, -2) @ a.abs() / a.shape[0]
+    torch.testing.assert_close(layer.evidence, expected)
+
+
+def test_evidence_grows_monotonically() -> None:
+    layer = SynapseLayer(n_neurons=3, learning_rate=0.1)
+    g = torch.Generator().manual_seed(0)
+    layer.consolidate(torch.randn(8, 3, generator=g))
+    snapshot = layer.evidence.clone()
+    layer.consolidate(torch.randn(8, 3, generator=g))
+    # Strict inequality everywhere both batches had non-zero activations,
+    # weak inequality otherwise. Either way: never decreases.
+    assert torch.all(layer.evidence >= snapshot)
+
+
+def test_beta_zero_strength_update_matches_v1_exactly() -> None:
+    """With β=0 the strength path is bit-identical to Phase 2 v1."""
+    g = torch.Generator().manual_seed(1)
+    a = torch.randn(16, 5, generator=g)
+
+    layer = SynapseLayer(n_neurons=5, learning_rate=0.05, resistance_beta=0.0)
+    layer.consolidate(a)
+
+    # Hand-computed v1 update:
+    expected = 0.05 * (a.transpose(-1, -2) @ a) / a.shape[0]
+    torch.testing.assert_close(layer.strengths, expected)
+
+
+def test_resistance_dampens_high_evidence_updates() -> None:
+    """A synapse with high evidence gets a smaller update than a fresh one."""
+    layer = SynapseLayer(n_neurons=2, learning_rate=1.0, resistance_beta=1.0)
+    # Manually pre-load evidence to put one entry far above the other.
+    with torch.no_grad():
+        layer.evidence[0, 0] = 10.0  # 1/(1+1*10) = 1/11 resistance factor
+        layer.evidence[1, 1] = 0.0   # full update on this position
+
+    a = torch.tensor([[1.0, 1.0]])
+    layer.consolidate(a, reward=1.0)
+
+    # raw_outer is all-ones for this input; expected[0,0] = 1/11,
+    # expected[1,1] = 1, expected[0,1] = 1/(1+5) = 1/6 (mean evidence ~5).
+    s = layer.strengths
+    assert s[1, 1].item() > s[0, 0].item()  # high-evidence resists more
+    assert abs(s[0, 0].item() - 1.0 / 11.0) < 1e-5
+    assert abs(s[1, 1].item() - 1.0) < 1e-5
+
+
+def test_resistance_reduces_cumulative_drift() -> None:
+    """Over many updates, β>0 must keep strength magnitudes smaller than β=0."""
+    g = torch.Generator().manual_seed(2)
+    activations = [torch.randn(16, 4, generator=g) for _ in range(50)]
+
+    layer_off = SynapseLayer(
+        n_neurons=4, learning_rate=0.1, resistance_beta=0.0
+    )
+    layer_on = SynapseLayer(
+        n_neurons=4, learning_rate=0.1, resistance_beta=1.0
+    )
+    for a in activations:
+        layer_off.consolidate(a)
+        layer_on.consolidate(a)
+
+    # Both saw identical inputs; resistance must produce smaller strengths.
+    assert layer_on.strengths.abs().max() < layer_off.strengths.abs().max()
+    # Evidence accumulation is identical for both (resistance does not
+    # affect the evidence path).
+    torch.testing.assert_close(layer_on.evidence, layer_off.evidence)
+
+
+def test_constructor_rejects_negative_beta() -> None:
+    with pytest.raises(ValueError, match="resistance_beta"):
+        SynapseLayer(n_neurons=3, resistance_beta=-0.1)
+
+
+def test_reset_clears_evidence_too() -> None:
+    layer = SynapseLayer(n_neurons=3, resistance_beta=0.5)
+    layer.consolidate(torch.tensor([[1.0, 1.0, 1.0]]))
+    assert torch.any(layer.evidence != 0.0)
+    layer.reset()
+    assert torch.all(layer.evidence == 0.0)

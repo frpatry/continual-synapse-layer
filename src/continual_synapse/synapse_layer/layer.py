@@ -1,32 +1,33 @@
-"""SynapseLayer v1 — dense Hebbian state container.
+"""SynapseLayer — dense Hebbian state container with evidence-based resistance.
 
-This is the first iteration of the synapse layer described in
-DESIGN.md section 3.2. The Phase-2 spec is intentionally minimal:
+Evolves from the Phase-2 v1 (strength only, no resistance, fixed
+reward) toward the full Phase-3 design described in DESIGN.md
+section 3.2. This iteration adds:
 
-- Dense ``n × n`` strength matrix. Sparse top-k partner selection
-  is deferred to Phase 3.
-- A single state field (``strength``). ``confidence``, ``evidence``,
-  ``age``, and ``access_count`` are deferred to Phase 3.
-- Hebbian update with a fixed reward of 1.0. The reward signal
-  system is deferred to Phase 3.
-- Updates are triggered explicitly by calling :meth:`consolidate`
-  from the training loop. Pressure-based automatic triggering is
-  deferred to Phase 4.
+- An ``evidence`` buffer per connection, accumulating the magnitude
+  of co-activations seen.
+- An evidence-based resistance term in the update rule:
+  ``Δs_ij = η · R · a_i · a_j / (1 + β · evidence_ij)``. High-evidence
+  synapses resist further change, which is the primary mechanism
+  meant to address the Phase-2 failure mode where the synapse
+  layer simply tracked the latest task.
 
-The module is deliberately split from the read-out side (the
-:mod:`continual_synapse.synapse_layer.modulation` module): this
-class only holds state and updates it. Producing a correction
-vector from the state belongs to the modulator. This keeps the
-state representation independent of the modulation strategy and
-makes both pieces easier to ablate.
+Still deferred to follow-up work in Phase 3:
 
-Update rule (DESIGN.md eq. (3.2), with ``β=0`` for v1)::
+- ``confidence``, ``age``, ``access_count`` state fields.
+- Sparse top-k partner selection.
 
-    Δs_ij = (η / B) · R · Σ_b a_{b,i} · a_{b,j}
+The module remains a state container only: it never produces a
+correction vector. Read-out is the modulator's job.
 
-i.e. the batch-mean outer product of activations, scaled by
-learning rate and reward. The batch-mean form keeps the update
-magnitude independent of batch size.
+Update rule (DESIGN.md eq. 3.2)::
+
+    Δs_ij = (η / B) · R · Σ_b a_{b,i} · a_{b,j} · 1 / (1 + β · E_ij)
+    E_ij  ← E_ij + Σ_b |a_{b,i}| · |a_{b,j}| / B
+
+With ``β = 0`` (the default) the strength update is exactly
+identical to Phase 2 v1 — making this change a strict superset.
+Evidence still accumulates so callers can inspect it.
 """
 
 from __future__ import annotations
@@ -36,32 +37,30 @@ from torch import nn
 
 
 class SynapseLayer(nn.Module):
-    """Dense Hebbian state for an ``n``-neuron activation vector.
+    """Dense Hebbian state with optional evidence-based resistance.
 
-    The module holds two buffers:
+    Buffers (all ``(n, n)`` unless noted, float32 unless noted):
 
-    - ``strengths``: ``(n, n)`` float32. ``strengths[j, i]`` is the
-      learned weight of the connection from neuron ``j`` to neuron
-      ``i``. Initialised to zero so the layer has no effect at start.
-    - ``global_step``: long scalar, incremented once per call to
-      :meth:`consolidate`. Useful for logging and for later phases'
-      age-based logic.
-
-    The module is registered as an ``nn.Module`` so its buffers
-    follow standard PyTorch device / dtype semantics (``.to(...)``,
-    ``state_dict``, etc.). It deliberately does **not** override
-    ``forward``: SynapseLayer is a state container, not a layer that
-    transforms activations. Read-out is the modulator's job.
+    - ``strengths``: learned Hebbian weights.
+    - ``evidence``: accumulated co-activation magnitude.
+    - ``global_step``: long scalar; number of ``consolidate`` calls.
 
     Args:
-        n_neurons: Width of the activation vector this layer
-            observes. Equal to the hooked module's output dim.
-        learning_rate: ``η`` in the update rule. The Phase-2 spec
-            recommends starting small (``1e-3``) to keep the layer
-            from destabilising the base model.
+        n_neurons: Width of the activation vector this layer observes.
+        learning_rate: ``η`` in the update rule.
+        resistance_beta: ``β``. With ``0`` (the default) the layer
+            behaves like Phase-2 v1 — evidence accumulates but does
+            not affect updates, so existing experiments remain
+            reproducible. Increase β to make high-evidence synapses
+            harder to overwrite.
     """
 
-    def __init__(self, n_neurons: int, learning_rate: float = 1e-3) -> None:
+    def __init__(
+        self,
+        n_neurons: int,
+        learning_rate: float = 1e-3,
+        resistance_beta: float = 0.0,
+    ) -> None:
         super().__init__()
         if n_neurons <= 0:
             raise ValueError(f"n_neurons must be positive, got {n_neurons}")
@@ -69,10 +68,18 @@ class SynapseLayer(nn.Module):
             raise ValueError(
                 f"learning_rate must be positive, got {learning_rate}"
             )
+        if resistance_beta < 0:
+            raise ValueError(
+                f"resistance_beta must be >= 0, got {resistance_beta}"
+            )
         self.n_neurons = n_neurons
         self.learning_rate = float(learning_rate)
+        self.resistance_beta = float(resistance_beta)
         self.register_buffer(
             "strengths", torch.zeros(n_neurons, n_neurons, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "evidence", torch.zeros(n_neurons, n_neurons, dtype=torch.float32)
         )
         self.register_buffer(
             "global_step", torch.zeros((), dtype=torch.long)
@@ -82,21 +89,20 @@ class SynapseLayer(nn.Module):
     def consolidate(
         self, activations: torch.Tensor, reward: float = 1.0
     ) -> None:
-        """Apply a single Hebbian update from a batch of activations.
+        """Apply a single Hebbian update with optional resistance.
 
         Args:
-            activations: ``(B, n_neurons)`` tensor of activations
-                observed for this batch. The caller is responsible
-                for detaching from the autograd graph (the
-                :class:`ActivationCapture` helper does this by
-                default).
+            activations: ``(B, n_neurons)`` tensor of activations.
+                Caller is responsible for detaching from autograd.
             reward: Scalar reward modulating the update magnitude.
-                Phase 2 uses a fixed ``1.0``; later phases compute a
-                real reward signal.
 
-        The update is computed in float32 regardless of the input
-        dtype to keep the running strength buffer well-conditioned
-        when the base model uses lower precision.
+        Order of operations is deliberate:
+
+        1. Compute the resistance factor from *current* evidence.
+           A synapse's resistance reflects what it has already
+           learned, not what the present update is about to teach.
+        2. Apply the resisted update to ``strengths``.
+        3. Grow ``evidence`` with the new co-activation magnitudes.
         """
         if activations.ndim != 2:
             raise ValueError(
@@ -112,19 +118,37 @@ class SynapseLayer(nn.Module):
             return
 
         a = activations.detach().to(self.strengths.dtype)
-        outer = a.transpose(-1, -2) @ a / a.shape[0]
-        self.strengths.add_(outer, alpha=self.learning_rate * float(reward))
+        batch_size = a.shape[0]
+        raw_outer = a.transpose(-1, -2) @ a / batch_size
+        abs_outer = a.abs().transpose(-1, -2) @ a.abs() / batch_size
+
+        if self.resistance_beta == 0.0:
+            # Fast path identical to v1; preserves the Phase-2
+            # numerical behaviour bit-for-bit.
+            self.strengths.add_(
+                raw_outer, alpha=self.learning_rate * float(reward)
+            )
+        else:
+            resistance = 1.0 / (1.0 + self.resistance_beta * self.evidence)
+            self.strengths.add_(
+                raw_outer * resistance,
+                alpha=self.learning_rate * float(reward),
+            )
+
+        self.evidence.add_(abs_outer)
         self.global_step.add_(1)
 
     def reset(self) -> None:
-        """Zero strengths and global_step. Used in tests and ablations."""
+        """Zero all buffers. Used in tests and ablations."""
         with torch.no_grad():
             self.strengths.zero_()
+            self.evidence.zero_()
             self.global_step.zero_()
 
     def extra_repr(self) -> str:
         return (
             f"n_neurons={self.n_neurons}, "
             f"learning_rate={self.learning_rate}, "
+            f"resistance_beta={self.resistance_beta}, "
             f"global_step={int(self.global_step.item())}"
         )
