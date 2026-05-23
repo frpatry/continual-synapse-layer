@@ -6,6 +6,137 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-23] Phase 2: SynapseLayer v1
+
+This session implemented the first iteration of the additive
+synapse layer, the gated modulator, the augmented model wrapper,
+and experiment 03. The numbers say v1 does not yet beat baseline;
+the Phase-2 checkpoint criteria are still met. Phase 3 will
+revisit performance once metacognition is in place.
+
+### State and read-out are separate modules
+
+**Decision:** Split the synapse system into two cooperating
+modules — `SynapseLayer` holds state (the strength matrix and
+global step counter); `SynapseModulation` reads state to produce
+a correction. Neither is a "synapse layer" on its own.
+
+**Alternatives considered:**
+- One monolithic `SynapseLayer` whose `forward(x)` returns the
+  corrected activations. Conflates two independently-ablatable
+  choices (what to store vs. how to read it).
+- Subclassing the base MLP. Forces inheritance and ties the synapse
+  design to a specific backbone shape.
+
+**Rationale:** Phase 3 introduces confidence, evidence, and sparse
+top-k, all of which are state-side changes. Phase 4 may try other
+read-out strategies (e.g., dot-product against archived clusters)
+without touching state. Keeping them in separate modules means
+each phase can ablate one axis at a time.
+
+### `gate=0` at init guarantees identical-to-baseline behaviour
+
+**Decision:** The modulator gate is a scalar `nn.Parameter`
+initialised to `0.0`. Combined with `strengths=0` at init, the
+correction is exactly zero on the very first forward pass.
+
+**Rationale:** The user instruction was explicit ("Initialize near
+zero so base model behavior is preserved at init"). A literal zero
+is the strongest guarantee available and makes the
+identical-to-base test bit-exact rather than approximate. The gate
+unfreezes naturally on the second batch once the first Hebbian
+update gives the strengths some signal; the result is a clean
+"start as baseline, then deviate" trajectory.
+
+**Trade-off:** One batch of delay before the gate can move. In
+practice the delay is invisible — far smaller than the time it
+takes for either the gate or the strengths to reach a useful scale.
+
+### Manual `consolidate()` over hidden side-effects
+
+**Decision:** `SynapseLayer.consolidate(activations, reward=1.0)`
+must be called explicitly by the training loop. The Phase-2 spec
+calls this out ("Update triggered manually for now").
+
+**Rationale:** Hidden side-effects (e.g., the synapse updating
+inside `forward`) make the code harder to read and test, and they
+prevent evaluation passes — where we don't want to update the
+synapse — from sharing the same forward path. The explicit call
+also gives Phase 3 an obvious place to plug the reward signal.
+
+### `on_after_batch` runner hook over a SynapseRunner subclass
+
+**Decision:** Add a third callback to `ContinualRunner`:
+`on_after_batch(i, task, model, x, y)`, fired after every
+optimizer step. The augmented model wires it to
+`apply_hebbian_update()`.
+
+**Alternatives considered:**
+- Subclass `ContinualRunner` to a `SynapseRunner`. Duplicates the
+  batch loop and prevents composing EWC + synapse cleanly later.
+- Make the augmented model trigger updates internally via a flag
+  on `forward`. Mixes inference and training paths.
+
+**Rationale:** Three small callbacks (`regulariser`, `on_task_end`,
+`on_after_batch`) cover EWC, Hebbian updates, and any future
+per-batch / per-task method we need. Phase 3 will likely add no
+new hook points.
+
+### No strength clipping in v1
+
+**Decision:** No clipping or saturating function on
+`SynapseLayer.strengths`. Numerical stability is guarded by a
+small default `learning_rate=1e-3` plus the stability test that
+runs 100 updates and asserts strengths stay finite.
+
+**Rationale:** Clipping hides bugs. The Phase-2 spec assumes
+small learning rates; the experiment 03 sweep below shows the
+strength range moves with `synapse_lr` exactly as expected.
+Phase 3's evidence-based resistance (`1 / (1 + β · evidence)`)
+will provide a principled self-saturating mechanism.
+
+### Hebbian observes pre-correction features
+
+**Decision:** The features fed into the synapse's Hebbian update
+are the *pre-correction* base output, not the post-correction
+activations used by the classifier head.
+
+**Rationale:** If the synapse observed its own correction, the
+update would self-reinforce: high gate × high strengths →
+larger correction → larger reported activations → larger update,
+ad infinitum. Observing the raw base activations breaks the loop
+and matches DESIGN.md ("Hooks into a chosen layer of the base
+model"). The unit test
+`test_apply_hebbian_update_uses_pre_correction_features` locks
+this in.
+
+### v1 numbers honestly do not beat baseline
+
+**Observation:** On a single seed with `epochs_per_task=2`:
+
+| Method (lr / λ / synapse_lr) | ACC | FGT |
+|---|---|---|
+| Naive | 0.604 | 0.483 |
+| EWC, λ=1000 | 0.636 | 0.434 |
+| EWC, λ=100000 | 0.493 | 0.254 (plasticity collapse) |
+| Synapse v1, synapse_lr=1e-6 (inert) | 0.604 | 0.483 |
+| Synapse v1, synapse_lr=1e-4 | 0.608 | 0.480 |
+| Synapse v1, synapse_lr=1e-3 | 0.578 | 0.521 |
+| Synapse v1, synapse_lr=5e-3 | 0.529 | 0.581 |
+
+The dense-Hebbian-with-fixed-reward formulation has no incentive
+to preserve past tasks; it simply records co-firing of whatever
+the current task is producing. Without confidence-based resistance
+(Phase 3) the synapse correction follows the latest task and
+slightly *amplifies* the forgetting of older tasks.
+
+This is what the Phase-2 spec predicts ("Does the synapse layer
+measurably affect output? Yes. Reduce forgetting yet? Not
+necessarily."). Recording it here so Phase 3 can use the gap as a
+quantitative baseline to beat.
+
+---
+
 ## [2026-05-23] Phase 1 close-out: EWC, experiments, CI, README
 
 This session closed the remaining Phase 1 deliverables.
