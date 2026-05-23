@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "continual-synapse-layer"
+version = "0.0.1"
+description = "Additive synapse layer for continual learning."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Francois Patry" }]
+
+dependencies = [
+    "torch==2.12.0",
+    "transformers==4.57.1",
+    "datasets==4.0.0",
+    "chromadb==1.2.1",
+    "numpy==2.4.6",
+    "scipy==1.16.3",
+    "matplotlib==3.10.7",
+    "seaborn==0.13.2",
+    "tqdm==4.67.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+    "jupyter==1.1.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
