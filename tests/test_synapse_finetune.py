@@ -228,6 +228,170 @@ def test_explicit_reward_overrides_computer() -> None:
     assert calls == []  # computer not invoked
 
 
+# ---- Phase 4: cold storage integration ----
+
+
+def _build_with_cold_storage(
+    *,
+    threshold: float = 0.0,
+    quantile: float = 0.25,
+    collection: str = "aug_cold_test",
+):
+    from continual_synapse.cold_storage.store import ColdStorage
+    from continual_synapse.consolidation.trigger import ConsolidationTrigger
+
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=8, learning_rate=0.1)
+    store = ColdStorage(collection_name=collection)
+    trigger = ConsolidationTrigger(
+        avg_pressure_threshold=threshold,
+        min_steps_between=0,
+        candidate_quantile=quantile,
+    )
+    aug = SynapseAugmentedMLP(
+        base,
+        synapse,
+        SynapseModulation(init_gate=0.5),
+        cold_storage=store,
+        consolidation_trigger=trigger,
+        retrieval_k=2,
+    )
+    return aug, store, trigger
+
+
+def test_cold_storage_off_preserves_existing_behaviour() -> None:
+    """Without cold_storage configured, the model matches Phase-3 behaviour bit-for-bit."""
+    set_seed(0)
+    a, _ = _build_augmented(init_gate=0.5)
+    x = torch.randn(3, 4)
+    with torch.no_grad():
+        a.synapse.strengths.fill_(0.1)
+    out_no_cs = a(x).clone()
+
+    set_seed(0)
+    b, _ = _build_augmented(init_gate=0.5)
+    with torch.no_grad():
+        b.synapse.strengths.fill_(0.1)
+    # b also has cold_storage=None by construction; output must match exactly.
+    torch.testing.assert_close(b(x), out_no_cs)
+
+
+def test_cold_storage_with_empty_store_does_not_affect_forward() -> None:
+    """Empty cold store -> reconstruction returns zeros -> forward unchanged."""
+    aug, store, _ = _build_with_cold_storage(collection="aug_cold_empty")
+    assert store.count() == 0
+    x = torch.randn(2, 4)
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(0.05)
+    out_with_empty = aug(x).clone()
+
+    # Compare against a fresh aug with no cold storage at all.
+    set_seed(0)
+    base = MLPClassifier(MLPConfig(input_dim=4, hidden_dim=8, num_classes=2))
+    syn = SynapseLayer(n_neurons=8, learning_rate=0.1)
+    plain = SynapseAugmentedMLP(base, syn, SynapseModulation(init_gate=0.5))
+    with torch.no_grad():
+        plain.synapse.strengths.fill_(0.05)
+    # Note: the two models have different base parameters (different
+    # construction order means different RNG state). We can't compare
+    # outputs directly; instead, check the cold-storage path is
+    # functionally inert by comparing aug to itself with cold_storage=None.
+    plain_cs = aug.cold_storage
+    aug.cold_storage = None
+    out_no_cs = aug(x).clone()
+    aug.cold_storage = plain_cs
+
+    torch.testing.assert_close(out_with_empty, out_no_cs)
+
+
+def test_consolidation_fires_when_trigger_says_so() -> None:
+    aug, store, _ = _build_with_cold_storage(
+        threshold=0.0, collection="aug_cold_fire"
+    )
+    # Pre-populate the synapse with high-pressure state.
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(2.0)
+        aug.synapse.evidence.fill_(2.0)
+        aug.synapse.global_step.fill_(50)
+
+    aug(torch.randn(2, 4))
+    aug.apply_hebbian_update()
+    assert aug.consolidation_count == 1
+    assert store.count() == 1
+
+
+def test_no_consolidation_when_trigger_or_store_missing() -> None:
+    """Consolidation requires both cold_storage and consolidation_trigger."""
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=8, learning_rate=0.1)
+    # No trigger -> no consolidation even when store present.
+    from continual_synapse.cold_storage.store import ColdStorage
+
+    store = ColdStorage(collection_name="aug_no_trigger")
+    aug = SynapseAugmentedMLP(
+        base, synapse, SynapseModulation(init_gate=0.0), cold_storage=store
+    )
+    aug(torch.randn(2, 4))
+    aug.apply_hebbian_update()
+    assert aug.consolidation_count == 0
+    assert store.count() == 0
+
+
+def test_cold_storage_alters_forward_after_consolidation() -> None:
+    """Once an entry lives in cold storage, the retrieved strengths reach
+    the modulator and change the output for a similar query."""
+    aug, store, _ = _build_with_cold_storage(
+        threshold=0.0,
+        quantile=1.0,  # archive everything for a definitive test
+        collection="aug_cold_alters",
+    )
+    # Build a clear archived pattern: large strengths, all zero before.
+    with torch.no_grad():
+        aug.synapse.strengths.copy_(torch.full((8, 8), 0.5))
+        aug.synapse.evidence.copy_(torch.full((8, 8), 1.0))
+        aug.synapse.global_step.fill_(100)
+
+    x = torch.randn(2, 4)
+    aug(x)
+    aug.apply_hebbian_update()
+    assert store.count() == 1
+    # After consolidation, synapse strengths were drained (the entire
+    # tensor was a candidate at quantile=1.0).
+    assert torch.all(aug.synapse.strengths == 0)
+
+    # New forward: retrieval should bring something back through the
+    # modulator. Compare against a fresh model with no cold storage:
+    # same drained synapse strengths but the cold-storage retrieval is
+    # active here.
+    out_with_cs = aug(x).clone()
+    aug.cold_storage = None
+    out_no_cs = aug(x).clone()
+
+    # The retrieval-augmented forward differs from the plain forward
+    # because retrieved strengths get added before the modulator.
+    assert not torch.allclose(out_with_cs, out_no_cs)
+
+
+def test_retrieval_k_validated() -> None:
+    from continual_synapse.cold_storage.store import ColdStorage
+
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    base = MLPClassifier(cfg)
+    syn = SynapseLayer(n_neurons=8)
+    with pytest.raises(ValueError, match="retrieval_k"):
+        SynapseAugmentedMLP(
+            base,
+            syn,
+            SynapseModulation(),
+            cold_storage=ColdStorage(collection_name="aug_k_validation"),
+            retrieval_k=0,
+        )
+
+
 def test_runner_end_to_end_with_synapse_smoke() -> None:
     """End-to-end: the synapse-augmented MLP trains without crashing and
     the strengths grow as Hebbian updates accumulate."""
