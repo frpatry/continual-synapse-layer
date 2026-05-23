@@ -496,6 +496,156 @@ def test_retrieval_k_validated() -> None:
         )
 
 
+# ---- Phase 4b follow-up: multi-pass wiring ----
+
+
+def test_n_passes_default_one_is_bit_exact() -> None:
+    """Default n_passes=1 reproduces single-pass behaviour bit-exact."""
+    set_seed(0)
+    a, _ = _build_augmented(init_gate=0.0, lr_synapse=0.1)
+    a.train()
+    x = torch.randn(4, 4)
+    a(x)
+    a.apply_hebbian_update()
+    legacy_strengths = a.synapse.strengths.clone()
+
+    # Same configuration with explicit n_passes=1.
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    base_copy_state = base.state_dict()
+    synapse_b = SynapseLayer(n_neurons=8, learning_rate=0.1, n_passes=1)
+    new = SynapseAugmentedMLP(
+        base, synapse_b, SynapseModulation(init_gate=0.0)
+    )
+    new.train()
+    # Reset to identical RNG-derived starting state.
+    new.base.load_state_dict(base_copy_state)
+    new(x)
+    new.apply_hebbian_update()
+    torch.testing.assert_close(new.synapse.strengths, legacy_strengths)
+
+
+def test_n_passes_does_not_observe_in_eval_mode() -> None:
+    """Multi-pass only applies during training; eval forwards must
+    leave the observation buffer empty so the model can be evaluated
+    without polluting synapse state."""
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=8, n_passes=5)
+    aug = SynapseAugmentedMLP(base, synapse, SynapseModulation(), n_passes=5)
+    aug.eval()
+    aug(torch.randn(2, 4))
+    assert synapse.buffer_size == 0
+
+
+def test_n_passes_observes_buffer_in_training_mode() -> None:
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=8, n_passes=3)
+    aug = SynapseAugmentedMLP(base, synapse, SynapseModulation(), n_passes=3)
+    aug.train()
+    aug(torch.randn(2, 4))
+    # 3 passes -> 3 observations in the buffer.
+    assert synapse.buffer_size == 3
+
+
+def test_n_passes_routes_buffer_through_consolidate() -> None:
+    """After forward + apply_hebbian_update with n_passes>1, the
+    buffer is drained and strengths reflect the buffer average."""
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=8, learning_rate=0.5, n_passes=3)
+    aug = SynapseAugmentedMLP(
+        base, synapse, SynapseModulation(), n_passes=3
+    )
+    aug.train()
+    aug(torch.randn(4, 4))
+    assert synapse.buffer_size == 3
+    aug.apply_hebbian_update()
+    assert synapse.buffer_size == 0
+    # Strengths moved off zero — buffer was consumed.
+    assert torch.any(synapse.strengths != 0)
+
+
+def test_n_passes_with_deterministic_forward_is_equivalent_to_single_pass() -> None:
+    """For a deterministic forward (no dropout), all N passes give
+    identical activations; their average equals a single pass, so
+    the strengths after consolidation match single-pass exactly."""
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    x = torch.randn(4, 4, generator=torch.Generator().manual_seed(7))
+
+    set_seed(0)
+    base_single = MLPClassifier(cfg)
+    synapse_single = SynapseLayer(n_neurons=8, learning_rate=0.5)
+    aug_single = SynapseAugmentedMLP(
+        base_single, synapse_single, SynapseModulation()
+    )
+    aug_single.train()
+    aug_single(x)
+    aug_single.apply_hebbian_update()
+
+    set_seed(0)
+    base_multi = MLPClassifier(cfg)
+    synapse_multi = SynapseLayer(n_neurons=8, learning_rate=0.5, n_passes=5)
+    aug_multi = SynapseAugmentedMLP(
+        base_multi, synapse_multi, SynapseModulation(), n_passes=5
+    )
+    aug_multi.train()
+    aug_multi(x)
+    aug_multi.apply_hebbian_update()
+
+    torch.testing.assert_close(
+        aug_multi.synapse.strengths, aug_single.synapse.strengths
+    )
+
+
+def test_n_passes_with_dropout_differs_from_single_pass() -> None:
+    """With dropout enabled, the N passes see different masks; the
+    averaged outer product is denoised and differs from any single-
+    pass equivalent (sometimes called for noise-filtering benefit)."""
+    cfg = MLPConfig(
+        input_dim=4, hidden_dim=8, num_classes=2, dropout=0.5
+    )
+    x = torch.randn(8, 4, generator=torch.Generator().manual_seed(11))
+
+    set_seed(0)
+    base_single = MLPClassifier(cfg)
+    synapse_single = SynapseLayer(n_neurons=8, learning_rate=0.5)
+    aug_single = SynapseAugmentedMLP(
+        base_single, synapse_single, SynapseModulation()
+    )
+    aug_single.train()
+    aug_single(x)
+    aug_single.apply_hebbian_update()
+
+    set_seed(0)
+    base_multi = MLPClassifier(cfg)
+    synapse_multi = SynapseLayer(n_neurons=8, learning_rate=0.5, n_passes=10)
+    aug_multi = SynapseAugmentedMLP(
+        base_multi, synapse_multi, SynapseModulation(), n_passes=10
+    )
+    aug_multi.train()
+    aug_multi(x)
+    aug_multi.apply_hebbian_update()
+
+    # Strengths differ because each pass saw a different dropout mask.
+    assert not torch.allclose(
+        aug_multi.synapse.strengths, aug_single.synapse.strengths
+    )
+
+
+def test_n_passes_validated_at_construction() -> None:
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    base = MLPClassifier(cfg)
+    syn = SynapseLayer(n_neurons=8)
+    with pytest.raises(ValueError, match="n_passes"):
+        SynapseAugmentedMLP(base, syn, SynapseModulation(), n_passes=0)
+
+
 def test_runner_end_to_end_with_synapse_smoke() -> None:
     """End-to-end: the synapse-augmented MLP trains without crashing and
     the strengths grow as Hebbian updates accumulate."""

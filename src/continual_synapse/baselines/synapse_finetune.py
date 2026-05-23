@@ -78,6 +78,17 @@ class SynapseAugmentedMLP(nn.Module):
             fire from ``apply_hebbian_update``.
         retrieval_k: Number of cold-storage entries combined per
             forward pass when cold storage is active.
+        n_passes: Per-batch multi-pass count for noise-filtered
+            co-activation (PROJECT_PLAN.md §4.2.1). Default ``1``
+            reproduces single-pass Phase-3 behaviour bit-exact. When
+            ``> 1`` *and* the model is in training mode, ``features()``
+            performs ``n_passes`` forwards on the same input, pushes
+            each pre-correction observation through ``synapse.observe``,
+            and lets ``synapse.consolidate`` average them. The
+            noise-filtering benefit only materialises when forwards
+            are stochastic (e.g. dropout enabled) — for a fully
+            deterministic forward, ``n_passes > 1`` produces ``n_passes``
+            identical observations whose average equals a single pass.
     """
 
     def __init__(
@@ -90,6 +101,7 @@ class SynapseAugmentedMLP(nn.Module):
         consolidation_trigger: ConsolidationTrigger | None = None,
         retrieval_k: int = 4,
         retrieval_refresh_interval: int = 1,
+        n_passes: int = 1,
     ) -> None:
         super().__init__()
         if synapse.n_neurons != base.config.hidden_dim:
@@ -104,6 +116,8 @@ class SynapseAugmentedMLP(nn.Module):
                 f"retrieval_refresh_interval must be positive, "
                 f"got {retrieval_refresh_interval}"
             )
+        if n_passes <= 0:
+            raise ValueError(f"n_passes must be positive, got {n_passes}")
         self.base = base
         self.synapse = synapse
         self.modulator = modulator if modulator is not None else SynapseModulation()
@@ -112,6 +126,7 @@ class SynapseAugmentedMLP(nn.Module):
         self.consolidation_trigger = consolidation_trigger
         self.retrieval_k = int(retrieval_k)
         self.retrieval_refresh_interval = int(retrieval_refresh_interval)
+        self.n_passes = int(n_passes)
         self._last_features: torch.Tensor | None = None
         self._consolidation_count: int = 0
         # Retrieval cache: avoid querying Chroma every forward pass.
@@ -129,9 +144,29 @@ class SynapseAugmentedMLP(nn.Module):
         pre-correction base output. Retrieval queries cold storage
         with the current batch's mean activation so the correction
         is context-dependent rather than universal.
+
+        When ``n_passes > 1`` and the module is in ``training`` mode,
+        this method also performs ``n_passes`` forward passes on
+        ``x`` to populate the synapse layer's observation buffer.
+        The pass that's returned (and that contributes to the loss)
+        is the first one; the remaining ``n_passes - 1`` are
+        observation-only re-runs.
         """
         f_base = self.base.features(x)
         self._last_features = f_base.detach()
+
+        # Multi-pass observation path (training mode only). Even at
+        # n_passes=1 we deliberately do NOT call observe(), to keep
+        # the buffer-empty path bit-exact compatible with Phase 3.
+        if self.training and self.n_passes > 1:
+            self.synapse.observe(f_base.detach())
+            for _ in range(self.n_passes - 1):
+                f_extra = self.base.features(x)
+                self.synapse.observe(f_extra.detach())
+            # Signal to apply_hebbian_update that the buffer is the
+            # source of truth; the cached _last_features is no longer
+            # representative of what we'll consolidate.
+            self._last_features = None
 
         if self.cold_storage is not None and self.cold_storage.count() > 0:
             retrieved = self._get_or_refresh_retrieval(f_base)
@@ -194,23 +229,47 @@ class SynapseAugmentedMLP(nn.Module):
     def apply_hebbian_update(self, reward: float | None = None) -> float:
         """Push the most recently observed features into the synapse layer.
 
+        Multi-pass mode (``n_passes > 1``): the synapse's observation
+        buffer was populated by ``features()`` during this batch's
+        forwards; we hand off to ``synapse.consolidate(reward=...)``
+        with no explicit activations so it averages the buffer. The
+        reward computer and ``record_access`` use the same average so
+        every downstream signal sees the same denoised features.
+
+        Single-pass mode (``n_passes == 1``, the default): pass the
+        cached ``_last_features`` to ``consolidate(activations=...,
+        reward=...)``. Bit-exact Phase-3 behaviour.
+
         When cold storage and a trigger are configured, also attempt
         a consolidation cycle. The cycle is a no-op if the trigger
         declines.
         """
-        if self._last_features is None:
-            raise RuntimeError(
-                "No features cached. Run a forward pass before calling "
-                "apply_hebbian_update()."
-            )
-        features = self._last_features
+        # Pick the features to use for reward / access-counting /
+        # consolidation. Multi-pass: average the buffer. Single-pass:
+        # use the cached features.
+        use_buffer = self.synapse.buffer_size > 0
+        if use_buffer:
+            features = self.synapse.buffer_average()
+        else:
+            if self._last_features is None:
+                raise RuntimeError(
+                    "No features cached. Run a forward pass before calling "
+                    "apply_hebbian_update()."
+                )
+            features = self._last_features
+
         if reward is None:
             if self.reward_computer is not None:
                 reward = float(self.reward_computer(features))
             else:
                 reward = 1.0
         self.synapse.record_access(features)
-        self.synapse.consolidate(features, reward=reward)
+
+        if use_buffer:
+            # Let the layer drain its own buffer.
+            self.synapse.consolidate(reward=reward)
+        else:
+            self.synapse.consolidate(features, reward=reward)
 
         if (
             self.cold_storage is not None
@@ -229,6 +288,13 @@ class SynapseAugmentedMLP(nn.Module):
                 # forward picks up the just-archived pattern.
                 self._cache_invalidated = True
 
+        # Either way, the next forward should start with a clean
+        # multi-pass buffer. Defensive — consolidate() drained it
+        # in the multi-pass path; this is a no-op when buffer is
+        # already empty (single-pass mode).
+        self.synapse.clear_buffer()
+        # The cached `_last_features` was consumed; clear so a
+        # missing forward before the next update is caught loudly.
         self._last_features = None
         return reward
 

@@ -65,6 +65,19 @@ class SynapseLayer(nn.Module):
             path is bit-identical to Phase-2 v1. Larger values
             dampen updates for synapses whose normalised evidence is
             close to 1.
+        sparse: Whether to apply sparse top-k partner selection.
+        top_k: Number of partners per source neuron in sparse mode.
+        n_passes: Expected number of :meth:`observe` calls between
+            successive :meth:`consolidate` calls. The default ``1``
+            keeps full backward compatibility with the
+            ``consolidate(activations, reward)`` Phase-3 API; values
+            greater than ``1`` enable the multi-pass averaging
+            originally specified in PROJECT_PLAN.md §4.2.1 to filter
+            intra-sample noise (e.g. dropout) before computing
+            co-activation outer products. The layer does not strictly
+            enforce that exactly ``n_passes`` observations occur — it
+            averages whatever's in the buffer when ``consolidate`` is
+            called — so the value is mostly documentation for callers.
     """
 
     def __init__(
@@ -74,6 +87,7 @@ class SynapseLayer(nn.Module):
         resistance_beta: float = 0.0,
         sparse: bool = False,
         top_k: int = 64,
+        n_passes: int = 1,
     ) -> None:
         super().__init__()
         if n_neurons <= 0:
@@ -88,11 +102,14 @@ class SynapseLayer(nn.Module):
             )
         if top_k <= 0:
             raise ValueError(f"top_k must be positive, got {top_k}")
+        if n_passes <= 0:
+            raise ValueError(f"n_passes must be positive, got {n_passes}")
         self.n_neurons = n_neurons
         self.learning_rate = float(learning_rate)
         self.resistance_beta = float(resistance_beta)
         self.sparse = bool(sparse)
         self.top_k = int(top_k)
+        self.n_passes = int(n_passes)
 
         zeros_f = torch.zeros(n_neurons, n_neurons, dtype=torch.float32)
         zeros_l = torch.zeros(n_neurons, n_neurons, dtype=torch.long)
@@ -105,17 +122,100 @@ class SynapseLayer(nn.Module):
         self.register_buffer("global_step", torch.zeros((), dtype=torch.long))
         self.register_buffer("_prev_abs_outer", zeros_f.clone())
 
+        # Transient buffer used by multi-pass averaging. Not a torch
+        # buffer because it must not move with .to(device) (each
+        # entry is already on the right device when observe() is
+        # called) and must not appear in state_dict().
+        self._activation_buffer: list[torch.Tensor] = []
+
+    @torch.no_grad()
+    def observe(self, activations: torch.Tensor) -> None:
+        """Append a single-pass activation tensor to the multi-pass buffer.
+
+        Used to accumulate ``n_passes`` observations of the *same*
+        input batch before :meth:`consolidate` averages them and
+        applies one Hebbian update. The buffer is cleared by
+        :meth:`consolidate` and :meth:`reset`.
+
+        Args:
+            activations: ``(B, n_neurons)`` tensor. Detached and cast
+                to the layer's dtype before storage.
+        """
+        if activations.ndim != 2:
+            raise ValueError(
+                f"Expected 2-D activations (B, n), got shape "
+                f"{tuple(activations.shape)}"
+            )
+        if activations.shape[1] != self.n_neurons:
+            raise ValueError(
+                f"Activation dim {activations.shape[1]} does not match "
+                f"n_neurons={self.n_neurons}"
+            )
+        self._activation_buffer.append(
+            activations.detach().to(self.strengths.dtype)
+        )
+
+    @property
+    def buffer_size(self) -> int:
+        """Number of observations currently in the multi-pass buffer."""
+        return len(self._activation_buffer)
+
+    @torch.no_grad()
+    def buffer_average(self) -> torch.Tensor:
+        """Return ``stack(buffer).mean(dim=0)`` without clearing.
+
+        Useful for downstream code (reward computers, access
+        recorders) that need the same averaged activations
+        :meth:`consolidate` will use. Raises if the buffer is empty.
+        """
+        if not self._activation_buffer:
+            raise RuntimeError("buffer_average() called on an empty buffer")
+        return _stack_average(self._activation_buffer)
+
+    @torch.no_grad()
+    def clear_buffer(self) -> None:
+        """Drop pending observations without applying an update."""
+        self._activation_buffer = []
+
     @torch.no_grad()
     def consolidate(
-        self, activations: torch.Tensor, reward: float = 1.0
+        self,
+        activations: torch.Tensor | None = None,
+        reward: float = 1.0,
     ) -> None:
         """Apply one Hebbian update and advance every state field.
 
+        Two calling modes — picked by inspecting the buffer:
+
+        - **Single-pass (current Phase-3 API, bit-exact).** Caller
+          passes ``activations`` explicitly; the buffer must be
+          empty. Outer products come straight from those activations.
+
+        - **Multi-pass (new).** Caller has previously made one or
+          more :meth:`observe` calls; ``activations`` must be
+          ``None`` (or absent). The buffer is averaged across the
+          first dim (``stack(buffer).mean(0)``) and the result is
+          used as the activations. The buffer is cleared after.
+
         Args:
-            activations: ``(B, n_neurons)`` tensor of activations.
-                Caller is responsible for detaching from autograd.
+            activations: ``(B, n_neurons)`` tensor for single-pass
+                mode, or ``None`` (default) for multi-pass mode.
             reward: Scalar reward modulating the update magnitude.
         """
+        if self._activation_buffer:
+            if activations is not None:
+                raise ValueError(
+                    "consolidate() received explicit `activations` while "
+                    "the observation buffer is non-empty; pick one mode"
+                )
+            activations = _stack_average(self._activation_buffer)
+            self._activation_buffer = []
+        elif activations is None:
+            raise ValueError(
+                "consolidate() needs either `activations` or a non-empty "
+                "buffer from prior observe() calls"
+            )
+
         if activations.ndim != 2:
             raise ValueError(
                 f"Expected 2-D activations (B, n), got shape "
@@ -207,7 +307,7 @@ class SynapseLayer(nn.Module):
         self.access_count.add_((contribution > threshold).long())
 
     def reset(self) -> None:
-        """Zero every buffer."""
+        """Zero every buffer and drop pending multi-pass observations."""
         with torch.no_grad():
             for buf_name in (
                 "strengths",
@@ -219,6 +319,7 @@ class SynapseLayer(nn.Module):
                 "_prev_abs_outer",
             ):
                 getattr(self, buf_name).zero_()
+            self._activation_buffer = []
 
     def extra_repr(self) -> str:
         sparsity = (
@@ -229,5 +330,22 @@ class SynapseLayer(nn.Module):
             f"learning_rate={self.learning_rate}, "
             f"resistance_beta={self.resistance_beta}, "
             f"{sparsity}, "
+            f"n_passes={self.n_passes}, "
             f"global_step={int(self.global_step.item())}"
         )
+
+
+def _stack_average(buffer: list[torch.Tensor]) -> torch.Tensor:
+    """Average a list of identically-shaped activation tensors.
+
+    Raises with a useful diagnostic if shapes mismatch.
+    """
+    try:
+        stacked = torch.stack(buffer, dim=0)
+    except RuntimeError as e:
+        shapes = [tuple(t.shape) for t in buffer]
+        raise ValueError(
+            f"all observed activations must share the same shape; "
+            f"got {shapes}"
+        ) from e
+    return stacked.mean(dim=0)

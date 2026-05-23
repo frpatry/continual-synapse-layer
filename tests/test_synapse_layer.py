@@ -451,6 +451,167 @@ def test_constructor_rejects_bad_top_k() -> None:
         SynapseLayer(n_neurons=8, top_k=0)
 
 
+# ---- Phase 4b follow-up: multi-pass averaging (PROJECT_PLAN.md §4.2.1) ----
+
+
+def test_n_passes_default_is_one() -> None:
+    layer = SynapseLayer(n_neurons=4)
+    assert layer.n_passes == 1
+    assert layer.buffer_size == 0
+
+
+def test_constructor_rejects_bad_n_passes() -> None:
+    with pytest.raises(ValueError, match="n_passes"):
+        SynapseLayer(n_neurons=4, n_passes=0)
+    with pytest.raises(ValueError, match="n_passes"):
+        SynapseLayer(n_neurons=4, n_passes=-1)
+
+
+def test_observe_appends_to_buffer() -> None:
+    layer = SynapseLayer(n_neurons=3, n_passes=3)
+    a = torch.tensor([[1.0, 0.0, 0.0]])
+    layer.observe(a)
+    layer.observe(a)
+    assert layer.buffer_size == 2
+
+
+def test_observe_validates_shape() -> None:
+    layer = SynapseLayer(n_neurons=3)
+    with pytest.raises(ValueError, match="2-D"):
+        layer.observe(torch.zeros(3))
+    with pytest.raises(ValueError, match="does not match"):
+        layer.observe(torch.zeros(2, 5))
+
+
+def test_buffer_average_equals_stack_mean() -> None:
+    layer = SynapseLayer(n_neurons=2)
+    a = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    b = torch.tensor([[2.0, 4.0], [4.0, 6.0]])
+    layer.observe(a)
+    layer.observe(b)
+    expected = (a + b) / 2.0
+    torch.testing.assert_close(layer.buffer_average(), expected)
+
+
+def test_buffer_average_raises_when_empty() -> None:
+    layer = SynapseLayer(n_neurons=2)
+    with pytest.raises(RuntimeError, match="empty"):
+        layer.buffer_average()
+
+
+def test_clear_buffer_drops_observations() -> None:
+    layer = SynapseLayer(n_neurons=2, n_passes=2)
+    layer.observe(torch.ones(1, 2))
+    layer.observe(torch.ones(1, 2))
+    assert layer.buffer_size == 2
+    layer.clear_buffer()
+    assert layer.buffer_size == 0
+
+
+def test_consolidate_single_pass_unchanged_when_buffer_empty() -> None:
+    """Bit-exact backward compatibility: the buffer-empty path is
+    identical to the Phase-3 ``consolidate(activations, reward)`` API."""
+    g = torch.Generator().manual_seed(0)
+    a = torch.randn(8, 4, generator=g)
+
+    legacy = SynapseLayer(n_neurons=4, learning_rate=0.1)
+    legacy.consolidate(a, reward=0.7)
+
+    # Same layer instance pattern, but n_passes>1 set (state container
+    # only — it should not affect single-pass calls).
+    new = SynapseLayer(n_neurons=4, learning_rate=0.1, n_passes=5)
+    new.consolidate(a, reward=0.7)
+
+    torch.testing.assert_close(new.strengths, legacy.strengths)
+    torch.testing.assert_close(new.evidence, legacy.evidence)
+    assert int(new.global_step.item()) == int(legacy.global_step.item())
+
+
+def test_consolidate_multi_pass_uses_buffer_average() -> None:
+    """When the buffer is non-empty, consolidate averages it and
+    computes outer products from the average — equivalent to a
+    single-pass call with stack(buffer).mean(0)."""
+    g = torch.Generator().manual_seed(1)
+    a1 = torch.randn(4, 3, generator=g)
+    a2 = torch.randn(4, 3, generator=g)
+    a3 = torch.randn(4, 3, generator=g)
+    avg = (a1 + a2 + a3) / 3.0
+
+    # Multi-pass path: observe three times, consolidate with no args.
+    multi = SynapseLayer(n_neurons=3, learning_rate=0.1, n_passes=3)
+    multi.observe(a1)
+    multi.observe(a2)
+    multi.observe(a3)
+    multi.consolidate(reward=0.5)
+
+    # Equivalent single-pass: consolidate the pre-averaged activations.
+    legacy = SynapseLayer(n_neurons=3, learning_rate=0.1)
+    legacy.consolidate(avg, reward=0.5)
+
+    torch.testing.assert_close(multi.strengths, legacy.strengths)
+    torch.testing.assert_close(multi.evidence, legacy.evidence)
+    # Buffer must be drained after consolidate.
+    assert multi.buffer_size == 0
+
+
+def test_consolidate_rejects_buffer_and_explicit_activations_together() -> None:
+    layer = SynapseLayer(n_neurons=2, n_passes=2)
+    layer.observe(torch.ones(1, 2))
+    with pytest.raises(ValueError, match="pick one mode"):
+        layer.consolidate(torch.ones(1, 2), reward=1.0)
+
+
+def test_consolidate_rejects_empty_buffer_and_no_activations() -> None:
+    layer = SynapseLayer(n_neurons=2)
+    with pytest.raises(ValueError, match="needs either"):
+        layer.consolidate(reward=1.0)
+
+
+def test_observe_rejects_mixed_shape_buffer() -> None:
+    """Shape mismatches across observed passes are caught at consolidate."""
+    layer = SynapseLayer(n_neurons=3, n_passes=2)
+    layer.observe(torch.ones(4, 3))
+    layer.observe(torch.ones(8, 3))  # different batch size
+    with pytest.raises(ValueError, match="same shape"):
+        layer.consolidate(reward=1.0)
+
+
+def test_multi_pass_filters_intra_pass_noise() -> None:
+    """The point of multi-pass averaging: when individual passes are
+    noisy around a true signal, the strength update from the average
+    is closer to the noise-free reference than any single-pass update.
+    """
+    g = torch.Generator().manual_seed(2)
+    true_signal = torch.tensor([[1.0, 2.0, 0.5, -1.0]] * 8)
+
+    # Reference: what we'd get with no noise.
+    ref = SynapseLayer(n_neurons=4, learning_rate=0.1)
+    ref.consolidate(true_signal, reward=1.0)
+
+    # Single noisy pass.
+    single = SynapseLayer(n_neurons=4, learning_rate=0.1)
+    noisy = true_signal + torch.randn(8, 4, generator=g) * 0.5
+    single.consolidate(noisy, reward=1.0)
+    single_err = (single.strengths - ref.strengths).abs().mean().item()
+
+    # Average over 20 noisy passes via the multi-pass path.
+    multi = SynapseLayer(n_neurons=4, learning_rate=0.1, n_passes=20)
+    for _ in range(20):
+        multi.observe(true_signal + torch.randn(8, 4, generator=g) * 0.5)
+    multi.consolidate(reward=1.0)
+    multi_err = (multi.strengths - ref.strengths).abs().mean().item()
+
+    # Averaging 20 noisy estimates is closer to truth than any one.
+    assert multi_err < single_err
+
+
+def test_reset_clears_buffer() -> None:
+    layer = SynapseLayer(n_neurons=3, n_passes=2)
+    layer.observe(torch.ones(1, 3))
+    layer.reset()
+    assert layer.buffer_size == 0
+
+
 def test_reset_clears_all_phase3_buffers() -> None:
     layer = SynapseLayer(n_neurons=2)
     layer.consolidate(torch.tensor([[1.0, 1.0]]))
