@@ -93,11 +93,16 @@ class SurpriseReward(nn.Module):
             pred = self.predictor(prev.unsqueeze(0)).squeeze(0)
             surprise = _cosine_distance(pred, current)
 
-        self._optimizer.zero_grad()
-        pred_for_loss = self.predictor(prev.unsqueeze(0)).squeeze(0)
-        loss = (pred_for_loss - current).pow(2).mean()
-        loss.backward()
-        self._optimizer.step()
+        # The predictor needs gradient flow for its own SGD step. This
+        # call site is typically reached from inside a `@torch.no_grad`
+        # block (the augmented MLP's apply_hebbian_update), so we
+        # explicitly re-enable autograd just for the predictor update.
+        with torch.enable_grad():
+            self._optimizer.zero_grad()
+            pred_for_loss = self.predictor(prev.unsqueeze(0)).squeeze(0)
+            loss = (pred_for_loss - current).pow(2).mean()
+            loss.backward()
+            self._optimizer.step()
 
         self._prev = current.clone()
         return float(surprise)

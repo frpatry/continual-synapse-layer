@@ -10,6 +10,7 @@ reproducible after the fact.
 | `01_baseline_forgetting.py` | Naive sequential fine-tuning | Split-MNIST | 1 |
 | `02_ewc_baseline.py` | EWC | Split-MNIST | 1 |
 | `03_synapse_layer_v1.py` | Naive + SynapseLayer v1 (Hebbian, dense, fixed reward) | Split-MNIST | 2 |
+| `04_synapse_with_resistance.py` | Synapse + evidence-based resistance + reward mixer | Split-MNIST | 3 |
 
 ## Running
 
@@ -19,6 +20,7 @@ From the repo root, after installing dependencies:
 python experiments/01_baseline_forgetting.py
 python experiments/02_ewc_baseline.py --lam 1000
 python experiments/03_synapse_layer_v1.py --synapse-lr 1e-3
+python experiments/04_synapse_with_resistance.py --mode resistance_full --beta 0.01
 ```
 
 The first run downloads MNIST via HuggingFace `datasets` into
