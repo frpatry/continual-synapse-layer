@@ -25,15 +25,17 @@ jobs:
           cache: pip
 
       - name: Install test dependencies
-        # Phase-1 unit tests only need torch, numpy, and pytest. Heavier
-        # deps (datasets, chromadb, transformers, matplotlib) are
-        # required by experiment scripts but not by the test suite, so
-        # we keep CI lean. Versions match requirements.txt pins.
+        # The test suite needs torch, numpy, pytest, and now scipy
+        # (for the Wilcoxon signed-rank test in the statistics
+        # module). Heavier deps (datasets, chromadb, transformers,
+        # matplotlib) remain CI-excluded because no test imports
+        # them. Versions match requirements.txt pins.
         run: |
           python -m pip install --upgrade pip
           python -m pip install \
             "torch==2.12.0" \
             "numpy==2.4.6" \
+            "scipy==1.16.3" \
             "pytest==9.0.3"
 
       - name: Run pytest

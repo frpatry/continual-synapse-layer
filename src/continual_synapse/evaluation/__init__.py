@@ -11,6 +11,7 @@ from continual_synapse.evaluation.metrics import (
     backward_transfer,
     forward_transfer,
 )
+from continual_synapse.evaluation.multi_seed import MultiSeedRun, run_multi_seed
 from continual_synapse.evaluation.runner import ContinualRunner, RunResult
 
 __all__ = [
@@ -23,4 +24,6 @@ __all__ = [
     "forward_transfer",
     "ContinualRunner",
     "RunResult",
+    "MultiSeedRun",
+    "run_multi_seed",
 ]
