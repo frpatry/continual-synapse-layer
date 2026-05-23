@@ -118,6 +118,85 @@ def test_runner_can_learn_first_task() -> None:
     assert result.accuracy_matrix[-1, -1] > 0.7
 
 
+def test_on_task_change_fires_in_expected_order() -> None:
+    """For 2 tasks, on_task_change should fire:
+    - before zero-shot eval of task 1 (called with index=1)
+    - before training task 0 (called with index=0)
+    - before eval of task 0 (called with index=0)
+    - before training task 1 (called with index=1)
+    - before eval of task 0 (called with index=0)
+    - before eval of task 1 (called with index=1)
+    Total 6 calls.
+    """
+    bench = _TwoTaskBenchmark()
+    model = MLPClassifier(MLPConfig(input_dim=8, hidden_dim=16, num_classes=2))
+    calls: list[int] = []
+
+    def cb(i, task, m):
+        calls.append(i)
+
+    runner = ContinualRunner(
+        optimizer_factory=lambda p: torch.optim.SGD(p, lr=0.05),
+        epochs_per_task=1,
+        batch_size=16,
+        eval_batch_size=16,
+        seed=0,
+        record_zero_shot=True,
+        on_task_change=cb,
+    )
+    runner.run(model, bench)
+    assert calls == [1, 0, 0, 1, 0, 1]
+
+
+def test_on_task_change_omitted_does_not_break_runner() -> None:
+    """The new callback is optional; runs without it behave as before."""
+    bench = _TwoTaskBenchmark()
+    model = MLPClassifier(MLPConfig(input_dim=8, hidden_dim=16, num_classes=2))
+    runner = _build_runner(seed=0)
+    result = runner.run(model, bench)
+    assert result.accuracy_matrix.shape == (2, 2)
+
+
+def test_on_task_change_drives_multi_head_selection_end_to_end() -> None:
+    """Wired against a multi-head model, on_task_change selects the right head
+    for each train/eval phase."""
+    from continual_synapse.baselines.multi_head import MultiHeadMLPClassifier
+
+    bench = _TwoTaskBenchmark()
+    set_seed(0)
+    model = MultiHeadMLPClassifier(
+        num_tasks=2,
+        config=MLPConfig(input_dim=8, hidden_dim=32, num_classes=2),
+    )
+
+    head_log: list[int] = []
+
+    def cb(i, task, m):
+        m.set_active_head(i)
+        head_log.append(i)
+
+    runner = ContinualRunner(
+        optimizer_factory=lambda p: torch.optim.SGD(p, lr=0.05),
+        epochs_per_task=4,
+        batch_size=16,
+        eval_batch_size=16,
+        seed=0,
+        record_zero_shot=False,  # zero-shot eval against fresh head is meaningless
+        on_task_change=cb,
+    )
+    result = runner.run(model, bench)
+    # The callback fired for each train phase + each eval phase.
+    # With 2 tasks and no zero-shot: train(0), eval(0), train(1), eval(0), eval(1).
+    assert head_log == [0, 0, 1, 0, 1]
+    # Each task's own head, trained on its own data and re-selected at eval
+    # time, should be at least non-trivially better than chance.
+    # Off-diagonal "task 0 after task 1" must not regress to chance, because
+    # head 0 is frozen during task-1 training under multi-head.
+    assert result.accuracy_matrix[0, 0] > 0.5
+    assert result.accuracy_matrix[1, 1] > 0.5
+    assert result.accuracy_matrix[1, 0] >= result.accuracy_matrix[0, 0] - 0.1
+
+
 def test_random_baseline_matches_class_balance() -> None:
     bench = _TwoTaskBenchmark()
     model = MLPClassifier(MLPConfig(input_dim=8, hidden_dim=16, num_classes=2))

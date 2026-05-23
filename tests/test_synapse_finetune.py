@@ -194,6 +194,24 @@ def test_apply_hebbian_update_uses_reward_computer_when_no_explicit_value() -> N
     torch.testing.assert_close(received[0], base.features(x).detach())
 
 
+def test_set_active_head_forwards_to_base_when_supported() -> None:
+    """SynapseAugmentedMLP wrapping a multi-head base delegates head selection."""
+    from continual_synapse.baselines.multi_head import MultiHeadMLPClassifier
+
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    base = MultiHeadMLPClassifier(num_tasks=3, config=cfg)
+    synapse = SynapseLayer(n_neurons=8)
+    aug = SynapseAugmentedMLP(base, synapse, SynapseModulation())
+    aug.set_active_head(2)
+    assert base.active_head == 2
+
+
+def test_set_active_head_raises_on_single_head_base() -> None:
+    aug, _ = _build_augmented()
+    with pytest.raises(AttributeError, match="multi-head"):
+        aug.set_active_head(0)
+
+
 def test_explicit_reward_overrides_computer() -> None:
     """A caller-supplied reward bypasses the configured computer."""
     calls: list[None] = []

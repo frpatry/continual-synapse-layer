@@ -21,6 +21,10 @@ subclassing:
 - ``on_after_batch(i, task, model, x, y)`` fires after every
   optimizer step. The synapse-augmented MLP uses it to apply the
   Hebbian update from the activations cached during forward.
+- ``on_task_change(j, task, model)`` fires before training a task
+  and before each evaluation. Multi-head models use it to switch
+  the active classification head; single-head methods leave it
+  unset and pay no cost.
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ logger = logging.getLogger(__name__)
 OptimizerFactory = Callable[[Iterable[nn.Parameter]], torch.optim.Optimizer]
 Regulariser = Callable[[nn.Module], torch.Tensor]
 TaskEndCallback = Callable[[int, Task, nn.Module], None]
+TaskChangeCallback = Callable[[int, Task, nn.Module], None]
 AfterBatchCallback = Callable[
     [int, Task, nn.Module, torch.Tensor, torch.Tensor], None
 ]
@@ -103,6 +108,7 @@ class ContinualRunner:
     regulariser: Regulariser | None = None
     on_task_end: TaskEndCallback | None = None
     on_after_batch: AfterBatchCallback | None = None
+    on_task_change: TaskChangeCallback | None = None
 
     def run(self, model: nn.Module, benchmark: ContinualBenchmark) -> RunResult:
         """Train ``model`` sequentially on ``benchmark`` and return results."""
@@ -121,7 +127,12 @@ class ContinualRunner:
 
         for i, task in enumerate(tasks):
             if self.record_zero_shot and i + 1 < T:
+                if self.on_task_change is not None:
+                    self.on_task_change(i + 1, tasks[i + 1], model)
                 R[i, i + 1] = self._evaluate(model, tasks[i + 1])
+
+            if self.on_task_change is not None:
+                self.on_task_change(i, task, model)
 
             self._train_one_task(model, optimizer, task, task_index=i)
 
@@ -129,6 +140,8 @@ class ContinualRunner:
                 self.on_task_end(i, task, model)
 
             for j in range(i + 1):
+                if self.on_task_change is not None:
+                    self.on_task_change(j, tasks[j], model)
                 R[i, j] = self._evaluate(model, tasks[j])
 
             logger.info(

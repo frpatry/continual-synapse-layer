@@ -90,6 +90,21 @@ class SynapseAugmentedMLP(nn.Module):
         self._last_features = f_base.detach()
         return f_base + self.modulator(f_base, self.synapse.strengths)
 
+    def set_active_head(self, index: int) -> None:
+        """Forward head selection to the base model, if it supports it.
+
+        Multi-head bases (e.g. :class:`MultiHeadMLPClassifier`)
+        expose ``set_active_head``; single-head bases do not. Raising
+        on the latter is intentional — the caller is using a wrapper
+        that does not support multi-head workflows.
+        """
+        if not hasattr(self.base, "set_active_head"):
+            raise AttributeError(
+                f"base model {type(self.base).__name__} does not "
+                "support multi-head selection"
+            )
+        self.base.set_active_head(index)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.base.classify(self.features(x))
 
