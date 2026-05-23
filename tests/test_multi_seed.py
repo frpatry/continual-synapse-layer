@@ -97,3 +97,29 @@ def test_run_multi_seed_calls_progress_callback() -> None:
         progress=lambda m, i, n: calls.append((m, i, n)),
     )
     assert calls == [("x", 0, 3), ("x", 1, 3), ("x", 2, 3)]
+
+
+def test_run_multi_seed_calls_on_seed_complete_with_result() -> None:
+    """The completion callback receives the per-seed RunResult so
+    experiment scripts can print metrics as each seed lands."""
+    from continual_synapse.evaluation.runner import RunResult
+
+    bench = _TinyBenchmark()
+    payloads: list[tuple[str, int, int, int, RunResult]] = []
+    run_multi_seed(
+        "m",
+        _factory,
+        bench,
+        seeds=[5, 7],
+        on_seed_complete=lambda m, i, n, seed, result: payloads.append(
+            (m, i, n, seed, result)
+        ),
+    )
+    assert len(payloads) == 2
+    assert [p[0] for p in payloads] == ["m", "m"]
+    assert [p[1] for p in payloads] == [0, 1]  # seed_index
+    assert [p[2] for p in payloads] == [2, 2]  # n_seeds
+    assert [p[3] for p in payloads] == [5, 7]  # actual seed values
+    # Result tensors are populated for both seeds.
+    for _, _, _, _, result in payloads:
+        assert result.accuracy_matrix.shape == (2, 2)

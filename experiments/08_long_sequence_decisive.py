@@ -332,6 +332,24 @@ def main() -> None:
                 f"unknown method {method!r}; known: {list(factories)}"
             )
         t0 = time.time()
+
+        def _seed_done(m, i, n, seed, result):
+            s = compute_metrics(result)
+            elapsed = time.time() - t0
+            fwt = (
+                f", fwt={s.forward_transfer:+.3f}"
+                if s.forward_transfer is not None
+                else ""
+            )
+            print(
+                f"    {m} seed {i + 1}/{n} (seed={seed}, "
+                f"{elapsed:.0f}s into method): "
+                f"acc={s.average_accuracy:.3f}, "
+                f"fgt={s.average_forgetting:+.3f}, "
+                f"bwt={s.backward_transfer:+.3f}{fwt}",
+                flush=True,
+            )
+
         run = run_multi_seed(
             method,
             factories[method],
@@ -340,6 +358,7 @@ def main() -> None:
             progress=lambda m, i, n: print(
                 f"  {m}: seed {i + 1}/{n}", flush=True
             ),
+            on_seed_complete=_seed_done,
         )
         elapsed = time.time() - t0
         method_times[method] = elapsed

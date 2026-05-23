@@ -26,6 +26,7 @@ from continual_synapse.evaluation.runner import ContinualRunner, RunResult
 
 
 MethodFactory = Callable[[int], tuple[nn.Module, ContinualRunner]]
+SeedCompleteCallback = Callable[[str, int, int, int, RunResult], None]
 
 
 @dataclass
@@ -48,6 +49,7 @@ def run_multi_seed(
     seeds: list[int],
     *,
     progress: Callable[[str, int, int], None] | None = None,
+    on_seed_complete: SeedCompleteCallback | None = None,
 ) -> MultiSeedRun:
     """Run ``factory(seed)`` once per seed and collect the results.
 
@@ -61,9 +63,14 @@ def run_multi_seed(
             runner's RNG handles shuffling).
         seeds: Seeds to iterate over. Order is preserved in the
             returned ``results`` list.
-        progress: Optional callable ``(method, seed_index, n_seeds)``
-            invoked before each run. Useful for ``tqdm``-style
-            progress reporting from experiment scripts.
+        progress: Optional ``(method, seed_index, n_seeds)`` callback
+            invoked *before* each run starts. Useful for ``tqdm``-
+            style "starting seed N" reporting.
+        on_seed_complete: Optional ``(method, seed_index, n_seeds,
+            seed, result)`` callback invoked *after* each run
+            finishes. Experiments use this to print per-seed metrics
+            so long multi-method sweeps don't go dark for tens of
+            minutes between summary aggregates.
 
     Returns:
         A ``MultiSeedRun`` carrying the original method name, seeds,
@@ -76,4 +83,6 @@ def run_multi_seed(
         model, runner = factory(seed)
         result = runner.run(model, benchmark)
         results.append(result)
+        if on_seed_complete is not None:
+            on_seed_complete(method, i, len(seeds), seed, result)
     return MultiSeedRun(method=method, seeds=list(seeds), results=results)
