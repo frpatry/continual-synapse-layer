@@ -228,3 +228,4 @@ results/tables/*
 !results/**/.gitkeep
 !results/figures/long_sequence/
 !results/figures/extended_sequence/
+!results/figures/architectural_completion/
