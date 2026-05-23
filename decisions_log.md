@@ -6,6 +6,182 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-23] Phase 3 close-out: state schema, β normalisation, sparse top-k, multi-seed
+
+This session closed the remaining Phase-3 deliverables: the full
+state schema (confidence, age, access_count), β calibration via
+normalised evidence, sparse top-k partner selection, multi-seed
+runner + statistical-significance helpers, and the headline
+experiment 05 comparison. The reward signal was *not* touched this
+session per the explicit non-goal.
+
+### State-field semantics (confidence, age, access_count)
+
+**Decision:** Populate the three new state fields mechanically but
+do *not* feed them back into the update rule yet.
+
+**Update logic chosen:**
+- ``confidence[i, j] += min(prev_abs_outer[i, j], curr_abs_outer[i, j])``
+  per call after the first. Rewards co-firing that is *sustained*
+  across consecutive batches; a pair that flickers gets credit only
+  for the weaker of its two batches.
+- ``age[i, j]`` ticks +1 on every consolidate.
+- ``access_count[i, j]`` ticks +1 when
+  ``mean_b(|features[b, i]|) · |strengths[i, j]| > threshold``
+  (default 1e-3), recorded via a new ``record_access`` method that
+  the augmented MLP calls before each consolidate.
+
+**Rationale for not yet using them in the update rule:** the
+Phase-3 spec only requires "populate them mechanically". Adding
+them to the rule prematurely would entangle independent variables
+and make the Phase-4 pressure metric harder to attribute. By the
+end of this session, the buffers exist and evolve correctly; future
+sessions can plug them in cleanly.
+
+### β calibration: normalise evidence by current max
+
+**Decision:** Resistance now uses
+``evidence / (max(evidence) + ε)`` instead of raw evidence, so
+β has the same effective meaning regardless of how large evidence
+grows on the chosen benchmark.
+
+**Alternative considered:** schedule β decay based on observed
+evidence scale. Rejected as more knobs to tune; the normalisation
+approach has the same effect with one fewer hyperparameter.
+
+**Backward-compat remap:** the old un-normalised β=0.01 on
+Split-MNIST mapped to ``1 / (1 + 0.01 · 2800) ≈ 0.034`` pass-through
+on the most-evidenced synapse. Under the new math, β≈28 reproduces
+that exactly. We picked β=10 as the new default (~9% pass-through),
+giving milder dampening. Single-seed verification confirmed the
+numbers stay in the same band (ACC 0.608/FGT 0.479 at β=10 vs the
+old β=0.01 single-seed 0.611/0.478).
+
+**Edge case noted:** the very first consolidate sees
+``evidence == 0`` everywhere, so ``max(evidence) = 0`` would divide
+by zero. Handled by ``clamp_min(ε)``.
+
+### Sparse top-k: dense buffers + zero-mask strategy
+
+**Decision:** Keep dense ``(n, n)`` buffers in SynapseLayer and
+*zero* entries outside the top-k mask after each consolidate. Top-k
+is opt-in via ``sparse=False`` default + ``top_k=64``.
+
+**Alternatives considered:**
+- True sparse representation (e.g., COO indices for the top-k
+  per-row partners). Lower memory but heavy bookkeeping for the
+  per-batch eviction; the cost-benefit at MLP scale (n=256, k=64)
+  is unfavourable.
+- Pure dense always. Memory grows to O(n²) — fine at n=256 but
+  prohibitive at transformer scale (n=768 means 590 k synapses).
+
+**Rationale:** The zero-mask strategy delivers the user-visible
+top-k semantics without changing the storage layout. At transformer
+scale we may revisit, but for Phase 3 / 4 development this is the
+right trade. The dense buffers also make state inspection in tests
+and notebooks trivial.
+
+**Eviction rule:** the mask is computed from *post-update* strengths.
+A synapse that crosses above the previous weakest's |strength|
+displaces it; all five state fields (strengths, evidence,
+confidence, age, access_count) plus the prev_abs_outer cache are
+zeroed for evicted positions, so a position that returns to the
+top-k later starts with a fresh slate.
+
+### Multi-seed and significance protocol
+
+**Decision:** Multi-seed runs via a factory-based ``run_multi_seed``
+helper; Wilcoxon signed-rank with Bonferroni correction across the
+``k choose 2`` method pairs.
+
+**Choices made:**
+- Factory takes ``seed`` and returns ``(model, runner)``. The
+  factory owns all seed-dependent setup (model init, EWC instance,
+  synapse layer, reward computer). The benchmark is reused across
+  seeds because real benchmarks (SplitMNIST) are deterministic.
+- Wilcoxon is paired per-seed — the same seed list must be used
+  across methods. Enforced implicitly by the factory pattern.
+- Bonferroni multiplies p-values by the number of pairs (``k choose 2``)
+  and clips to 1.0. Less powerful than Holm-Bonferroni but simpler
+  and conservative.
+- scipy is imported lazily inside ``pairwise_wilcoxon`` so the rest
+  of the statistics module remains importable without scipy. CI
+  workflow gained ``scipy==1.16.3`` in the install step.
+
+### Phase 3 headline numbers (5 seeds, Split-MNIST)
+
+| Method                | ACC            | FGT            |
+|-----------------------|----------------|----------------|
+| naive                 | 0.600 ± 0.004  | 0.488 ± 0.005  |
+| ewc (λ=1000)          | 0.623 ± 0.017  | 0.458 ± 0.023  |
+| synapse_resistance    | 0.597 ± 0.010  | 0.493 ± 0.011  |
+| synapse_full          | 0.598 ± 0.010  | 0.492 ± 0.011  |
+| synapse_full_sparse   | 0.596 ± 0.009  | 0.495 ± 0.010  |
+
+**After Bonferroni correction, no pairwise comparison reaches
+α=0.05 significance.** The minimum raw p-value the Wilcoxon
+signed-rank test can produce at n=5 is 0.0625; multiplied by 10
+pairs that's 0.625. We are statistically blind at this seed count.
+Pre-correction, the EWC-vs-naive comparison sits at p=0.125 (not
+significant either).
+
+**Honest assessment.**
+
+1. The Phase-3 synapse variants are statistically indistinguishable
+   from naive on Split-MNIST. The single-seed +0.9 pp ACC gain
+   reported at the end of the previous Phase-3 session was noise —
+   the 5-seed mean for synapse_resistance is 0.597, *below* naive's
+   0.600.
+2. EWC continues to dominate at +2.3 pp ACC over naive (mean), but
+   even this is not Bonferroni-significant at 5 seeds.
+3. Sparse top-k (k=64) does not measurably hurt the synapse system
+   (0.598 → 0.596 ACC, within noise). The expected memory benefit
+   is real for transformer-scale use.
+
+**Why the synapse layer fails to help here:**
+
+- Split-MNIST with a *shared* 2-class head puts the head squarely
+  in the catastrophic-forgetting path. The synapse correction at
+  the penultimate layer can't compensate when the head's softmax
+  boundary is the bottleneck.
+- The reward signal really is too weak as currently configured —
+  consistency rarely drops below 0.97 across task switches because
+  the EMA tracks too fast. The deferred reward-signal investigation
+  is genuinely needed.
+- Without confidence/age/access_count being *consumed* (just
+  populated), the resistance mechanism leans on a single field
+  (normalised evidence). The richer state schema is there for
+  Phase 4 to use.
+
+**What this means for the project narrative:**
+
+- The Phase-3 deliverables are met: full state schema, normalised
+  resistance, sparse top-k, multi-seed protocol all working and
+  tested.
+- The Phase-2 failure mode ("synapse just tracks the latest task")
+  is fixed — it no longer regresses 2.6 pp. It's now neutral.
+- The Phase-3 success criterion ("beats baseline") is NOT met. We
+  recorded this honestly so the project's narrative reflects
+  reality. Phase 4 (cold storage) is where we either find a real
+  benefit or write the negative-results follow-up article called
+  out in PROJECT_PLAN.md §10.3.
+
+### What's still deferred
+
+Carried forward to future sessions:
+
+- **Reward signal investigation.** Consistency EMA tuning was an
+  explicit non-goal for this session.
+- **DistilBERT integration** via ActivationCapture and **Split-AG-News
+  benchmark** — Phase-2 tasks that may shift the picture if the
+  shared-head bottleneck is the real culprit.
+- **Phase 3 walkthrough notebook** — Phase 6 polish.
+- **Consume confidence/age/access_count in the update rule** —
+  Phase 4 will use them in the pressure metric, but a more
+  sophisticated update rule that uses them directly is open.
+
+---
+
 ## [2026-05-23] Phase 3 (partial): evidence-based resistance + reward signal
 
 This session implemented the two mechanisms scoped for "addressing
