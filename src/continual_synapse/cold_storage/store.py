@@ -26,9 +26,10 @@ companion design note in DESIGN.md §3.3.
 
 from __future__ import annotations
 
+import base64
 import uuid
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
 try:
     import chromadb  # type: ignore[import-untyped]
@@ -36,6 +37,9 @@ try:
 except ImportError:  # pragma: no cover — chromadb is in requirements.txt
     chromadb = None  # type: ignore[assignment]
     Collection = Any  # type: ignore[misc, assignment]
+
+if TYPE_CHECKING:
+    from continual_synapse.cold_storage.compression import CompressionSchedule
 
 
 _COLLECTION_NAME = "synapse_archive"
@@ -147,9 +151,120 @@ class ColdStorage:
         """Replace ``metadata`` for ``entry_id`` in place."""
         self._collection.update(ids=[entry_id], metadatas=[metadata])
 
+    def update_entry(
+        self,
+        entry_id: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        document: str | None = None,
+    ) -> None:
+        """Replace ``metadata`` and/or ``document`` for ``entry_id``.
+
+        Embedding is not updatable through this method — by design,
+        an entry's embedding key is fixed after insertion. To replace
+        the embedding, delete and re-insert. When updating the
+        ``document``, the existing embedding is re-supplied to
+        Chroma's ``update`` to prevent it from auto-computing a
+        replacement embedding from the document text (which would
+        change the dimension and fail validation against the
+        collection's fixed embedding dim).
+        """
+        if metadata is None and document is None:
+            return  # nothing to do
+        kwargs: dict[str, Any] = {"ids": [entry_id]}
+        if metadata is not None:
+            kwargs["metadatas"] = [metadata]
+        if document is not None:
+            # Fetch + re-supply the embedding so Chroma's auto-
+            # embedding doesn't override our fixed key.
+            existing = self.get_by_id(entry_id)
+            kwargs["documents"] = [document]
+            kwargs["embeddings"] = [existing.embedding]
+        self._collection.update(**kwargs)
+
     def delete_cluster(self, entry_id: str) -> None:
         """Remove ``entry_id`` from the store."""
         self._collection.delete(ids=[entry_id])
+
+    # ---- compression re-evaluation (Phase 4b follow-up) ----
+
+    def re_evaluate_all_entries(
+        self,
+        current_step: int,
+        schedule: "CompressionSchedule",
+    ) -> dict[int, int]:
+        """Walk every entry, age it, and re-quantise if the schedule shifts it.
+
+        The compression schedule was previously consulted only at
+        insertion time (with ``age=0, access_count=0``) — so every
+        entry stayed at the schedule's "fresh" precision (32-bit by
+        default) for the lifetime of the experiment, regardless of
+        what the design intended. This method closes that gap by
+        applying the schedule to existing entries.
+
+        For each entry:
+          1. Compute ``current_age = max(current_step - created_at_step, 0)``.
+          2. Compute ``new_precision = schedule.precision_for(current_age,
+             access_count)``.
+          3. If ``new_precision != current_precision``: dequantize at
+             the current precision, re-quantize at the new precision,
+             update the entry's document.
+          4. Always update the entry's ``metadata["age"]`` to the
+             freshly-computed value and ``metadata["precision"]`` to
+             the chosen tier.
+
+        Args:
+            current_step: The trainer's global step (typically
+                ``synapse.global_step``). Subtracted from each entry's
+                ``created_at_step`` to derive its current age.
+            schedule: The :class:`CompressionSchedule` to apply.
+
+        Returns:
+            Dict mapping precision tier -> count of entries now at
+            that tier. Useful for diagnostics ("how many entries are
+            at 16-bit?").
+        """
+        from continual_synapse.cold_storage.compression import (
+            dequantize,
+            quantize,
+        )
+
+        counts: dict[int, int] = {}
+        for entry in self.all_entries():
+            old_precision = int(entry.metadata.get("precision", 32))
+            created_at = int(entry.metadata.get("created_at_step", 0))
+            access_count = int(entry.metadata.get("access_count", 0))
+            n_neurons = int(entry.metadata.get("n_neurons", 0))
+            current_age = max(int(current_step) - created_at, 0)
+            new_precision = schedule.precision_for(
+                age=current_age, access_count=access_count
+            )
+
+            new_metadata = dict(entry.metadata)
+            new_metadata["age"] = current_age
+            new_metadata["precision"] = int(new_precision)
+
+            if new_precision != old_precision and n_neurons > 0:
+                old_blob = base64.b64decode(entry.document)
+                tensor = dequantize(
+                    old_blob,
+                    precision=old_precision,
+                    shape=(n_neurons, n_neurons),
+                )
+                new_blob = quantize(tensor, precision=new_precision)
+                new_document = base64.b64encode(new_blob).decode("ascii")
+                self.update_entry(
+                    entry.id,
+                    metadata=new_metadata,
+                    document=new_document,
+                )
+            else:
+                # Even when precision is unchanged, update metadata so
+                # the `age` field is no longer stale at 0.
+                self.update_metadata(entry.id, new_metadata)
+
+            counts[int(new_precision)] = counts.get(int(new_precision), 0) + 1
+        return counts
 
     # ---- reads ----
 

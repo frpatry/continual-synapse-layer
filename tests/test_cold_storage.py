@@ -158,3 +158,252 @@ def test_collection_recreate_on_reuse() -> None:
 
     b = ColdStorage(collection_name="reused")
     assert b.count() == 0
+
+
+# ---- Phase 4b follow-up: compression re-evaluation sweep ----
+
+
+def _store_compressed(
+    store: ColdStorage,
+    strengths,
+    *,
+    embedding,
+    precision: int = 32,
+    created_at_step: int = 0,
+    access_count: int = 0,
+    entry_id: str | None = None,
+) -> str:
+    """Helper: store a synapse strengths matrix at given precision."""
+    import base64
+
+    import torch
+
+    from continual_synapse.cold_storage.compression import quantize
+
+    t = torch.as_tensor(strengths, dtype=torch.float32)
+    blob = quantize(t, precision=precision)
+    doc = base64.b64encode(blob).decode("ascii")
+    meta = {
+        "precision": precision,
+        "n_neurons": int(t.shape[0]),
+        "age": 0,
+        "access_count": access_count,
+        "created_at_step": created_at_step,
+    }
+    return store.store_cluster(
+        embedding=embedding, metadata=meta, document=doc, entry_id=entry_id
+    )
+
+
+def test_update_entry_replaces_document_and_metadata() -> None:
+    store = ColdStorage(collection_name="update_entry_test")
+    store.store_cluster(
+        embedding=[1.0, 0.0],
+        metadata={"k": 1},
+        document="old",
+        entry_id="x",
+    )
+    store.update_entry(
+        "x", metadata={"k": 2, "v": "y"}, document="new"
+    )
+    e = store.get_by_id("x")
+    assert e.document == "new"
+    assert e.metadata["k"] == 2
+    assert e.metadata["v"] == "y"
+
+
+def test_update_entry_metadata_only_keeps_document() -> None:
+    store = ColdStorage(collection_name="update_md_only")
+    store.store_cluster(
+        embedding=[1.0],
+        metadata={"k": 1},
+        document="keep",
+        entry_id="x",
+    )
+    store.update_entry("x", metadata={"k": 9})
+    e = store.get_by_id("x")
+    assert e.document == "keep"
+    assert e.metadata["k"] == 9
+
+
+def test_update_entry_with_neither_arg_is_noop() -> None:
+    store = ColdStorage(collection_name="update_noop")
+    store.store_cluster(
+        embedding=[1.0],
+        metadata={"k": 1},
+        document="x",
+        entry_id="a",
+    )
+    store.update_entry("a")  # neither metadata nor document
+    e = store.get_by_id("a")
+    assert e.document == "x"
+    assert e.metadata == {"k": 1}
+
+
+def test_re_evaluate_updates_age_field() -> None:
+    """The first thing re_evaluate does is update each entry's `age`
+    metadata to current_step - created_at_step. Verify on a single
+    entry whose precision doesn't need to change."""
+    import torch
+
+    from continual_synapse.cold_storage.compression import CompressionSchedule
+
+    store = ColdStorage(collection_name="reeval_age")
+    _store_compressed(
+        store,
+        torch.zeros(2, 2),
+        embedding=[1.0, 0.0],
+        precision=32,
+        created_at_step=10,
+        entry_id="a",
+    )
+    sched = CompressionSchedule()
+    store.re_evaluate_all_entries(current_step=50, schedule=sched)
+    e = store.get_by_id("a")
+    # current_age = 50 - 10 = 40, which is < 100 so still 32-bit.
+    assert e.metadata["age"] == 40
+    assert e.metadata["precision"] == 32
+
+
+def test_re_evaluate_re_quantises_when_threshold_crossed() -> None:
+    """When age crosses the threshold, the entry's precision shifts
+    and the document is re-encoded."""
+    import torch
+
+    from continual_synapse.cold_storage.compression import CompressionSchedule
+
+    store = ColdStorage(collection_name="reeval_quantise")
+    s = torch.tensor([[1.0, -0.5], [0.25, 0.75]])
+    _store_compressed(
+        store,
+        s,
+        embedding=[1.0, 0.0],
+        precision=32,
+        created_at_step=0,
+        entry_id="b",
+    )
+    before = store.get_by_id("b")
+    sched = CompressionSchedule()  # age >= 500 -> 8-bit
+    counts = store.re_evaluate_all_entries(current_step=600, schedule=sched)
+
+    e = store.get_by_id("b")
+    # age 600 is in [500, 2000) -> 8-bit tier.
+    assert e.metadata["age"] == 600
+    assert e.metadata["precision"] == 8
+    # Document was re-quantised, so it differs from the original.
+    assert e.document != before.document
+    # The counts dict reports one entry at the new tier.
+    assert counts == {8: 1}
+
+
+def test_re_evaluate_round_trips_strengths_within_tolerance() -> None:
+    """After re-quantisation, dequantizing returns a tensor close to the
+    original within the new tier's precision error."""
+    import base64
+    import torch
+
+    from continual_synapse.cold_storage.compression import (
+        CompressionSchedule,
+        dequantize,
+    )
+
+    store = ColdStorage(collection_name="reeval_roundtrip")
+    g = torch.Generator().manual_seed(0)
+    s = torch.randn(3, 3, generator=g)
+    _store_compressed(
+        store, s, embedding=[1.0, 0.0, 0.0], precision=32, entry_id="r"
+    )
+    sched = CompressionSchedule()
+    store.re_evaluate_all_entries(current_step=2500, schedule=sched)
+    e = store.get_by_id("r")
+    assert e.metadata["precision"] == 4
+    recovered = dequantize(
+        base64.b64decode(e.document), precision=4, shape=(3, 3)
+    )
+    # 4-bit max-abs quantisation: step ~ max(|s|)/7, half-step error ~ that/2.
+    err = (recovered - s).abs().max().item()
+    assert err < (s.abs().max().item() / 7.0) + 1e-3
+
+
+def test_re_evaluate_counts_entries_per_tier() -> None:
+    import torch
+
+    from continual_synapse.cold_storage.compression import CompressionSchedule
+
+    store = ColdStorage(collection_name="reeval_counts")
+    # Three entries, three different ages spanning the schedule tiers.
+    _store_compressed(
+        store, torch.zeros(2, 2), embedding=[1.0, 0.0],
+        created_at_step=2000, entry_id="recent",  # age 0 at step 2000 -> 32
+    )
+    _store_compressed(
+        store, torch.zeros(2, 2), embedding=[0.5, 0.5],
+        created_at_step=1500, entry_id="medium",  # age 500 -> 8-bit
+    )
+    _store_compressed(
+        store, torch.zeros(2, 2), embedding=[0.0, 1.0],
+        created_at_step=0, entry_id="old",  # age 2000 -> 4-bit
+    )
+    sched = CompressionSchedule()
+    counts = store.re_evaluate_all_entries(current_step=2000, schedule=sched)
+    assert counts == {32: 1, 8: 1, 4: 1}
+
+
+def test_re_evaluate_respects_access_count_bump() -> None:
+    """access_count >= 5 bumps the tier up by one. A medium-age
+    entry with high access_count should land in the next-higher tier."""
+    import torch
+
+    from continual_synapse.cold_storage.compression import CompressionSchedule
+
+    store = ColdStorage(collection_name="reeval_access")
+    _store_compressed(
+        store, torch.zeros(2, 2), embedding=[1.0, 0.0],
+        created_at_step=0, access_count=10, entry_id="popular",
+    )
+    sched = CompressionSchedule()
+    store.re_evaluate_all_entries(current_step=600, schedule=sched)
+    e = store.get_by_id("popular")
+    # age 600 normally -> 8-bit (tier index 2). access_count 10 >= 5
+    # bumps it up to tier index 1 -> 16-bit.
+    assert e.metadata["precision"] == 16
+
+
+def test_re_evaluate_empty_store_returns_empty_counts() -> None:
+    from continual_synapse.cold_storage.compression import CompressionSchedule
+
+    store = ColdStorage(collection_name="reeval_empty")
+    counts = store.re_evaluate_all_entries(
+        current_step=1000, schedule=CompressionSchedule()
+    )
+    assert counts == {}
+
+
+def test_re_evaluate_reduces_total_byte_size() -> None:
+    """Memory footprint should actually shrink after a sweep that
+    moves entries to lower precision."""
+    import base64
+    import torch
+
+    from continual_synapse.cold_storage.compression import CompressionSchedule
+
+    store = ColdStorage(collection_name="reeval_memory")
+    for i in range(5):
+        _store_compressed(
+            store,
+            torch.randn(4, 4, generator=torch.Generator().manual_seed(i)),
+            embedding=[float(i), 0.0],
+            created_at_step=0,
+            entry_id=f"e{i}",
+        )
+    before_bytes = sum(
+        len(base64.b64decode(e.document)) for e in store.all_entries()
+    )
+    store.re_evaluate_all_entries(
+        current_step=3000, schedule=CompressionSchedule()
+    )
+    after_bytes = sum(
+        len(base64.b64decode(e.document)) for e in store.all_entries()
+    )
+    # 4-bit entries are roughly 1/8 the size of 32-bit.
+    assert after_bytes < before_bytes / 4
