@@ -6,6 +6,115 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-23] Phase 4c: 30-task extended sequence — the gap is flat at zero
+
+To check whether the synapse + cold-storage gap to naive baseline
+was stable, narrowing, or widening with more tasks, the
+experiment from Phase 4b was re-run with 30 Permuted-MNIST tasks
+(naive and synapse_full_cold_storage only — 5 seeds, same
+hyperparameters, same architecture).
+
+### 30-task numbers (5 seeds, Permuted-MNIST shared head)
+
+| Method                          | ACC          | FGT          |
+|---------------------------------|--------------|--------------|
+| naive                           | 0.276 ± 0.015| 0.705 ± 0.015|
+| synapse_full_cold_storage       | 0.277 ± 0.018| 0.704 ± 0.019|
+
+Wilcoxon signed-rank: p_corr = 0.8125 (no significance).
+Difference in mean ACC: 0.001. Difference in std: 0.003.
+
+Cold-storage consolidations per seed: 405–461 (≈ 15 cycles per
+task average). Store growth scaled roughly linearly with task
+count.
+
+### Answer to the headline question
+
+**The gap is flat, neither narrowing nor widening.** At every
+training step from 1 to 30, the cold_storage − naive average-
+accuracy gap sits in [-0.02, +0.01] with mean very close to zero.
+See ``results/figures/extended_sequence/gap_vs_tasks_seen.png``.
+
+### What this overturns from Phase 4b
+
+The Phase 4b architectural call leaned heavily on **two**
+secondary findings since the headline ACC was already a near-tie:
+
+1. *Cold storage repairs the synapse regression* (+7.5 pp vs
+   synapse_full alone). This is unchanged — synapse_full alone
+   was not re-run at 30 tasks, but there's no reason to expect
+   the +7.5 pp recovery effect changed.
+
+2. *Cold storage reduces variance 8×* (std 0.092 → 0.011 at 15
+   tasks). **This effect did NOT generalise.** At 30 tasks:
+
+   | Tasks | naive std | cold-storage std | ratio |
+   |-------|-----------|------------------|-------|
+   | 15    | 0.024     | 0.011            | 2.2×  |
+   | 30    | 0.015     | 0.018            | 0.83× |
+
+   The "variance reduction" was a 15-task observation that
+   reversed by 30 tasks. The Phase-4b std numbers may have
+   been a seed-specific quirk or a too-early measurement; with
+   the working set saturated for longer the cold-storage variant
+   is no more stable than naive (slightly less, in fact).
+
+### Implication for Phase 5 framing
+
+Phase 4b's architectural call was "proceed to Phase 5 with the
+contribution explicitly reframed around robustness and variance
+reduction." That framing now has thin empirical support:
+
+- **ACC ≈ naive** at both 15 and 30 tasks. No absolute benefit.
+- **Variance reduction did not generalise** beyond 15 tasks.
+- **The synapse-repair contribution is real** but it just brings
+  the architecture *to* naive parity, not past it.
+- **Runtime cost is 7× naive** (1547 s vs 219 s at 30 tasks)
+  with no measurable accuracy benefit.
+
+The honest reading: the cold-storage variant is **expensive
+parity** with the naive baseline on Permuted-MNIST, with no
+generalising stability benefit. Phase 4b's optimism about
+"graceful degradation profile" was driven mostly by EWC's
+catastrophic collapse (a hyperparameter artifact); against the
+naive baseline alone, there is no distinguishing positive
+finding to report.
+
+This sharpens the Phase 5 question: rather than "proceed with
+reframed contribution", the more honest call is:
+
+- **Option B-revised (pivot to negative-results writeup) is now
+  the better call** unless the next session uncovers a stress
+  condition where the cold-storage variant clearly wins.
+
+Two concrete next experiments would be decisive:
+
+1. **EWC λ-sweep on Permuted-MNIST 15 and 30 tasks.** Find the λ
+   where EWC stays well-tuned; compare to synapse + cold storage
+   at that point. If EWC tuned well decisively beats us, the
+   "robust vs EWC" story collapses entirely.
+
+2. **A stress condition designed to favour episodic memory.**
+   e.g., task interleaving (revisit task 1 after task 10 and
+   measure recall), or distribution shift mid-stream. If cold
+   storage's context-dependent retrieval helps anywhere, it
+   should help here.
+
+If both of those come back neutral or negative, the writeup
+pivots: "We implemented a memory-inspired continual-learning
+architecture (synapse layer + cold storage), tested it
+rigorously on Permuted-MNIST at 15 and 30 tasks against naive
+sequential fine-tuning, and found no measurable benefit. The
+implementation is a clean reference for future work but the
+architectural hypothesis was not supported by the data."
+
+### Status: architectural call now leans Option B
+
+Pending the two follow-up probes above. If either reveals a
+defensible positive condition, Option A returns.
+
+---
+
 ## [2026-05-23] Phase 4b: long-sequence decisive test + architectural call
 
 This is the test the entire project was building toward: 15-task
