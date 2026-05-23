@@ -18,6 +18,9 @@ subclassing:
   EWC and similar methods use this to penalise parameter drift.
 - ``on_task_end(i, task, model)`` fires after each task's training
   loop. EWC uses it to compute Fisher and snapshot parameters.
+- ``on_after_batch(i, task, model, x, y)`` fires after every
+  optimizer step. The synapse-augmented MLP uses it to apply the
+  Hebbian update from the activations cached during forward.
 """
 
 from __future__ import annotations
@@ -40,6 +43,9 @@ logger = logging.getLogger(__name__)
 OptimizerFactory = Callable[[Iterable[nn.Parameter]], torch.optim.Optimizer]
 Regulariser = Callable[[nn.Module], torch.Tensor]
 TaskEndCallback = Callable[[int, Task, nn.Module], None]
+AfterBatchCallback = Callable[
+    [int, Task, nn.Module, torch.Tensor, torch.Tensor], None
+]
 
 
 @dataclass
@@ -96,6 +102,7 @@ class ContinualRunner:
     record_zero_shot: bool = True
     regulariser: Regulariser | None = None
     on_task_end: TaskEndCallback | None = None
+    on_after_batch: AfterBatchCallback | None = None
 
     def run(self, model: nn.Module, benchmark: ContinualBenchmark) -> RunResult:
         """Train ``model`` sequentially on ``benchmark`` and return results."""
@@ -116,7 +123,7 @@ class ContinualRunner:
             if self.record_zero_shot and i + 1 < T:
                 R[i, i + 1] = self._evaluate(model, tasks[i + 1])
 
-            self._train_one_task(model, optimizer, task)
+            self._train_one_task(model, optimizer, task, task_index=i)
 
             if self.on_task_end is not None:
                 self.on_task_end(i, task, model)
@@ -146,6 +153,7 @@ class ContinualRunner:
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         task: Task,
+        task_index: int,
     ) -> None:
         loader = DataLoader(
             task.train,
@@ -165,6 +173,8 @@ class ContinualRunner:
                     loss = loss + self.regulariser(model)
                 loss.backward()
                 optimizer.step()
+                if self.on_after_batch is not None:
+                    self.on_after_batch(task_index, task, model, x, y)
 
     @torch.no_grad()
     def _evaluate(self, model: nn.Module, task: Task) -> float:
