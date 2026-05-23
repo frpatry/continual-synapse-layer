@@ -226,3 +226,4 @@ results/logs/*.json
 results/figures/*
 results/tables/*
 !results/**/.gitkeep
+!results/figures/long_sequence/
