@@ -187,22 +187,49 @@ def test_beta_zero_strength_update_matches_v1_exactly() -> None:
 
 
 def test_resistance_dampens_high_evidence_updates() -> None:
-    """A synapse with high evidence gets a smaller update than a fresh one."""
+    """High-normalised-evidence synapses get a smaller update.
+
+    Evidence is normalised by its current max before applying β,
+    so the most-evidenced synapse always sees ``1/(1+β)`` resistance
+    and zero-evidence synapses see no dampening.
+    """
     layer = SynapseLayer(n_neurons=2, learning_rate=1.0, resistance_beta=1.0)
-    # Manually pre-load evidence to put one entry far above the other.
+    # Pre-load evidence: max is 10, normalised becomes 1 for (0,0)
+    # and 0 for (1,1).
     with torch.no_grad():
-        layer.evidence[0, 0] = 10.0  # 1/(1+1*10) = 1/11 resistance factor
-        layer.evidence[1, 1] = 0.0   # full update on this position
+        layer.evidence[0, 0] = 10.0
+        layer.evidence[1, 1] = 0.0
 
     a = torch.tensor([[1.0, 1.0]])
     layer.consolidate(a, reward=1.0)
 
-    # raw_outer is all-ones for this input; expected[0,0] = 1/11,
-    # expected[1,1] = 1, expected[0,1] = 1/(1+5) = 1/6 (mean evidence ~5).
+    # raw_outer is all-ones; with β=1 and max_ev=10:
+    #   resistance[0,0] = 1/(1+1*1) = 1/2
+    #   resistance[1,1] = 1/(1+1*0) = 1
     s = layer.strengths
-    assert s[1, 1].item() > s[0, 0].item()  # high-evidence resists more
-    assert abs(s[0, 0].item() - 1.0 / 11.0) < 1e-5
+    assert s[1, 1].item() > s[0, 0].item()
+    assert abs(s[0, 0].item() - 0.5) < 1e-5
     assert abs(s[1, 1].item() - 1.0) < 1e-5
+
+
+def test_resistance_is_dataset_scale_independent() -> None:
+    """Doubling the evidence scale should leave the strength update unchanged.
+
+    With normalised evidence, only the *relative* magnitudes matter,
+    so β has the same effective meaning regardless of how large
+    evidence has grown.
+    """
+    layer_a = SynapseLayer(n_neurons=2, learning_rate=1.0, resistance_beta=1.0)
+    layer_b = SynapseLayer(n_neurons=2, learning_rate=1.0, resistance_beta=1.0)
+    with torch.no_grad():
+        layer_a.evidence.fill_(10.0)
+        layer_a.evidence[0, 0] = 5.0
+        layer_b.evidence.fill_(10000.0)
+        layer_b.evidence[0, 0] = 5000.0  # same ratio
+    a = torch.tensor([[1.0, 1.0]])
+    layer_a.consolidate(a)
+    layer_b.consolidate(a)
+    torch.testing.assert_close(layer_a.strengths, layer_b.strengths)
 
 
 def test_resistance_reduces_cumulative_drift() -> None:

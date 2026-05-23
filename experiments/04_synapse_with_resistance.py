@@ -67,9 +67,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--beta",
         type=float,
-        default=1.0,
+        default=10.0,
         help="Evidence-based resistance coefficient (active in "
-        "modes 'resistance' and 'resistance_full').",
+        "modes 'resistance' and 'resistance_full'). Phase 3 uses "
+        "normalised evidence, so β is dataset-independent: at β=10 "
+        "the most-evidenced synapse keeps ~9% of its update.",
     )
     p.add_argument(
         "--gamma",

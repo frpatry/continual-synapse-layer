@@ -17,12 +17,26 @@ rule. They exist so that Phase 4's pressure-based consolidation
 can compute its scoring formula and so that ablation experiments
 can correlate any future rule that uses them with the behaviour we
 observe now.
+
+The update rule (DESIGN.md eq. 3.2 with normalised evidence)::
+
+    Δs_ij = η · R · raw_ij · 1 / (1 + β · normalised_evidence_ij)
+    normalised_evidence = evidence / (max(evidence) + ε)
+    E_ij ← E_ij + |a_i| · |a_j|
+
+Normalising by ``max(evidence)`` makes ``β`` dataset-independent:
+``β`` is now the dampening factor for the *most-evidenced* synapse
+in the layer, regardless of how large raw evidence happens to grow
+on the chosen benchmark.
 """
 
 from __future__ import annotations
 
 import torch
 from torch import nn
+
+
+_EVIDENCE_NORM_EPS = 1e-6
 
 
 class SynapseLayer(nn.Module):
@@ -109,14 +123,16 @@ class SynapseLayer(nn.Module):
         raw_outer = a.transpose(-1, -2) @ a / batch_size
         abs_outer = a.abs().transpose(-1, -2) @ a.abs() / batch_size
 
-        # ---- strength update with optional resistance ----
+        # ---- strength update with normalised-evidence resistance ----
         if self.resistance_beta == 0.0:
             # Fast path identical to Phase-2 v1; bit-for-bit.
             self.strengths.add_(
                 raw_outer, alpha=self.learning_rate * float(reward)
             )
         else:
-            resistance = 1.0 / (1.0 + self.resistance_beta * self.evidence)
+            ev_max = self.evidence.max().clamp_min(_EVIDENCE_NORM_EPS)
+            normalised_evidence = self.evidence / ev_max
+            resistance = 1.0 / (1.0 + self.resistance_beta * normalised_evidence)
             self.strengths.add_(
                 raw_outer * resistance,
                 alpha=self.learning_rate * float(reward),
