@@ -25,9 +25,9 @@ jobs:
           cache: pip
 
       - name: Install test dependencies
-        # The test suite needs torch, numpy, pytest, and now scipy
-        # (for the Wilcoxon signed-rank test in the statistics
-        # module). Heavier deps (datasets, chromadb, transformers,
+        # The test suite needs torch, numpy, pytest, scipy (Wilcoxon
+        # signed-rank in the statistics module), and chromadb (cold
+        # storage tests). Heavier deps (datasets, transformers,
         # matplotlib) remain CI-excluded because no test imports
         # them. Versions match requirements.txt pins.
         run: |
@@ -36,6 +36,7 @@ jobs:
             "torch==2.12.0" \
             "numpy==2.4.6" \
             "scipy==1.16.3" \
+            "chromadb==1.2.1" \
             "pytest==9.0.3"
 
       - name: Run pytest

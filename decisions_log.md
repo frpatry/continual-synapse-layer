@@ -6,6 +6,156 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-23] Phase 4 (partial): cold storage architecture + short-benchmark result
+
+This session implemented the full Phase-4 architecture — cold
+storage, compression pipeline, pressure-based consolidation
+trigger, consolidation pipeline (synapse → store), reconstructive
+retrieval (store → synapse), and integration into
+``SynapseAugmentedMLP`` — plus the 5-task multi-head experiment 07
+that the project plan flagged as the short-benchmark test. The
+decisive 15+ task long-sequence experiment (08) is deferred to
+the next session per PROJECT_PLAN.md §7 / Phase 4 priorities.
+
+The architectural call (proceed to Phase 5 vs pivot to negative
+writeup) **remains deferred** until experiment 08 results are in.
+
+### Cold-storage backend: Chroma in-memory, document-as-bytes
+
+**Decision:** Use ``chromadb.Client()`` (in-memory, no server)
+as the vector store. Per-entry storage:
+
+- ``embedding``: activation pattern at consolidation time (used
+  for retrieval).
+- ``document``: base-64-encoded compressed strengths matrix.
+- ``metadata``: precision, n_neurons, age, access_count,
+  created_at_step, num_candidates.
+
+**Rationale:** Chroma's metadata fields don't accept raw bytes,
+so the compressed strengths live in ``document`` (Chroma's free-
+form string slot) as base-64. This keeps the schema declarative
+without a sidecar store.
+
+### Compression schedule: 32 → 16 → 8 → 4 bit by age, bumped by access
+
+**Decision:** ``CompressionSchedule(age_thresholds=(100, 500,
+2000), tier_precisions=(32, 16, 8, 4), access_count_floor=5)``.
+Quantisation is symmetric per-tensor max-abs; 4-bit values are
+packed two per byte and sign-extended on dequantise.
+
+**Trade-off:** 4-bit halves storage from 8-bit but the per-element
+quantisation error is up to ~14 % of the value range. Acceptable
+because the archive holds gist, not detail — and any entry we
+care about gets bumped up a tier via ``access_count``.
+
+### Pressure metric: avg-pressure trigger with refractory + top-quantile candidates
+
+**Decision:** Mean of ``|s_ij| · e_ij / (1 + a_ij)`` across the
+synapse matrix, with a configurable threshold. ``min_steps_between``
+adds a refractory period; ``candidate_quantile`` selects which
+synapses get archived once the cycle fires.
+
+**Tuning observation:** With our 256×256 synapse matrix on
+Split-MNIST, mean pressure ends at ~0.013 even after a full run.
+The PROJECT_PLAN.md default of "around 0.1" produced zero
+consolidations. Threshold 0.005 fires roughly every 30 batches.
+The right threshold is dataset- and capacity-dependent; a more
+principled auto-calibration (e.g., percentile-based or relative
+to long-running mean) is open work for Phase 5.
+
+### Consolidation pipeline: one entry per cycle, no k-means in v1
+
+**Decision:** Each fired cycle archives a single Chroma entry
+containing the candidate synapses' strengths (non-candidates
+zeroed) at the fresh-precision tier (32-bit). K-means clustering
+of candidates (DESIGN.md §3.5) is deferred to a refinement — one
+entry per cycle keeps the data path tractable for the first
+working version.
+
+**Drain semantics:** strength, evidence, access_count are zeroed
+on the candidate positions; age and confidence are preserved. The
+spec says "reset strength, evidence, access counters" and we
+follow it literally — age/confidence track the *cell's* lifecycle,
+not the *pattern's*.
+
+### Reconstructive retrieval: context-dependent, similarity-weighted
+
+**Decision:** Forward path consults cold storage with the current
+batch's mean activation as the query. Top-k retrieved entries are
+decompressed and averaged with weights ``1 / (1 + distance)``;
+the resulting strengths matrix is added to the synapse's working
+matrix before the modulator applies its gate.
+
+**Why context-dependent matters:** Phase 3.5 surfaced the
+hypothesis that the synapse layer's universal correction matrix
+conflicts with multi-head's per-task representations. With cold
+storage, different tasks pull different slices of the archive
+because they produce different activation patterns. The same
+modulator now produces task-conditioned corrections without the
+synapse layer itself needing per-task heads.
+
+**Side-effect:** Each retrieval bumps the retrieved entries'
+``access_count`` metadata, which feeds back into both the
+compression schedule (frequently-accessed entries stay sharper)
+and the pressure metric (frequently-accessed entries are less
+likely to be re-consolidated).
+
+### Backward-compatible integration
+
+**Decision:** ``SynapseAugmentedMLP`` accepts optional
+``cold_storage``, ``consolidation_trigger``, and ``retrieval_k``.
+When ``cold_storage=None`` the model reproduces Phase-3 behaviour
+bit-for-bit (verified by 15 unchanged tests).
+
+### Phase 4 numbers, honestly (n=5 seeds, multi-head Split-MNIST)
+
+| Method                          | ACC          | FGT          |
+|---------------------------------|--------------|--------------|
+| naive (multi-head)              | 0.833 ± 0.055| 0.197 ± 0.068|
+| ewc (multi-head, λ=1000)        | 0.956 ± 0.020| 0.041 ± 0.023|
+| synapse_full (multi-head)       | 0.810 ± 0.065| 0.227 ± 0.081|
+| synapse_full_cold_storage       | 0.812 ± 0.066| 0.224 ± 0.083|
+
+The cold-storage variant moves ACC by 0.2 pp and FGT by 0.3 pp
+on this 5-task benchmark — well inside one std and Bonferroni-
+corrected p of 1.0 vs synapse_full. **Cold storage shows no
+measurable benefit on 5-task Split-MNIST.**
+
+This matches the expected framing: with only 5 tasks, the synapse
+layer's working set (256² = 65 k synapses) never saturates. The
+trigger fires (~30 batch intervals at threshold 0.005), entries
+accumulate in cold storage, retrieval queries succeed — but the
+retrieved patterns don't carry information the working set has
+already lost, so the augmentation is a noisy no-op.
+
+### What's next: experiment 08 (long sequence)
+
+The decisive test for the project hypothesis is a 15-20 task
+sequence where capacity saturation forces real reliance on the
+archive. The Phase-4 v1 architecture is in place to run that test;
+the next session will:
+
+1. Build a Permuted-MNIST (or Rotated-MNIST) benchmark with 15+
+   tasks.
+2. Re-run the same four methods at 5 seeds.
+3. Report per-task accuracy trajectories, memory footprint over
+   time, and consolidation-cycle counts in addition to ACC/FGT.
+4. Make the architectural call (proceed to Phase 5 vs pivot to
+   negative writeup) with the full data.
+
+### Deferred to future sessions
+
+- Experiment 08 (long-sequence benchmark) — next session.
+- K-means clustering of consolidation candidates — refinement.
+- Auto-tuned pressure threshold (percentile-based or relative) —
+  removes a hyperparameter that was already painful to set.
+- Reward-signal investigation (consistency EMA tuning) — still
+  open from Phase 3.
+- DistilBERT integration + Split-AG-News — still open from
+  Phase 3.5.
+
+---
+
 ## [2026-05-23] Phase 3.5: multi-head probe and deferred architectural call
 
 This exploratory session tested whether the synapse architecture
