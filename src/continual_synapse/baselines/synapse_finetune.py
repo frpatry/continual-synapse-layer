@@ -91,7 +91,7 @@ class SynapseAugmentedMLP(nn.Module):
         return f_base + self.modulator(f_base, self.synapse.strengths)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base.head(self.features(x))
+        return self.base.classify(self.features(x))
 
     @torch.no_grad()
     def apply_hebbian_update(self, reward: float | None = None) -> float:

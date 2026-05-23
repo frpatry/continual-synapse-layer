@@ -64,5 +64,14 @@ class MLPClassifier(nn.Module):
         """Return penultimate-layer activations for input ``x``."""
         return self.backbone(x)
 
+    def classify(self, features: torch.Tensor) -> torch.Tensor:
+        """Apply the classification head to a precomputed feature tensor.
+
+        Factored out so callers that need the post-feature pathway (the
+        synapse-augmented MLP, multi-head variants) can swap heads
+        without re-implementing the forward shape.
+        """
+        return self.head(features)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(self.features(x))
+        return self.classify(self.features(x))
