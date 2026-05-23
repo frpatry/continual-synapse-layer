@@ -6,6 +6,101 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-23] Architectural completion Part 1: multi-pass implemented (and the silent simplification it closes)
+
+### Meta-finding: the silent Phase-2 simplification
+
+A read-only audit on 2026-05-23 surfaced a discrepancy between
+DESIGN.md / PROJECT_PLAN.md and the implementation: the multi-pass
+co-activation mechanism described in DESIGN.md §3.2 and pseudo-coded
+in PROJECT_PLAN.md §4.2.1 (lines 129–149 with ``activation_buffer``,
+``observe()``, ``consolidate()`` averaging) was **never built**.
+Phase-2 v1 (``synapse_layer/layer.py``, commit 92cefdd, 2026-05-23
+session 4) silently substituted single-pass batch-mean — outer
+products were computed from one forward of one batch, never from
+multiple forwards averaged together. The simplification was not
+recorded as a deferral; subsequent phases all built on top of it
+without noticing.
+
+This is a real failure mode for spec-to-code traceability. Every
+other deferred item from DESIGN.md (confidence, sparse top-k,
+k-means clustering, etc.) was logged as a deferral in this very
+file. Multi-pass was not. The cause was likely that single-pass
+batch-mean and multi-pass averaging look superficially similar in
+the v1 dense-MLP setting (both reduce noise across samples) and
+the gap was easy to miss without re-reading the spec carefully.
+
+The audit also flagged a second silent simplification — the
+compression schedule never re-fires post-insert, so every cold-
+storage entry stays at 32-bit forever. That one is addressed in
+Part 2 of this architectural-completion work; see the next
+entry below.
+
+### What this means for Phase 4b and 4c results
+
+The "cold storage shows no benefit" and "the gap is flat at zero"
+findings from Phase 4b/4c were collected with the *single-pass*
+synapse layer — i.e. an architecturally incomplete system. The
+finding still stands as a fact about that exact configuration,
+but it does not yet falsify the architectural hypothesis,
+because the design called for multi-pass.
+
+Experiment 11 (next session's compute) re-runs the same
+benchmarks with the spec-complete architecture (multi-pass +
+compression sweep) so we can quantify how much of the prior
+result was an artifact of the simplifications versus the
+underlying mechanism.
+
+### Multi-pass design decisions
+
+**SynapseLayer dual-mode consolidate.** The new
+``consolidate(activations=None, reward=1.0)`` keeps the Phase-3
+explicit-activations path bit-exact when the buffer is empty;
+when the buffer is non-empty, the activations argument is
+forbidden and the buffer is averaged via ``stack(...).mean(0)``
+before the outer products are computed. Two paths, one method,
+no behavioural drift for existing callers. ``observe()`` is
+the new entry point; ``buffer_size``, ``buffer_average()``, and
+``clear_buffer()`` round out the public surface for callers that
+want to inspect or reset state.
+
+**``n_passes`` on the layer is informational.** The SynapseLayer
+itself averages whatever the buffer holds — it does not enforce
+that exactly ``n_passes`` observations were made. The ``n_passes``
+field is mainly documentation for callers and shows up in
+``extra_repr``. The wrapper (SynapseAugmentedMLP) is where the
+operational semantics live.
+
+**Multi-pass is training-mode-only.** In
+``SynapseAugmentedMLP.features``, the extra forwards run only
+when ``self.training and self.n_passes > 1``. During evaluation
+the buffer stays empty so the runner's repeated ``forward(x)``
+calls in ``_evaluate`` never pollute synapse state. This is
+both correctness (eval should not change the model) and a
+performance optimisation.
+
+**The first forward is the loss-contributing one.** When N>1
+forwards happen, the first call's ``f_base`` is the one that
+becomes part of the modulated output and reaches the classifier
+head; the additional N-1 forwards are observation-only re-runs
+of ``base.features(x)``. This keeps autograd clean — only one
+forward graph contributes to backward.
+
+**Deterministic vs stochastic forwards.** For a fully
+deterministic forward (no dropout), all N passes give identical
+activations and ``stack(N copies).mean()`` equals any single
+copy. So ``n_passes > 1`` on a deterministic MLP is provably a
+no-op. The benefit only materialises when forwards are stochastic
+— enabling dropout in the base MLPConfig is the natural switch.
+Experiment 11 will exercise the stochastic variant explicitly.
+
+**Backward compatibility.** Every Phase-3 test still passes, and a
+new dedicated test (``test_consolidate_single_pass_unchanged_when_buffer_empty``)
+locks the buffer-empty path bit-exact equivalent to the legacy
+``consolidate(activations, reward)`` API.
+
+---
+
 ## [2026-05-23] Phase 4c: 30-task extended sequence — the gap is flat at zero
 
 To check whether the synapse + cold-storage gap to naive baseline
