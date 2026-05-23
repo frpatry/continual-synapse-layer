@@ -25,12 +25,17 @@ rather than self-reinforcing its own correction.
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 from torch import nn
 
 from continual_synapse.baselines.naive_finetune import MLPClassifier
 from continual_synapse.synapse_layer.layer import SynapseLayer
 from continual_synapse.synapse_layer.modulation import SynapseModulation
+
+
+RewardComputer = Callable[[torch.Tensor], float]
 
 
 class SynapseAugmentedMLP(nn.Module):
@@ -48,6 +53,11 @@ class SynapseAugmentedMLP(nn.Module):
             correction. Defaults to a fresh ``SynapseModulation()``
             with ``gate=0`` so the model is functionally identical
             to the base MLP at init.
+        reward_computer: Optional callable taking the cached
+            pre-correction features and returning a scalar reward.
+            When ``None`` (the default), the Hebbian update uses a
+            fixed reward of ``1.0``, matching Phase-2 v1 behaviour.
+            Typically a :class:`RewardMixer`.
     """
 
     def __init__(
@@ -55,6 +65,7 @@ class SynapseAugmentedMLP(nn.Module):
         base: MLPClassifier,
         synapse: SynapseLayer,
         modulator: SynapseModulation | None = None,
+        reward_computer: RewardComputer | None = None,
     ) -> None:
         super().__init__()
         if synapse.n_neurons != base.config.hidden_dim:
@@ -65,6 +76,7 @@ class SynapseAugmentedMLP(nn.Module):
         self.base = base
         self.synapse = synapse
         self.modulator = modulator if modulator is not None else SynapseModulation()
+        self.reward_computer = reward_computer
         self._last_features: torch.Tensor | None = None
 
     def features(self, x: torch.Tensor) -> torch.Tensor:
@@ -82,18 +94,32 @@ class SynapseAugmentedMLP(nn.Module):
         return self.base.head(self.features(x))
 
     @torch.no_grad()
-    def apply_hebbian_update(self, reward: float = 1.0) -> None:
+    def apply_hebbian_update(self, reward: float | None = None) -> float:
         """Push the most recently observed features into the synapse layer.
 
         Must be called after a forward pass (training or evaluation).
         Raises if no features have been cached yet so the caller
         notices a missing forward instead of silently skipping the
         update.
+
+        Args:
+            reward: If provided, used directly. If ``None`` and a
+                ``reward_computer`` was configured, the computer is
+                called on the cached features. Otherwise a fixed
+                ``1.0`` is used. Returns the reward value actually
+                applied so callers (and experiments) can log it.
         """
         if self._last_features is None:
             raise RuntimeError(
                 "No features cached. Run a forward pass before calling "
                 "apply_hebbian_update()."
             )
-        self.synapse.consolidate(self._last_features, reward=reward)
+        features = self._last_features
+        if reward is None:
+            if self.reward_computer is not None:
+                reward = float(self.reward_computer(features))
+            else:
+                reward = 1.0
+        self.synapse.consolidate(features, reward=reward)
         self._last_features = None
+        return reward

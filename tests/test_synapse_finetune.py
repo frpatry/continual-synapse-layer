@@ -151,6 +151,65 @@ def test_runner_after_batch_hook_fires_once_per_batch() -> None:
     assert [i for i, _ in calls[6:]] == [1] * 6
 
 
+# ---- Phase 3: reward computer wiring ----
+
+
+def test_apply_hebbian_update_uses_fixed_reward_when_no_computer() -> None:
+    aug, _ = _build_augmented()
+    aug(torch.randn(2, 4))
+    applied = aug.apply_hebbian_update()
+    assert applied == 1.0
+
+
+def test_apply_hebbian_update_uses_explicit_reward_when_provided() -> None:
+    aug, _ = _build_augmented()
+    aug(torch.randn(2, 4))
+    applied = aug.apply_hebbian_update(reward=0.25)
+    assert applied == 0.25
+
+
+def test_apply_hebbian_update_uses_reward_computer_when_no_explicit_value() -> None:
+    """The reward computer is called with the cached features."""
+    received: list[torch.Tensor] = []
+
+    def reward_fn(features: torch.Tensor) -> float:
+        received.append(features.clone())
+        return 0.3
+
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=8, learning_rate=0.1)
+    aug = SynapseAugmentedMLP(
+        base, synapse, SynapseModulation(), reward_computer=reward_fn
+    )
+    x = torch.randn(3, 4)
+    aug(x)
+    applied = aug.apply_hebbian_update()
+
+    assert applied == 0.3
+    assert len(received) == 1
+    # The computer must see the same pre-correction features used by
+    # `consolidate`, i.e. base.features(x).detach().
+    torch.testing.assert_close(received[0], base.features(x).detach())
+
+
+def test_explicit_reward_overrides_computer() -> None:
+    """A caller-supplied reward bypasses the configured computer."""
+    calls: list[None] = []
+
+    def reward_fn(features: torch.Tensor) -> float:
+        calls.append(None)
+        return 0.9
+
+    aug, _ = _build_augmented()
+    aug.reward_computer = reward_fn
+    aug(torch.randn(2, 4))
+    applied = aug.apply_hebbian_update(reward=0.1)
+    assert applied == 0.1
+    assert calls == []  # computer not invoked
+
+
 def test_runner_end_to_end_with_synapse_smoke() -> None:
     """End-to-end: the synapse-augmented MLP trains without crashing and
     the strengths grow as Hebbian updates accumulate."""
