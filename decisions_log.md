@@ -6,6 +6,108 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-23] Phase 1 close-out: EWC, experiments, CI, README
+
+This session closed the remaining Phase 1 deliverables.
+
+### EWC implementation
+
+**Decision:** Implement diagonal *empirical* Fisher Information,
+estimated sample-by-sample on each task's training set, with
+per-task storage of Fisher and parameter snapshots.
+
+**Alternatives considered:**
+- **True Fisher** (expectation under the model's predictive
+  distribution): more correct, slower, requires sampling y from
+  softmax(logits). Empirical Fisher uses the true labels and is the
+  standard choice in practical EWC reproductions (e.g., the original
+  Kirkpatrick code, most public EWC repos).
+- **Mini-batch Fisher** (average gradient within a batch then
+  square): faster but biased — the Fisher is the expectation of
+  *per-sample* squared gradients, and squaring a batch-averaged
+  gradient does not equal averaging squared per-sample gradients.
+- **Online EWC** (accumulate Fisher into a single running matrix
+  with a forgetting factor): saves O(T) memory. The original paper
+  keeps per-task Fisher; for Phase 1 we follow the paper. Phase 5
+  re-evaluations may revisit this.
+
+**Trade-offs:** Sample-by-sample Fisher is slow (`fisher_sample_size`
+caps the cost). Per-task storage is `O(T * P)` where `P` is the
+parameter count. Both are fine at MLP scale; will revisit at
+transformer scale.
+
+### Runner extension points (vs. subclassing)
+
+**Decision:** Add two optional callbacks to `ContinualRunner` —
+`regulariser(model) -> Tensor` (per batch) and
+`on_task_end(i, task, model)` (after each task). Continual-learning
+methods are wired in by passing these callbacks at construction
+time rather than subclassing.
+
+**Rationale:** Callbacks compose: EWC + replay + the synapse layer
+can all be active in the same run without inheritance gymnastics.
+The runner stays one class. Cost is two extra fields and a few
+lines of plumbing.
+
+### EWC numbers on shared-head Split-MNIST
+
+**Observation (not a permanent decision):** With the Phase-1
+shared 2-class head, EWC exhibits the classic stability/plasticity
+trade-off in a stark way:
+
+| `λ` | ACC | Forgetting |
+|---|---|---|
+| 0 (naive) | 0.604 | 0.483 |
+| 1000 | 0.636 | 0.434 |
+| 10000 | 0.610 | 0.466 |
+| 100000 | 0.493 | 0.254 |
+
+Strong λ preserves old tasks but freezes the head and stops new
+learning. Standard EWC reproductions use multi-head Split-MNIST
+where the head per task absorbs task-specific gradients. We are
+keeping the shared-head setup for now because it makes the
+catastrophic-forgetting story unambiguous; Phase 5 will rerun the
+EWC comparison with the multi-head variant as a separate baseline.
+
+### Experiment logs: JSON, ignored by git
+
+**Decision:** Each experiment run writes a JSON file to
+`results/logs/<unix_ts>_<experiment>_<method>.json` capturing
+config, accuracy matrix, metrics, and git SHA. The directory is
+tracked via `.gitkeep`, but the logs themselves are git-ignored.
+
+**Rationale:** Logs are easily regenerated from the script; keeping
+them in git would bloat history without adding signal. A future
+phase that needs to pin "the numbers for the article" can drop a
+chosen subset under `results/tables/` with explicit naming.
+
+### CI: minimal install, no heavy deps
+
+**Decision:** The GitHub Actions workflow installs only
+`torch`, `numpy`, and `pytest`. It does not install `datasets`,
+`chromadb`, `transformers`, `matplotlib`, etc.
+
+**Rationale:** The test suite uses synthetic tensors — it does not
+download datasets or touch chromadb. Skipping those installs cuts
+CI time and avoids flakes from external services.
+
+**Trade-off:** Experiments are not exercised in CI. We'll need a
+separate "long" workflow if/when we want nightly experiment runs.
+
+### Reporting helper placement
+
+**Decision:** Shared experiment-side code lives in
+`src/continual_synapse/evaluation/reporting.py`. Experiments under
+`experiments/` import it via the package.
+
+**Rationale:** Keeps experiment scripts small and lets the
+reporting code be unit-tested like the rest of the package. The
+alternative — `experiments/_common.py` — would require sys.path
+gymnastics and would not be testable through the standard pytest
+configuration.
+
+---
+
 ## [2026-05-23] Pinned versions bumped for Python 3.13
 
 **Decision:** Replace the pins in PROJECT_PLAN.md section 5.1 with
