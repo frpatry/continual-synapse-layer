@@ -185,6 +185,58 @@ def plot_consolidations(payload: dict, out_path: Path) -> None:
     plt.close(fig)
 
 
+def plot_running_avg_gap(
+    payload: dict,
+    out_path: Path,
+    *,
+    method_a: str = "synapse_full_cold_storage",
+    method_b: str = "naive",
+) -> None:
+    """Plot ``avg_accuracy(method_a) − avg_accuracy(method_b)`` per training step.
+
+    Answers the "is the gap stable, narrowing, or widening with more
+    tasks?" question directly. Positive values mean ``method_a``
+    leads; negative means ``method_b`` leads; the slope of the
+    rolling mean tells us whether the gap evolves.
+
+    No-op if either method is missing from the payload.
+    """
+    by_name = {m["method"]: m for m in payload["methods"]}
+    if method_a not in by_name or method_b not in by_name:
+        return
+
+    Ra = _accuracy_matrices(by_name[method_a])  # (seeds, T, T)
+    Rb = _accuracy_matrices(by_name[method_b])
+    if Ra.shape[0] != Rb.shape[0]:
+        return  # different seed counts — refuse to plot a misleading gap
+
+    avg_a = _running_avg_accuracy(Ra)  # (seeds, T)
+    avg_b = _running_avg_accuracy(Rb)
+    gap = avg_a - avg_b  # (seeds, T)
+    mean = np.nanmean(gap, axis=0)
+    std = np.nanstd(gap, axis=0)
+    T = gap.shape[-1]
+    x = np.arange(1, T + 1)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.axhline(0.0, color="black", linewidth=0.8, alpha=0.6)
+    ax.plot(x, mean, marker="o", ms=3, color="tab:purple", label="gap mean")
+    ax.fill_between(
+        x, mean - std, mean + std, alpha=0.2, color="tab:purple", label="± 1 std"
+    )
+    ax.set_title(
+        f"Average-accuracy gap: {method_a} − {method_b} "
+        f"(n={Ra.shape[0]} seeds, mean ± std)"
+    )
+    ax.set_xlabel("Number of tasks trained")
+    ax.set_ylabel(f"ACC({method_a}) − ACC({method_b})")
+    ax.grid(alpha=0.3)
+    ax.legend(loc="best", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+
 def plot_forgetting_first_task(payload: dict, out_path: Path) -> None:
     """Same data as the first panel of per-task trajectories, but on
     its own at a larger size — this is the headline forgetting plot."""
@@ -236,6 +288,9 @@ def main() -> None:
     )
     plot_forgetting_first_task(
         payload, args.output_dir / "forgetting_vs_first_task.png"
+    )
+    plot_running_avg_gap(
+        payload, args.output_dir / "gap_vs_tasks_seen.png"
     )
     print(f"Saved plots to {args.output_dir}")
 
