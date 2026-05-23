@@ -6,6 +6,170 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-23] Phase 3 (partial): evidence-based resistance + reward signal
+
+This session implemented the two mechanisms scoped for "addressing
+the Phase-2 failure mode": evidence-based resistance and a real
+reward signal (external + consistency + surprise + mixer with
+developmental trajectory). Deferred to a follow-up Phase-3 session:
+``confidence``, ``age``, ``access_count``, and sparse top-k partner
+selection.
+
+### Why this session was narrower than the full Phase-3 task list
+
+**Decision:** Scope the session to the two mechanisms the user
+explicitly named, defer confidence and sparse top-k.
+
+**Rationale:** Phase 2 closed with a specific, measurable failure
+mode ("synapse just records the latest task"). Resistance directly
+attacks that failure (a high-evidence synapse no longer shifts);
+the reward signal attacks it indirectly (consistency drops on
+task switches, dampening updates). Confidence and sparse top-k are
+useful but orthogonal — they belong in their own session so the
+ablation is clean. Recorded the deferrals in
+[[phase-3-deferred]].
+
+### Evidence semantics: absolute co-activation
+
+**Decision:** ``evidence[i, j] += mean_b(|a_{b,i}| · |a_{b,j}|)``.
+
+**Alternatives considered:**
+- Signed outer product ``mean_b(a_{b,i} · a_{b,j})``: gets cancelled
+  when samples have opposite-signed activations on the same neuron
+  pair. We want "this pair fires together a lot" regardless of sign.
+- Indicator above a threshold: requires a hyperparameter and loses
+  magnitude information. Not used.
+
+**Trade-off:** Absolute-value form means evidence is monotonically
+non-decreasing per neuron pair. Without a decay term, evidence
+grows unboundedly across many updates and resistance asymptotically
+freezes the strength matrix. For Phase 3 this is acceptable
+(Split-MNIST runs are short); a Phase-4 long-horizon experiment may
+need a decay or windowed-mean variant.
+
+### β=0 default for strict v1 compatibility
+
+**Decision:** ``SynapseLayer(resistance_beta=0.0)`` takes a fast
+path that is bit-identical to Phase-2 v1. Evidence still accumulates
+but it does not multiply into the strength update.
+
+**Rationale:** The user explicitly wanted Phase 2 numbers
+reproducible. The test
+``test_beta_zero_strength_update_matches_v1_exactly`` locks it.
+
+### β must be calibrated to the evidence scale
+
+**Observation (not a permanent decision):** With activations from
+the MLP backbone and Split-MNIST, evidence reaches ~2800 after one
+full run. ``β = 1`` then gives resistance ≈ 1/2800 — strengths
+never move and the synapse layer is functionally dead. The useful
+range we found is ``β = 0.001 … 0.1``.
+
+This calibration sensitivity is a real ergonomic problem for the
+system. Two ways to address it later:
+
+1. Normalise evidence to ``[0, 1]`` (e.g., divide by a running max).
+   Then ``β`` has a benchmark-independent meaning.
+2. Schedule evidence with a decay so it settles at a known scale.
+
+Marking as a known issue. For Phase-3 reporting we tune β manually.
+
+### Reward semantics: at least one source, but no required mix
+
+**Decision:** The ``RewardMixer`` accepts any non-empty subset of
+``{external, consistency, surprise}``. Trying to construct one
+with no components raises.
+
+**Rationale:** Three sources give the user three independent
+ablation knobs and Phase-3 experiments need to exercise that
+freedom. The "at least one" rule prevents silently misconfigured
+mixers from returning zero forever.
+
+### Mixer formula has explicit edge cases
+
+**Decision:** When only ``external`` is configured, return its
+value verbatim (no ``α``-decay). When only internals are
+configured, return their weighted sum (no ``α`` involvement).
+When both are present, apply the literal formula
+``α · external + (1 - α) · (w_c · cons + w_s · surp)``.
+
+**Rationale:** Decaying the only available signal to zero (as the
+literal formula would do with only external) is obviously wrong.
+DESIGN.md's formula assumes both kinds of sources are present, so
+when one is missing the natural reading is "the other dominates".
+Documented in the module docstring so the next reader knows it
+was intentional, not a bug.
+
+### ``validated_evidence(t)`` proxied by step count
+
+**Decision:** Phase 3 v1's ``α(t)`` denominator uses the mixer's
+own call count rather than the DESIGN.md formula
+("count of times external reward confirmed an internal signal").
+
+**Rationale:** The DESIGN.md formula needs a clear definition of
+"confirmation" (a threshold? a correlation? a sign agreement?) and
+a joint statistic over reward sources. None of those are settled
+yet, and a wrong choice now would be load-bearing. The call-count
+proxy preserves the qualitative trajectory (α high early, decaying
+later) and keeps the door open for a real ``validated_evidence``
+implementation when we have data to ground it. Module docstring
+calls this out so the substitution is obvious.
+
+### Surprise reward: enable_grad inside no_grad caller
+
+**Decision:** ``SurpriseReward.__call__`` wraps its predictor's
+``loss.backward()`` in ``torch.enable_grad()``.
+
+**Why:** ``SynapseAugmentedMLP.apply_hebbian_update`` is decorated
+``@torch.no_grad`` (the Hebbian update is gradient-free), and the
+reward computer is called from inside it. SurpriseReward needs
+gradient flow for its own online SGD step on a tiny linear
+predictor. We re-enable autograd only for that local update; the
+surrounding no-grad context for the synapse update is unchanged.
+
+Caught by experiment 04 mode=resistance_full; the unit tests for
+SurpriseReward exercise it directly and so passed without revealing
+the interaction. Added a docstring note.
+
+### Phase 3 numbers, honestly
+
+Single seed, Split-MNIST, 2 epochs per task:
+
+| Method                                | ACC   | FGT   |
+|---------------------------------------|-------|-------|
+| Naive baseline (Phase 1)              | 0.604 | 0.483 |
+| EWC, λ=1000 (Phase 1)                 | 0.636 | 0.434 |
+| Synapse v1 (Phase 2)                  | 0.578 | 0.521 |
+| + resistance, β=0.01                  | 0.611 | 0.478 |
+| + reward (β=0)                        | 0.577 | 0.521 |
+| + resistance + reward, β=0.01         | 0.613 | 0.474 |
+
+What this says:
+
+- **Resistance is doing the work.** Turning β from 0 to 0.01 shifts
+  ACC by +3.5 pp and forgetting by -4.3 pp.
+- **Reward signal alone is not enough.** Without resistance,
+  consistency rarely dips below 0.97 — the EMA tracks task switches
+  fast enough to keep reward near 1.0. The dampening is too weak to
+  matter on its own.
+- **The full system slightly beats baseline** (0.613 vs 0.604) but
+  still trails EWC (0.636). The next Phase-3 mechanisms
+  (confidence, sparse top-k) are where the next gains should come
+  from. We have not run multi-seed yet; the +0.9 pp gap vs baseline
+  is at single-seed noise scale.
+
+### Deferred to follow-up Phase-3 session
+
+- ``confidence``, ``age``, ``access_count`` state fields.
+- Sparse top-k partner selection in
+  ``synapse_layer/topk.py``.
+- Multi-seed runs and statistical significance — proper ablation
+  needs at least 5 seeds with Wilcoxon signed-rank per
+  PROJECT_PLAN.md §8.
+- Notebook visualising synapse state, evidence, and α(t) over time.
+
+---
+
 ## [2026-05-23] Phase 2: SynapseLayer v1
 
 This session implemented the first iteration of the additive
