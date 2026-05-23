@@ -120,6 +120,11 @@ class SynapseAugmentedMLP(nn.Module):
                 reward = float(self.reward_computer(features))
             else:
                 reward = 1.0
+        # Record which synapses contributed non-trivially to the
+        # correction *before* updating strengths: the access semantics
+        # are "how often this synapse mattered with the strengths it
+        # had during the forward pass we just ran".
+        self.synapse.record_access(features)
         self.synapse.consolidate(features, reward=reward)
         self._last_features = None
         return reward

@@ -238,3 +238,113 @@ def test_reset_clears_evidence_too() -> None:
     assert torch.any(layer.evidence != 0.0)
     layer.reset()
     assert torch.all(layer.evidence == 0.0)
+
+
+# ---- Phase 3 follow-up: confidence, age, access_count ----
+
+
+def test_new_state_buffers_initialised_to_zero() -> None:
+    layer = SynapseLayer(n_neurons=4)
+    for name in ("confidence", "age", "access_count"):
+        buf = getattr(layer, name)
+        assert buf.shape == (4, 4)
+        assert torch.all(buf == 0)
+    assert layer.age.dtype == torch.int64
+    assert layer.access_count.dtype == torch.int64
+    assert layer.confidence.dtype == torch.float32
+
+
+def test_age_ticks_every_consolidate_call() -> None:
+    layer = SynapseLayer(n_neurons=2)
+    a = torch.tensor([[1.0, 1.0]])
+    for expected in range(1, 6):
+        layer.consolidate(a)
+        assert torch.all(layer.age == expected)
+
+
+def test_confidence_stays_zero_on_first_batch() -> None:
+    """No previous-batch reference exists, so confidence cannot grow."""
+    layer = SynapseLayer(n_neurons=3)
+    layer.consolidate(torch.tensor([[1.0, 2.0, -1.0]]))
+    assert torch.all(layer.confidence == 0.0)
+
+
+def test_confidence_grows_for_sustained_co_activation() -> None:
+    """Confidence ← min(prev_abs_outer, curr_abs_outer) per pair."""
+    layer = SynapseLayer(n_neurons=2)
+    # Both batches have a = (1, 1) → abs_outer = [[1, 1], [1, 1]]
+    a = torch.tensor([[1.0, 1.0]])
+    layer.consolidate(a)  # confidence still zero (first batch)
+    layer.consolidate(a)  # confidence += min(1, 1) = 1
+    expected = torch.ones(2, 2)
+    torch.testing.assert_close(layer.confidence, expected)
+    # Third call adds another 1.
+    layer.consolidate(a)
+    torch.testing.assert_close(layer.confidence, expected * 2)
+
+
+def test_confidence_truncates_to_weaker_of_two_batches() -> None:
+    layer = SynapseLayer(n_neurons=2)
+    layer.consolidate(torch.tensor([[2.0, 2.0]]))   # |outer| = 4 everywhere
+    layer.consolidate(torch.tensor([[0.5, 0.5]]))   # |outer| = 0.25 everywhere
+    # min(4, 0.25) = 0.25 everywhere; confidence grows by 0.25.
+    expected = torch.full((2, 2), 0.25)
+    torch.testing.assert_close(layer.confidence, expected)
+
+
+def test_confidence_zero_when_one_batch_has_zero_pair() -> None:
+    layer = SynapseLayer(n_neurons=2)
+    layer.consolidate(torch.tensor([[1.0, 0.0]]))  # only (0,0) non-zero outer
+    layer.consolidate(torch.tensor([[0.0, 1.0]]))  # only (1,1) non-zero outer
+    # min across the two batches is zero everywhere.
+    assert torch.all(layer.confidence == 0.0)
+
+
+def test_record_access_counts_non_trivial_contributions() -> None:
+    layer = SynapseLayer(n_neurons=3)
+    with torch.no_grad():
+        # Make (0, 0) strong, others zero.
+        layer.strengths[0, 0] = 1.0
+    # Activations: neuron 0 has mean |a| = 1.0; contribution at (0,0) = 1.0
+    layer.record_access(torch.tensor([[1.0, 0.0, 0.0]]), threshold=0.1)
+    assert layer.access_count[0, 0].item() == 1
+    # All other entries below threshold (no strength or no activation).
+    other = layer.access_count.clone()
+    other[0, 0] = 0
+    assert torch.all(other == 0)
+
+
+def test_record_access_threshold_excludes_small_contributions() -> None:
+    layer = SynapseLayer(n_neurons=2)
+    with torch.no_grad():
+        layer.strengths.fill_(0.01)
+    layer.record_access(torch.tensor([[1.0, 1.0]]), threshold=0.5)
+    # mean|a| = 1.0, |s| = 0.01, contribution = 0.01 < threshold 0.5
+    assert torch.all(layer.access_count == 0)
+
+
+def test_record_access_validates_shape() -> None:
+    layer = SynapseLayer(n_neurons=3)
+    with pytest.raises(ValueError):
+        layer.record_access(torch.zeros(2, 5))
+
+
+def test_reset_clears_all_phase3_buffers() -> None:
+    layer = SynapseLayer(n_neurons=2)
+    layer.consolidate(torch.tensor([[1.0, 1.0]]))
+    layer.consolidate(torch.tensor([[1.0, 1.0]]))
+    layer.record_access(torch.tensor([[1.0, 1.0]]), threshold=0.001)
+    # All five state buffers should be non-zero somewhere now.
+    for name in ("strengths", "evidence", "confidence", "age", "access_count"):
+        assert torch.any(getattr(layer, name) != 0), name
+    layer.reset()
+    for name in (
+        "strengths",
+        "evidence",
+        "confidence",
+        "age",
+        "access_count",
+        "_prev_abs_outer",
+    ):
+        assert torch.all(getattr(layer, name) == 0), name
+    assert layer.global_step.item() == 0
