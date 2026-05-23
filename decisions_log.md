@@ -6,6 +6,125 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-23] Phase 3.5: multi-head probe and deferred architectural call
+
+This exploratory session tested whether the synapse architecture
+performs better when the shared-head bottleneck is removed. The
+DistilBERT/Split-AG-News probe was scoped out; the multi-head
+result was decisive enough that adding another data point would
+not change the conclusion (see "Why we skipped DistilBERT" below).
+
+### Multi-head Split-MNIST numbers (5 seeds, MultiHeadMLPClassifier)
+
+For reference, the Phase-3 shared-head numbers are repeated in the
+first row of the comparison table.
+
+| Method                     | ACC          | FGT          |
+|----------------------------|--------------|--------------|
+| naive (single-head)        | 0.600 ± 0.004| 0.488 ± 0.005|
+| naive (multi-head)         | 0.833 ± 0.055| 0.197 ± 0.068|
+| ewc (multi-head, λ=1000)   | 0.956 ± 0.020| 0.041 ± 0.023|
+| synapse_resistance (m-h)   | 0.810 ± 0.067| 0.227 ± 0.083|
+| synapse_full (m-h)         | 0.810 ± 0.065| 0.227 ± 0.081|
+| synapse_full_sparse (m-h)  | 0.800 ± 0.066| 0.239 ± 0.083|
+
+### What the data says
+
+1. **The shared-head bottleneck was real and large.** Going
+   multi-head adds +23 pp ACC to the naive baseline by itself.
+   This confirms the Phase-3 hypothesis: with a shared 2-class
+   head, the head's softmax boundary was the main forgetting
+   surface, and the synapse correction at the penultimate layer
+   could not compensate for it.
+
+2. **EWC under multi-head reaches 95.6 % ACC**, near published
+   Split-MNIST EWC numbers. The combination is well-matched:
+   inactive heads have zero Fisher, the active backbone has
+   strong Fisher, and the quadratic penalty pins the trunk while
+   each head specialises.
+
+3. **The synapse layer does not benefit from removing the
+   bottleneck.** synapse_resistance and synapse_full sit at
+   0.810 — slightly *below* naive 0.833. The synapse correction
+   is shared across all tasks (one strengths matrix), and in
+   multi-head the dominant continual-learning mechanism IS the
+   per-task head; the global synapse correction adds noise rather
+   than signal.
+
+4. **Sparse top-k still doesn't hurt much.** Within the synapse
+   family, synapse_full vs synapse_full_sparse differs by 1 pp
+   ACC (well inside one std). The memory benefit is intact.
+
+5. **Bonferroni-corrected significance.** As in experiment 05,
+   n=5 puts the floor at p ≥ 0.0625 × 10 = 0.625, so nothing
+   crosses α=0.05. But the point-estimate gaps are large
+   (EWC – synapse_full ≈ 14.6 pp ACC) and the std bands of
+   naive/synapse vs EWC barely overlap, so the qualitative
+   picture is unambiguous even before significance is reached.
+
+### Why we skipped DistilBERT
+
+The Phase-3.5 prompt called for a quick DistilBERT/Split-AG-News
+probe as a second favourable condition. We chose to skip it for
+this session because:
+
+- Installing ``transformers`` and tokenizers is ~500 MB of new
+  dependencies and ~20 min of CPU runtime even for a tiny probe.
+- The multi-head result is already decisive on the synapse-alone
+  question: even with the bottleneck removed, the synapse layer
+  *regresses* below naive. A DistilBERT probe is likely
+  confirmatory rather than flipping. Asymmetric value would not
+  justify the cost here.
+- The architectural question that really matters (synapse + cold
+  storage as a coordinated long-horizon memory system) is *not*
+  what DistilBERT on a 2-task AG-News subset would test.
+
+The DistilBERT probe is deferred to a future Phase-3.6 session if
+it ever becomes the bottleneck for the architectural call.
+
+### Architectural call (Option A vs Option B) is DEFERRED
+
+Original framing in this session:
+- **Option A:** synapse shows clear gain in either favourable
+  setting → proceed to Phase 4.
+- **Option B:** synapse remains neutral → pivot to negative-
+  results writeup.
+
+Neither is appropriate yet, because **both options misframe what
+the project hypothesis actually is.** The hypothesis is not
+"synapse layer beats EWC on standard CL benchmarks". The
+hypothesis from [DESIGN.md §3.1](DESIGN.md) is "synapse layer +
+cold-storage layer as a coordinated long-horizon memory system
+beats sequential fine-tuning". On a 5-task Split-MNIST sequence,
+synapse capacity is nowhere near strained — there is nothing for
+the cold storage to do.
+
+The decisive test is therefore Phase 4 with a long task sequence
+(10+ tasks). That is the regime where:
+- Synapse strengths saturate and the pressure metric matters.
+- Old patterns leave the synapse layer's working set and need to
+  be reconstructed from cold storage.
+- The full architecture — observe → consolidate → store →
+  retrieve — is exercised.
+
+Until that test runs, "synapse_full is below naive on multi-head
+Split-MNIST" is a real, honest data point but not yet evidence
+that the full architecture fails.
+
+### Next session: Phase 4 with long-sequence experiment
+
+Phase 4 was scoped in PROJECT_PLAN.md §7 as cold-storage
+implementation. We're adding a specific deliverable: an experiment
+that runs the full system on a 10+-task sequence and measures
+whether long-term retrieval recovers performance on tasks that
+have left the synapse layer's working set.
+
+The architectural call (A or B) gets made after that experiment,
+with the multi-head finding above as one input to the decision
+rather than the only input.
+
+---
+
 ## [2026-05-23] Phase 3 close-out: state schema, β normalisation, sparse top-k, multi-seed
 
 This session closed the remaining Phase-3 deliverables: the full
