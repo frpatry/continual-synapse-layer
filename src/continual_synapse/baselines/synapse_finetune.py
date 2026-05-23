@@ -89,6 +89,7 @@ class SynapseAugmentedMLP(nn.Module):
         cold_storage: ColdStorage | None = None,
         consolidation_trigger: ConsolidationTrigger | None = None,
         retrieval_k: int = 4,
+        retrieval_refresh_interval: int = 1,
     ) -> None:
         super().__init__()
         if synapse.n_neurons != base.config.hidden_dim:
@@ -98,6 +99,11 @@ class SynapseAugmentedMLP(nn.Module):
             )
         if retrieval_k <= 0:
             raise ValueError(f"retrieval_k must be positive, got {retrieval_k}")
+        if retrieval_refresh_interval <= 0:
+            raise ValueError(
+                f"retrieval_refresh_interval must be positive, "
+                f"got {retrieval_refresh_interval}"
+            )
         self.base = base
         self.synapse = synapse
         self.modulator = modulator if modulator is not None else SynapseModulation()
@@ -105,8 +111,16 @@ class SynapseAugmentedMLP(nn.Module):
         self.cold_storage = cold_storage
         self.consolidation_trigger = consolidation_trigger
         self.retrieval_k = int(retrieval_k)
+        self.retrieval_refresh_interval = int(retrieval_refresh_interval)
         self._last_features: torch.Tensor | None = None
         self._consolidation_count: int = 0
+        # Retrieval cache: avoid querying Chroma every forward pass.
+        # `retrieval_refresh_interval=N` means refresh-then-reuse-(N-1)
+        # times. So `N=1` refreshes every forward (no caching);
+        # `N=4` refreshes on forwards 1, 5, 9, ...
+        self._retrieved_cache: torch.Tensor | None = None
+        self._reuses_remaining: int = 0
+        self._cache_invalidated: bool = True
 
     def features(self, x: torch.Tensor) -> torch.Tensor:
         """Return base features plus the (optionally cold-augmented) correction.
@@ -120,19 +134,49 @@ class SynapseAugmentedMLP(nn.Module):
         self._last_features = f_base.detach()
 
         if self.cold_storage is not None and self.cold_storage.count() > 0:
-            with torch.no_grad():
-                query = f_base.detach().mean(dim=0)
-                retrieved = reconstruct_strengths(
-                    self.cold_storage,
-                    query,
-                    k=self.retrieval_k,
-                    n_neurons=self.synapse.n_neurons,
-                )
+            retrieved = self._get_or_refresh_retrieval(f_base)
             effective_strengths = self.synapse.strengths + retrieved
         else:
             effective_strengths = self.synapse.strengths
 
         return f_base + self.modulator(f_base, effective_strengths)
+
+    def _get_or_refresh_retrieval(
+        self, f_base: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the cached cold-storage strengths, refreshing if stale.
+
+        Refresh fires when:
+        - The cache has been invalidated (post-consolidation or never set).
+        - We have used up the configured number of reuses.
+
+        This is the hot path on the cold-storage variant; the cache
+        avoids one Chroma query per forward, which is the dominant
+        per-batch cost when the store has hundreds of entries.
+        """
+        needs_refresh = (
+            self._cache_invalidated
+            or self._retrieved_cache is None
+            or self._reuses_remaining <= 0
+        )
+        if needs_refresh:
+            with torch.no_grad():
+                query = f_base.detach().mean(dim=0)
+                self._retrieved_cache = reconstruct_strengths(
+                    self.cold_storage,  # type: ignore[arg-type]
+                    query,
+                    k=self.retrieval_k,
+                    n_neurons=self.synapse.n_neurons,
+                )
+            # After this refresh, allow `interval - 1` reuses before
+            # the next refresh. `interval = 1` means zero reuses, i.e.
+            # refresh on every forward.
+            self._reuses_remaining = max(self.retrieval_refresh_interval - 1, 0)
+            self._cache_invalidated = False
+        else:
+            self._reuses_remaining -= 1
+        assert self._retrieved_cache is not None
+        return self._retrieved_cache
 
     def set_active_head(self, index: int) -> None:
         """Forward head selection to the base model, if it supports it."""
@@ -181,6 +225,9 @@ class SynapseAugmentedMLP(nn.Module):
             )
             if entry_id is not None:
                 self._consolidation_count += 1
+                # Mark the retrieval cache as stale so the next
+                # forward picks up the just-archived pattern.
+                self._cache_invalidated = True
 
         self._last_features = None
         return reward

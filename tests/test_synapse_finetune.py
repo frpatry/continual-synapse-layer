@@ -376,6 +376,110 @@ def test_cold_storage_alters_forward_after_consolidation() -> None:
     assert not torch.allclose(out_with_cs, out_no_cs)
 
 
+def test_retrieval_cache_reused_within_interval() -> None:
+    """Retrieval caching avoids one Chroma query per forward when the
+    cache hasn't been invalidated and the interval has not elapsed."""
+    from unittest.mock import patch
+
+    aug, store, _ = _build_with_cold_storage(
+        threshold=0.0,
+        quantile=1.0,
+        collection="aug_cache_reuse",
+    )
+    aug.retrieval_refresh_interval = 4
+    # Seed the store with one entry so retrieval has something to query.
+    with torch.no_grad():
+        aug.synapse.strengths.copy_(torch.full((8, 8), 0.5))
+        aug.synapse.evidence.copy_(torch.full((8, 8), 1.0))
+        aug.synapse.global_step.fill_(100)
+    aug(torch.randn(2, 4))
+    aug.apply_hebbian_update()
+    assert store.count() == 1
+
+    # Spy on reconstruct_strengths to count refreshes.
+    import continual_synapse.baselines.synapse_finetune as mod_under_test
+
+    refresh_count = [0]
+    real_reconstruct = mod_under_test.reconstruct_strengths
+
+    def counted(*a, **kw):
+        refresh_count[0] += 1
+        return real_reconstruct(*a, **kw)
+
+    with patch.object(mod_under_test, "reconstruct_strengths", counted):
+        # First forward after invalidation -> refresh.
+        aug(torch.randn(2, 4))
+        # Three more forwards inside the interval -> reuse cache.
+        aug(torch.randn(2, 4))
+        aug(torch.randn(2, 4))
+        aug(torch.randn(2, 4))
+        # Fifth forward crosses the interval -> refresh again.
+        aug(torch.randn(2, 4))
+    assert refresh_count[0] == 2  # exactly two real queries in 5 forwards
+
+
+def test_consolidation_invalidates_retrieval_cache() -> None:
+    """A fresh consolidation should make the very next forward refresh."""
+    from unittest.mock import patch
+
+    aug, store, _ = _build_with_cold_storage(
+        threshold=0.0,
+        quantile=1.0,
+        collection="aug_cache_invalidate",
+    )
+    aug.retrieval_refresh_interval = 1000  # long enough that the interval
+    # alone would never refresh during the test.
+
+    # Seed the store with an initial entry.
+    with torch.no_grad():
+        aug.synapse.strengths.copy_(torch.full((8, 8), 0.5))
+        aug.synapse.evidence.copy_(torch.full((8, 8), 1.0))
+        aug.synapse.global_step.fill_(100)
+    aug(torch.randn(2, 4))
+    aug.apply_hebbian_update()
+    assert store.count() == 1
+
+    # Warm the cache.
+    aug(torch.randn(2, 4))
+
+    import continual_synapse.baselines.synapse_finetune as mod_under_test
+
+    refresh_count = [0]
+    real_reconstruct = mod_under_test.reconstruct_strengths
+
+    def counted(*a, **kw):
+        refresh_count[0] += 1
+        return real_reconstruct(*a, **kw)
+
+    with patch.object(mod_under_test, "reconstruct_strengths", counted):
+        # Reset synapse so consolidate has something fresh to archive.
+        with torch.no_grad():
+            aug.synapse.strengths.copy_(torch.full((8, 8), 0.5))
+            aug.synapse.evidence.copy_(torch.full((8, 8), 1.0))
+        aug(torch.randn(2, 4))  # cache hit (no refresh)
+        # Trigger another consolidation — this should invalidate the cache.
+        aug.apply_hebbian_update()
+        # Next forward: cache invalidated -> refresh.
+        aug(torch.randn(2, 4))
+    assert refresh_count[0] == 1
+
+
+def test_retrieval_refresh_interval_validated() -> None:
+    from continual_synapse.cold_storage.store import ColdStorage
+
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    base = MLPClassifier(cfg)
+    syn = SynapseLayer(n_neurons=8)
+    with pytest.raises(ValueError, match="retrieval_refresh_interval"):
+        SynapseAugmentedMLP(
+            base,
+            syn,
+            SynapseModulation(),
+            cold_storage=ColdStorage(collection_name="aug_refresh_validation"),
+            retrieval_refresh_interval=0,
+        )
+
+
 def test_retrieval_k_validated() -> None:
     from continual_synapse.cold_storage.store import ColdStorage
 
