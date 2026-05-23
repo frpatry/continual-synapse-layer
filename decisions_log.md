@@ -6,6 +6,159 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-23] Architectural completion Part 3: experiment 11 result and the final architectural call
+
+### The five-method comparison (15 tasks Permuted-MNIST, dropout=0.5, 5 seeds)
+
+| Method          | ACC          | FGT          | Note                          |
+|-----------------|--------------|--------------|-------------------------------|
+| naive           | 0.662 ± 0.018| 0.296 ± 0.019| control                       |
+| cs_current      | 0.660 ± 0.017| 0.298 ± 0.020| Phase-4 cold storage          |
+| cs_multi_pass   | 0.655 ± 0.008| 0.304 ± 0.008| + n_passes=5                  |
+| cs_sweep        | 0.666 ± 0.016| 0.292 ± 0.018| + periodic compression sweep  |
+| cs_full         | 0.664 ± 0.008| 0.294 ± 0.008| spec-complete (both)          |
+
+Bonferroni-corrected Wilcoxon: **every pairwise p ≥ 0.625**. Even the
+smallest p (cs_multi_pass vs cs_full, p_raw=0.0625, p_corr=0.625)
+doesn't approach significance. All five methods are within 1.1 pp ACC
+of each other; std bands overlap throughout the training trajectory
+(see ``avg_accuracy_vs_tasks_seen.png``).
+
+### Honest decomposition of the prior "cold storage" finding
+
+How much of Phase 4b/4c's "no benefit" was an artifact of the
+silent simplifications versus a real property of the architecture?
+
+**Answer: very little of it was artifactual.** The spec-complete
+``cs_full`` (multi-pass + compression sweep both on) matches the
+spec-incomplete ``cs_current`` (matches what Phase 4b actually tested)
+within 0.4 pp ACC and 0.4 pp FGT. The accuracy story is essentially
+identical whether you run the mechanism as designed or as
+accidentally simplified.
+
+Per-mechanism contribution to ACC vs naive baseline:
+- + multi-pass alone: **−0.7 pp** (cs_multi_pass = 0.655 vs naive 0.662)
+- + compression sweep alone: **+0.4 pp** (cs_sweep = 0.666)
+- + both (cs_full): **+0.2 pp** (cs_full = 0.664)
+
+These are all inside one standard deviation. The architecture
+delivers no measurable accuracy benefit even when implemented to
+spec.
+
+### What the mechanisms actually do (the real findings)
+
+The architectural completion is not empty — the mechanisms are
+working as designed. Two non-accuracy findings stand on their own:
+
+**1. Compression sweep bounds memory at 3.7× lower footprint.**
+The ``store_byte_size_per_task.png`` plot is the clearest result
+of this whole session: cs_current and cs_multi_pass grow unbounded
+to ~37 MB of stored documents by task 14 (linear in task count);
+cs_sweep and cs_full stay flat at ~10 MB throughout. The schedule
+moves entries through 32 → 16 → 8 → 4 bit tiers exactly as
+designed (see ``precision_distribution_evolution.png``). This is a
+real engineering contribution that the silent Phase-4 simplification
+had been hiding.
+
+**2. Multi-pass averaging reduces variance roughly 2×.** The std on
+ACC drops from 0.018 (naive) to 0.008 (cs_multi_pass and cs_full).
+The Phase 4b "variance reduction" claim that didn't generalise to
+30 tasks for cs_current *does* hold when multi-pass is enabled —
+because the variance source that multi-pass actually targets is
+intra-sample dropout noise, which the dropout-0 Phase 4b setup
+never exercised. With dropout=0.5 here, multi-pass picks up its
+intended effect.
+
+Neither of these accounts for the absence of an accuracy gain.
+
+### The variance-reduction effect, revisited
+
+Phase 4b reported a 2.2× std reduction at 15 tasks (dropout=0)
+that did not generalise to 30 tasks. The current experiment
+clarifies that finding: with multi-pass *on*, the variance
+reduction is real and reproducible (0.018 → 0.008, a 2.25× ratio
+that matches Phase 4b almost exactly). With multi-pass *off* but
+cold storage on (cs_current here), no variance reduction occurs
+(0.017 vs 0.018 naive). The 2.2× ratio in Phase 4b was therefore
+likely an artifact of the seed-specific noise structure in that
+exact 15-task run, not a property of cold storage. Multi-pass is
+the actual mechanism for variance reduction.
+
+### Architectural call
+
+The session prompt offered two options:
+- **Option A:** synapse + cold storage shows clear gain → proceed
+  to Phase 5 contribution.
+- **Option B:** confirms negative result on the actual architecture
+  → pivot to negative-results writeup.
+
+**The data calls Option B.** With the spec-complete architecture
+implemented, tested at 15 tasks × 5 seeds × 5 methods with proper
+multi-seed statistics:
+
+- No method significantly differs from any other on ACC.
+- The best variant (cs_sweep) beats naive by 0.4 pp ACC; not
+  Bonferroni-significant and not large in absolute terms.
+- The spec-complete architecture is statistically indistinguishable
+  from the naive baseline.
+
+This is the cleanest possible negative result: the mechanisms work,
+the variance reduction is real, the memory bounding is real — but
+the architectural hypothesis ("memory-inspired CL beats simple
+sequential fine-tuning on standard benchmarks") is not supported by
+the data.
+
+### Why we did not run the 30-task follow-up
+
+The Phase 4c 30-task run with the simplified architecture already
+showed a flat-zero gap. The 15-task run with the spec-complete
+architecture also shows a flat-zero gap. Two data points across
+task counts and architecture variants both deliver the same answer.
+A third (30 tasks × spec-complete) is unlikely to flip the call and
+costs ~3 hours of compute. The decision is to instead allocate that
+compute to the follow-up article and Phase 5 polish.
+
+### What the follow-up article should say
+
+The article narrative (per PROJECT_PLAN.md §10.3) becomes:
+
+> *"We implemented a memory-inspired continual-learning architecture
+> (an additive synapse layer with evidence-based resistance,
+> context-dependent reward, sparse top-k partner selection, and a
+> cold-storage archive with progressive quantization-based compression).
+> We tested it on Split-MNIST at 5 tasks and Permuted-MNIST at 15
+> and 30 tasks against sequential fine-tuning and EWC, with 5 seeds
+> per condition and pairwise Wilcoxon signed-rank testing with
+> Bonferroni correction. The architecture's accuracy is
+> statistically indistinguishable from naive sequential fine-tuning
+> across all conditions tested. Two non-accuracy findings stand:
+> the progressive compression schedule bounds storage at 3.7× lower
+> memory footprint than the uncompressed variant at equivalent
+> accuracy, and multi-pass observation reduces seed-to-seed variance
+> by about 2× when the base model has stochastic forwards (dropout).
+> A meta-finding from the engineering process is worth recording:
+> two specified mechanisms (multi-pass averaging and compression
+> re-evaluation) were silently simplified in v1 implementations and
+> only surfaced by a structured read-only code audit late in the
+> project. We document both for future reference and as a cautionary
+> tale about spec-to-code traceability in research engineering."*
+
+### Concrete next steps (Phase 5 reframed)
+
+1. **Polish the public-facing repo** (README, docstrings, two
+   walkthrough notebooks) — Phase 6 work moved up.
+2. **Write the article** with the narrative above.
+3. **Optional: one more bench (Split-CIFAR-10)** to broaden the
+   "no benefit" claim before publishing. ~1 day of work.
+4. **Demo video** showing the implementation clearly, especially
+   the compression-bounding and variance-reduction effects which
+   are real engineering contributions.
+
+The negative result is now the headline; the engineering
+contributions sit alongside it as supporting findings.
+
+---
+
 ## [2026-05-23] Architectural completion Part 1: multi-pass implemented (and the silent simplification it closes)
 
 ### Meta-finding: the silent Phase-2 simplification
