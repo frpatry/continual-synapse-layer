@@ -11,3 +11,5 @@ seaborn==0.13.2
 pytest==9.0.3
 jupyter==1.1.1
 tqdm==4.67.1
+# Required by `datasets` to decode MNIST image columns.
+pillow==12.2.0
