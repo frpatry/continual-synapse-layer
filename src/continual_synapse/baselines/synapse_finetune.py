@@ -44,6 +44,7 @@ import torch
 from torch import nn
 
 from continual_synapse.baselines.naive_finetune import MLPClassifier
+from continual_synapse.cold_storage.compression import CompressionSchedule
 from continual_synapse.cold_storage.store import ColdStorage
 from continual_synapse.consolidation.pipeline import consolidate_to_storage
 from continual_synapse.consolidation.reconstruction import reconstruct_strengths
@@ -102,6 +103,8 @@ class SynapseAugmentedMLP(nn.Module):
         retrieval_k: int = 4,
         retrieval_refresh_interval: int = 1,
         n_passes: int = 1,
+        compression_sweep_interval: int = 0,
+        compression_schedule: CompressionSchedule | None = None,
     ) -> None:
         super().__init__()
         if synapse.n_neurons != base.config.hidden_dim:
@@ -118,6 +121,11 @@ class SynapseAugmentedMLP(nn.Module):
             )
         if n_passes <= 0:
             raise ValueError(f"n_passes must be positive, got {n_passes}")
+        if compression_sweep_interval < 0:
+            raise ValueError(
+                f"compression_sweep_interval must be >= 0, got "
+                f"{compression_sweep_interval}"
+            )
         self.base = base
         self.synapse = synapse
         self.modulator = modulator if modulator is not None else SynapseModulation()
@@ -127,6 +135,20 @@ class SynapseAugmentedMLP(nn.Module):
         self.retrieval_k = int(retrieval_k)
         self.retrieval_refresh_interval = int(retrieval_refresh_interval)
         self.n_passes = int(n_passes)
+        # Periodic compression sweep. 0 (the default) disables the
+        # sweep entirely, reproducing the Phase-4b behaviour where
+        # every entry stayed at 32-bit forever. Non-zero values
+        # trigger ColdStorage.re_evaluate_all_entries every N training
+        # batches (counted from the synapse's global_step deltas).
+        self.compression_sweep_interval = int(compression_sweep_interval)
+        self.compression_schedule = (
+            compression_schedule
+            if compression_schedule is not None
+            else CompressionSchedule()
+        )
+        self._batches_since_compression_sweep: int = 0
+        self._compression_sweep_count: int = 0
+        self._last_compression_counts: dict[int, int] = {}
         self._last_features: torch.Tensor | None = None
         self._consolidation_count: int = 0
         # Retrieval cache: avoid querying Chroma every forward pass.
@@ -288,6 +310,35 @@ class SynapseAugmentedMLP(nn.Module):
                 # forward picks up the just-archived pattern.
                 self._cache_invalidated = True
 
+        # Periodic compression sweep (Phase 4b follow-up). Fires every
+        # `compression_sweep_interval` apply_hebbian_update calls when
+        # cold storage is configured. Without this sweep, the compression
+        # schedule's tier transitions never happen — entries stay at
+        # the freshly-stored precision forever (see decisions_log entry
+        # "Architectural completion Part 2").
+        if (
+            self.cold_storage is not None
+            and self.compression_sweep_interval > 0
+        ):
+            self._batches_since_compression_sweep += 1
+            if (
+                self._batches_since_compression_sweep
+                >= self.compression_sweep_interval
+            ):
+                current_step = int(self.synapse.global_step.item())
+                self._last_compression_counts = (
+                    self.cold_storage.re_evaluate_all_entries(
+                        current_step=current_step,
+                        schedule=self.compression_schedule,
+                    )
+                )
+                self._batches_since_compression_sweep = 0
+                self._compression_sweep_count += 1
+                # Retrieval cache may hold a tensor decoded from the
+                # old precision; invalidate so the next forward
+                # re-fetches from the freshly-quantised entries.
+                self._cache_invalidated = True
+
         # Either way, the next forward should start with a clean
         # multi-pass buffer. Defensive — consolidate() drained it
         # in the multi-pass path; this is a no-op when buffer is
@@ -297,6 +348,16 @@ class SynapseAugmentedMLP(nn.Module):
         # missing forward before the next update is caught loudly.
         self._last_features = None
         return reward
+
+    @property
+    def compression_sweep_count(self) -> int:
+        """Number of compression sweeps that have fired on this instance."""
+        return self._compression_sweep_count
+
+    @property
+    def last_compression_counts(self) -> dict[int, int]:
+        """``{precision: count}`` after the most recent sweep, ``{}`` if none."""
+        return dict(self._last_compression_counts)
 
     @property
     def consolidation_count(self) -> int:

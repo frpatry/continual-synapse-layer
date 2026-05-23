@@ -646,6 +646,182 @@ def test_n_passes_validated_at_construction() -> None:
         SynapseAugmentedMLP(base, syn, SynapseModulation(), n_passes=0)
 
 
+# ---- Phase 4b follow-up: compression sweep wiring ----
+
+
+def _build_with_cold_storage_and_sweep(
+    *,
+    sweep_interval: int = 5,
+    threshold: float = 0.0,
+    quantile: float = 0.5,
+    collection: str = "aug_sweep_test",
+    schedule=None,
+):
+    from continual_synapse.cold_storage.compression import CompressionSchedule
+    from continual_synapse.cold_storage.store import ColdStorage
+    from continual_synapse.consolidation.trigger import ConsolidationTrigger
+
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=8, learning_rate=0.1)
+    store = ColdStorage(collection_name=collection)
+    trigger = ConsolidationTrigger(
+        avg_pressure_threshold=threshold,
+        min_steps_between=0,
+        candidate_quantile=quantile,
+    )
+    aug = SynapseAugmentedMLP(
+        base,
+        synapse,
+        SynapseModulation(init_gate=0.5),
+        cold_storage=store,
+        consolidation_trigger=trigger,
+        retrieval_k=2,
+        compression_sweep_interval=sweep_interval,
+        compression_schedule=schedule or CompressionSchedule(),
+    )
+    return aug, store, trigger
+
+
+def test_compression_sweep_default_interval_is_zero_disabled() -> None:
+    """Default interval=0 means the sweep never fires — bit-exact
+    Phase-4 cold-storage behaviour."""
+    aug, _ = _build_augmented()
+    assert aug.compression_sweep_interval == 0
+    assert aug.compression_sweep_count == 0
+
+
+def test_compression_sweep_fires_at_configured_interval() -> None:
+    aug, store, _ = _build_with_cold_storage_and_sweep(
+        sweep_interval=3, collection="sweep_fires"
+    )
+    # Pre-load synapse state so consolidation triggers on the first batch.
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(2.0)
+        aug.synapse.evidence.fill_(2.0)
+        aug.synapse.global_step.fill_(50)
+    # Run 7 hebbian updates; sweep fires every 3 -> expect 2 sweeps.
+    for _ in range(7):
+        aug(torch.randn(2, 4))
+        aug.apply_hebbian_update()
+    assert aug.compression_sweep_count == 2
+
+
+def test_compression_sweep_zero_interval_never_fires() -> None:
+    aug, store, _ = _build_with_cold_storage_and_sweep(
+        sweep_interval=0, collection="sweep_zero"
+    )
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(2.0)
+        aug.synapse.evidence.fill_(2.0)
+        aug.synapse.global_step.fill_(50)
+    for _ in range(10):
+        aug(torch.randn(2, 4))
+        aug.apply_hebbian_update()
+    assert aug.compression_sweep_count == 0
+
+
+def test_compression_sweep_updates_age_metadata() -> None:
+    """After the sweep, entries in cold storage should have non-zero
+    `age` fields (was always 0 in Phase 4b/4c)."""
+    from continual_synapse.cold_storage.compression import CompressionSchedule
+
+    aug, store, _ = _build_with_cold_storage_and_sweep(
+        sweep_interval=1,
+        collection="sweep_age",
+        schedule=CompressionSchedule(
+            age_thresholds=(10_000_000,),  # so no precision change
+            tier_precisions=(32, 32),
+            access_count_floor=1_000_000,
+        ),
+    )
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(2.0)
+        aug.synapse.evidence.fill_(2.0)
+        aug.synapse.global_step.fill_(0)
+    # First batch: consolidation fires AT global_step 0 (created_at_step=0),
+    # then sweep fires. Run a second batch to advance global_step and
+    # sweep again.
+    aug(torch.randn(2, 4))
+    aug.apply_hebbian_update()  # global_step now 1, entry created_at_step=0
+    aug(torch.randn(2, 4))
+    aug.apply_hebbian_update()  # global_step now 2, sweep updates age to 2
+
+    entries = store.all_entries()
+    assert len(entries) >= 1
+    # The first entry was created at step 0, now at step 2 -> age 2.
+    assert all(e.metadata["age"] >= 0 for e in entries)
+    # At least one entry should have age > 0 after the second sweep.
+    assert any(e.metadata["age"] > 0 for e in entries)
+
+
+def test_compression_sweep_actually_reduces_precision() -> None:
+    """End-to-end: with a schedule whose thresholds are crossed, the
+    sweep moves stored entries to lower precision tiers and
+    `last_compression_counts` reflects the move."""
+    from continual_synapse.cold_storage.compression import CompressionSchedule
+
+    aug, store, _ = _build_with_cold_storage_and_sweep(
+        sweep_interval=1,
+        collection="sweep_compress",
+        # Thresholds set so age >= 2 -> 16-bit.
+        schedule=CompressionSchedule(
+            age_thresholds=(2,),
+            tier_precisions=(32, 16),
+            access_count_floor=1_000_000,
+        ),
+    )
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(2.0)
+        aug.synapse.evidence.fill_(2.0)
+        aug.synapse.global_step.fill_(0)
+    # Insert one entry, then advance enough that its age crosses the
+    # threshold and the next sweep moves it to 16-bit.
+    for _ in range(5):
+        aug(torch.randn(2, 4))
+        aug.apply_hebbian_update()
+    # After 5 sweeps the latest sweep saw entries with age >= 2 and
+    # moved them to 16-bit. Inspect the most recent counts.
+    counts = aug.last_compression_counts
+    assert 16 in counts and counts[16] >= 1
+    # Inspect entries directly: at least one is now at 16-bit.
+    entries = store.all_entries()
+    precisions = [e.metadata["precision"] for e in entries]
+    assert 16 in precisions
+
+
+def test_compression_sweep_requires_cold_storage() -> None:
+    """No cold storage configured -> sweep cannot fire even with a
+    non-zero interval."""
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    base = MLPClassifier(cfg)
+    syn = SynapseLayer(n_neurons=8, learning_rate=0.1)
+    aug = SynapseAugmentedMLP(
+        base, syn, SynapseModulation(), compression_sweep_interval=1
+    )
+    aug(torch.randn(2, 4))
+    aug.apply_hebbian_update()
+    assert aug.compression_sweep_count == 0
+
+
+def test_compression_sweep_interval_validated_at_construction() -> None:
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    base = MLPClassifier(cfg)
+    syn = SynapseLayer(n_neurons=8)
+    with pytest.raises(ValueError, match="compression_sweep_interval"):
+        SynapseAugmentedMLP(
+            base, syn, SynapseModulation(), compression_sweep_interval=-1
+        )
+
+
+def test_last_compression_counts_starts_empty() -> None:
+    aug, _, _ = _build_with_cold_storage_and_sweep(
+        sweep_interval=10, collection="sweep_initial_counts"
+    )
+    assert aug.last_compression_counts == {}
+
+
 def test_runner_end_to_end_with_synapse_smoke() -> None:
     """End-to-end: the synapse-augmented MLP trains without crashing and
     the strengths grow as Hebbian updates accumulate."""
