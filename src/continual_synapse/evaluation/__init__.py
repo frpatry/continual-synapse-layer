@@ -2,6 +2,7 @@
 
 from continual_synapse.evaluation.benchmarks import (
     ContinualBenchmark,
+    PermutedMNIST,
     SplitMNIST,
     Task,
 )
@@ -16,6 +17,7 @@ from continual_synapse.evaluation.runner import ContinualRunner, RunResult
 
 __all__ = [
     "ContinualBenchmark",
+    "PermutedMNIST",
     "SplitMNIST",
     "Task",
     "average_accuracy",
