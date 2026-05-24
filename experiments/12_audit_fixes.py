@@ -39,6 +39,13 @@ Run from the repo root::
     python experiments/12_audit_fixes.py --num-tasks 15
 
 Output: ``results/logs/audit_fixes/<ts>_12_audit_fixes_T15.json``.
+
+The output file is checkpointed after each method's multi-seed
+loop completes, so a kill mid-experiment leaves the last completed
+method's results intact and readable. Writes are atomic
+(``.tmp`` + ``os.replace``). The payload carries an ``is_partial``
+flag plus ``methods_completed`` / ``methods_requested`` lists so
+downstream tools can distinguish a partial run from a full one.
 """
 
 from __future__ import annotations
@@ -47,6 +54,7 @@ import argparse
 import base64
 import json
 import math
+import os
 import sys
 import time
 from dataclasses import asdict
@@ -372,6 +380,73 @@ def _multi_seed_to_jsonable(run: MultiSeedRun) -> dict:
     return out
 
 
+def _build_payload(
+    args: argparse.Namespace,
+    ts: int,
+    runs: list[MultiSeedRun],
+    summaries: list,
+    diagnostics: dict[str, list[dict]],
+    reward_summary: dict[str, dict],
+    method_times: dict[str, float],
+    *,
+    is_partial: bool,
+    methods_completed: list[str],
+) -> dict[str, Any]:
+    """Build a fully-self-describing payload.
+
+    ``is_partial`` is True for checkpoint writes (only a subset of
+    ``args.methods`` has completed). Pairwise Wilcoxon needs ≥ 2
+    methods; the lists stay empty until then.
+    """
+    pairwise_acc = (
+        [asdict(c) for c in pairwise_wilcoxon(summaries, metric="average_accuracy")]
+        if len(summaries) >= 2
+        else []
+    )
+    pairwise_fgt = (
+        [asdict(c) for c in pairwise_wilcoxon(summaries, metric="average_forgetting")]
+        if len(summaries) >= 2
+        else []
+    )
+    return {
+        "experiment": "12_audit_fixes",
+        "timestamp": ts,
+        "config": vars(args),
+        "is_partial": is_partial,
+        "methods_completed": list(methods_completed),
+        "methods_requested": list(args.methods),
+        "methods": [_multi_seed_to_jsonable(r) for r in runs],
+        "summaries": [
+            {
+                "method": s.method,
+                "n_seeds": s.n_seeds,
+                "metric_means": s.metric_means,
+                "metric_stds": s.metric_stds,
+                "per_seed_metrics": s.per_seed_metrics,
+            }
+            for s in summaries
+        ],
+        "pairwise_accuracy": pairwise_acc,
+        "pairwise_forgetting": pairwise_fgt,
+        "diagnostics": diagnostics,
+        "reward_summary": reward_summary,
+        "method_times_seconds": method_times,
+    }
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write JSON via a sibling .tmp file and ``os.replace``.
+
+    ``os.replace`` is atomic on POSIX (same filesystem), so a reader
+    either sees the prior complete file or the new complete file —
+    never a partial one. A kill mid-write leaves only the .tmp
+    behind, and the previous checkpoint stays valid.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+
+
 def main() -> None:
     args = parse_args()
     if len(args.seeds) < 2:
@@ -390,8 +465,20 @@ def main() -> None:
         args, num_classes=bench.num_classes_per_task
     )
 
+    # Pin the output path up front so every checkpoint and the final
+    # write all land at the same path. Checkpoints overwrite atomically.
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time())
+    path = output_dir / f"{ts}_12_audit_fixes_T{args.num_tasks}.json"
+    print(f"Checkpoint path: {path}", flush=True)
+
     runs: list[MultiSeedRun] = []
+    summaries: list = []
+    reward_summary: dict[str, dict] = {}
     method_times: dict[str, float] = {}
+    methods_completed: list[str] = []
+
     for method in args.methods:
         if method not in factories:
             raise SystemExit(
@@ -423,9 +510,37 @@ def main() -> None:
         elapsed = time.time() - t0
         method_times[method] = elapsed
         runs.append(run)
+        summaries.append(summarise_method(run))
+        # Flatten this method's per-seed reward samples into the summary.
+        flat = [r for seed_list in reward_samples[method] for r in seed_list]
+        reward_summary[method] = _reward_histogram(flat)
+        methods_completed.append(method)
         print(f"{method} finished in {elapsed:.1f}s", flush=True)
 
-    summaries = [summarise_method(r) for r in runs]
+        # Checkpoint: a kill after this point preserves every completed
+        # method's results.
+        is_partial = len(methods_completed) < len(args.methods)
+        payload = _build_payload(
+            args,
+            ts,
+            runs,
+            summaries,
+            diagnostics,
+            reward_summary,
+            method_times,
+            is_partial=is_partial,
+            methods_completed=methods_completed,
+        )
+        _atomic_write_json(path, payload)
+        tag = "partial" if is_partial else "final"
+        print(
+            f"  Checkpoint written ({tag}, "
+            f"{len(methods_completed)}/{len(args.methods)} methods): {path}",
+            flush=True,
+        )
+
+    # Stdout summary tables (read from the same accumulated state that
+    # was just written to the checkpoint).
     print()
     print(
         f"Per-method mean ± std (n={len(args.seeds)} seeds, "
@@ -437,17 +552,13 @@ def main() -> None:
         print(f"Pairwise Wilcoxon signed-rank on {metric} (Bonferroni-corrected):")
         print(format_pairwise_table(pairwise_wilcoxon(summaries, metric=metric)))
 
-    # Reward distribution per method (across all seeds, flattened).
     print("Per-batch reward distribution (flattened across seeds):")
     print(
         f"  {'method':<24s} {'n':>7s} {'min':>7s} {'p10':>7s} "
         f"{'p50':>7s} {'p90':>7s} {'max':>7s} {'mean':>7s} {'std':>7s}"
     )
-    reward_summary: dict[str, dict] = {}
     for method in args.methods:
-        flat = [r for seed_list in reward_samples[method] for r in seed_list]
-        h = _reward_histogram(flat)
-        reward_summary[method] = h
+        h = reward_summary.get(method, {"n": 0})
         if h["n"] == 0:
             print(f"  {method:<24s}  (no reward samples — naive control)")
             continue
@@ -458,7 +569,6 @@ def main() -> None:
             f"{h['mean']:>7.3f} {h['std']:>7.3f}"
         )
 
-    # Sparse density at end of run (avg across seeds).
     print()
     print("End-of-run sparse density (fraction of non-zero strengths):")
     for method in args.methods:
@@ -472,42 +582,6 @@ def main() -> None:
             mean_density = sum(last_densities) / len(last_densities)
             print(f"  {method:<24s} {mean_density:.3f}")
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ts = int(time.time())
-    path = output_dir / (
-        f"{ts}_12_audit_fixes_T{args.num_tasks}.json"
-    )
-    payload: dict[str, Any] = {
-        "experiment": "12_audit_fixes",
-        "timestamp": ts,
-        "config": vars(args),
-        "methods": [_multi_seed_to_jsonable(r) for r in runs],
-        "summaries": [
-            {
-                "method": s.method,
-                "n_seeds": s.n_seeds,
-                "metric_means": s.metric_means,
-                "metric_stds": s.metric_stds,
-                "per_seed_metrics": s.per_seed_metrics,
-            }
-            for s in summaries
-        ],
-        "pairwise_accuracy": [
-            asdict(c)
-            for c in pairwise_wilcoxon(summaries, metric="average_accuracy")
-        ],
-        "pairwise_forgetting": [
-            asdict(c)
-            for c in pairwise_wilcoxon(
-                summaries, metric="average_forgetting"
-            )
-        ],
-        "diagnostics": diagnostics,
-        "reward_summary": reward_summary,
-        "method_times_seconds": method_times,
-    }
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
     print(f"Saved run log to {path}")
 
 
