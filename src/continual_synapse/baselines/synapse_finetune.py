@@ -49,6 +49,8 @@ from continual_synapse.cold_storage.store import ColdStorage
 from continual_synapse.consolidation.pipeline import consolidate_to_storage
 from continual_synapse.consolidation.reconstruction import reconstruct_strengths
 from continual_synapse.consolidation.trigger import ConsolidationTrigger
+from continual_synapse.reward.external import ExternalReward
+from continual_synapse.reward.mixer import RewardMixer
 from continual_synapse.synapse_layer.layer import SynapseLayer
 from continual_synapse.synapse_layer.modulation import SynapseModulation
 
@@ -150,6 +152,13 @@ class SynapseAugmentedMLP(nn.Module):
         self._compression_sweep_count: int = 0
         self._last_compression_counts: dict[int, int] = {}
         self._last_features: torch.Tensor | None = None
+        # Detached training-mode logits from the most recent forward.
+        # Used by `apply_hebbian_update(training_target=...)` to drive
+        # an ExternalReward from per-batch accuracy without re-running
+        # the forward pass. Set to None in eval mode so callers that
+        # forget to switch back to train can't accidentally feed
+        # eval-time logits into the training reward.
+        self._last_logits: torch.Tensor | None = None
         self._consolidation_count: int = 0
         # Retrieval cache: avoid querying Chroma every forward pass.
         # `retrieval_refresh_interval=N` means refresh-then-reuse-(N-1)
@@ -180,7 +189,8 @@ class SynapseAugmentedMLP(nn.Module):
         # Multi-pass observation path (training mode only). Even at
         # n_passes=1 we deliberately do NOT call observe(), to keep
         # the buffer-empty path bit-exact compatible with Phase 3.
-        if self.training and self.n_passes > 1:
+        in_multi_pass = self.training and self.n_passes > 1
+        if in_multi_pass:
             self.synapse.observe(f_base.detach())
             for _ in range(self.n_passes - 1):
                 f_extra = self.base.features(x)
@@ -191,7 +201,15 @@ class SynapseAugmentedMLP(nn.Module):
             self._last_features = None
 
         if self.cold_storage is not None and self.cold_storage.count() > 0:
-            retrieved = self._get_or_refresh_retrieval(f_base)
+            # Multi-pass query consistency (audit fix 3/3): when the
+            # Hebbian update will consume the buffer-averaged
+            # activations, the retrieval query should match — using
+            # the noisy first-forward mean here was an architectural
+            # inconsistency between read and write paths.
+            query_source = (
+                self.synapse.buffer_average() if in_multi_pass else f_base
+            )
+            retrieved = self._get_or_refresh_retrieval(query_source)
             effective_strengths = self.synapse.strengths + retrieved
         else:
             effective_strengths = self.synapse.strengths
@@ -245,10 +263,23 @@ class SynapseAugmentedMLP(nn.Module):
         self.base.set_active_head(index)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base.classify(self.features(x))
+        logits = self.base.classify(self.features(x))
+        if self.training:
+            self._last_logits = logits.detach()
+        else:
+            # Eval forward — leave any cached training logits alone but
+            # do not overwrite with eval-time values. The cache is only
+            # meaningful for the next apply_hebbian_update call, which
+            # only fires from on_after_batch during training.
+            pass
+        return logits
 
     @torch.no_grad()
-    def apply_hebbian_update(self, reward: float | None = None) -> float:
+    def apply_hebbian_update(
+        self,
+        reward: float | None = None,
+        training_target: torch.Tensor | None = None,
+    ) -> float:
         """Push the most recently observed features into the synapse layer.
 
         Multi-pass mode (``n_passes > 1``): the synapse's observation
@@ -261,6 +292,20 @@ class SynapseAugmentedMLP(nn.Module):
         Single-pass mode (``n_passes == 1``, the default): pass the
         cached ``_last_features`` to ``consolidate(activations=...,
         reward=...)``. Bit-exact Phase-3 behaviour.
+
+        Args:
+            reward: Explicit reward. When given, bypasses both the
+                training-target accuracy path and the reward_computer.
+            training_target: Optional ``(B,)`` int64 labels for the
+                most recent training batch. When supplied AND the
+                reward_computer is a :class:`RewardMixer` with an
+                :class:`ExternalReward`, the model computes per-batch
+                training accuracy from the cached logits and pushes it
+                into the external reward source BEFORE the mixer reads
+                it. This makes the audit-flagged "external reward is
+                always 1.0" pathway carry a genuine signal. No-op
+                when the reward_computer is anything else or the
+                training_target is None.
 
         When cold storage and a trigger are configured, also attempt
         a consolidation cycle. The cycle is a no-op if the trigger
@@ -279,6 +324,22 @@ class SynapseAugmentedMLP(nn.Module):
                     "apply_hebbian_update()."
                 )
             features = self._last_features
+
+        # If the caller passed training labels and the reward stack is
+        # configured to take external feedback, drive external from
+        # per-batch accuracy. This must happen BEFORE the mixer is
+        # invoked so the updated value is what gets blended.
+        if (
+            training_target is not None
+            and self._last_logits is not None
+            and isinstance(self.reward_computer, RewardMixer)
+            and isinstance(self.reward_computer.external, ExternalReward)
+        ):
+            preds = self._last_logits.argmax(dim=1)
+            target = training_target.to(preds.device)
+            if preds.shape == target.shape and preds.numel() > 0:
+                acc = float((preds == target).float().mean().item())
+                self.reward_computer.external.set(acc)
 
         if reward is None:
             if self.reward_computer is not None:
@@ -347,6 +408,9 @@ class SynapseAugmentedMLP(nn.Module):
         # The cached `_last_features` was consumed; clear so a
         # missing forward before the next update is caught loudly.
         self._last_features = None
+        # Same for the cached logits — the next training forward
+        # will re-populate them. Eval forwards will not.
+        self._last_logits = None
         return reward
 
     @property

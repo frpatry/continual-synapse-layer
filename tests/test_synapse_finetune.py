@@ -815,6 +815,99 @@ def test_compression_sweep_interval_validated_at_construction() -> None:
         )
 
 
+def test_training_target_updates_external_reward_with_batch_accuracy() -> None:
+    """When apply_hebbian_update gets a training_target, it should
+    compute per-batch accuracy from cached logits and push it into
+    the mixer's external reward source before the mixer reads it."""
+    from continual_synapse.reward.external import ExternalReward
+    from continual_synapse.reward.mixer import RewardMixer
+    from continual_synapse.reward.consistency import ConsistencyReward
+
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    # Make head deterministic so we know what accuracy to expect.
+    with torch.no_grad():
+        base.head.weight.zero_()
+        base.head.bias.zero_()
+        # bias logit for class 0 high so model always predicts class 0
+        base.head.bias[0] = 10.0
+    external = ExternalReward(default=0.5)
+    mixer = RewardMixer(
+        external=external,
+        consistency=ConsistencyReward(n_neurons=8),
+        gamma=0.0,  # disable trajectory decay -> alpha stays at 1 so mixer ≈ external
+    )
+    synapse = SynapseLayer(n_neurons=8, learning_rate=0.05)
+    aug = SynapseAugmentedMLP(
+        base, synapse, SynapseModulation(init_gate=0.0),
+        reward_computer=mixer,
+    )
+    aug.train()
+    x = torch.randn(4, 4)
+    aug(x)
+    # All four samples predicted class 0; if labels are all 0 -> 100% acc.
+    y_all_zero = torch.zeros(4, dtype=torch.int64)
+    aug.apply_hebbian_update(training_target=y_all_zero)
+    assert external.value == 1.0
+
+    # Half wrong: two samples labelled class 1 -> 50% acc.
+    aug(x)
+    y_half = torch.tensor([0, 1, 0, 1], dtype=torch.int64)
+    aug.apply_hebbian_update(training_target=y_half)
+    assert external.value == 0.5
+
+
+def test_training_target_noop_when_no_external_reward() -> None:
+    """Without a RewardMixer + ExternalReward, training_target is harmless."""
+    aug, _ = _build_augmented()
+    aug.train()
+    aug(torch.randn(2, 4))
+    applied = aug.apply_hebbian_update(
+        training_target=torch.zeros(2, dtype=torch.int64)
+    )
+    assert applied == 1.0  # default reward path unchanged
+
+
+def test_training_target_noop_when_reward_computer_is_not_mixer() -> None:
+    """Bare-callable reward computers (not RewardMixer) ignore training_target."""
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=8, learning_rate=0.05)
+    aug = SynapseAugmentedMLP(
+        base, synapse, SynapseModulation(init_gate=0.0),
+        reward_computer=lambda features: 0.42,
+    )
+    aug.train()
+    aug(torch.randn(2, 4))
+    applied = aug.apply_hebbian_update(
+        training_target=torch.zeros(2, dtype=torch.int64)
+    )
+    assert applied == 0.42
+
+
+def test_last_logits_cached_only_in_training_mode() -> None:
+    aug, _ = _build_augmented()
+    aug.eval()
+    aug(torch.randn(2, 4))
+    assert aug._last_logits is None
+
+    aug.train()
+    aug(torch.randn(2, 4))
+    assert aug._last_logits is not None
+    assert aug._last_logits.shape == (2, 2)
+
+
+def test_last_logits_consumed_and_cleared_by_apply_hebbian_update() -> None:
+    aug, _ = _build_augmented()
+    aug.train()
+    aug(torch.randn(2, 4))
+    assert aug._last_logits is not None
+    aug.apply_hebbian_update()
+    assert aug._last_logits is None
+
+
 def test_last_compression_counts_starts_empty() -> None:
     aug, _, _ = _build_with_cold_storage_and_sweep(
         sweep_interval=10, collection="sweep_initial_counts"
