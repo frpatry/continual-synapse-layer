@@ -6,6 +6,146 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-24] Pressure-metric dilution fix — cs_full_sparse goes from catastrophic to baseline-equivalent
+
+### The pathology
+
+Experiment 12's ``cs_full_sparse`` method produced ACC
+``0.534 ± 0.149`` (vs ``0.673 ± 0.007`` for dense ``cs_full``)
+with a monotonic-by-seed-value crash (per-seed ACC ``0.652,
+0.679, 0.578, 0.423, 0.336``). Post-exp seed-isolation
+investigation found no code-level state leak; the Python lifecycle
+was clean. The smoking gun came from the diagnostics: sparse mode
+fired only **1–4 consolidations per 15-task run** (vs 123–153 for
+dense), so cold storage stayed nearly empty, retrieval barely
+contributed, and the modulator gate gradient went unstable in
+seeds 3 and 4 (final gate values ``−0.44`` and ``−0.52``
+respectively — large negative gate means the synapse correction
+gets *subtracted* from the base activations, actively pulling
+the model away from what it had learned).
+
+Root cause: ``ConsolidationTrigger.should_fire`` averaged
+pressure across the full ``(n, n)=(256, 256)=65_536`` buffer.
+Sparse top-k mode zeros out ~75 % of entries (``top_k=64``,
+``density=0.250``), so the zeros diluted the mean by ``1 /
+density ≈ 4×``. The trigger almost never crossed
+``pressure_threshold=0.005`` in sparse mode, even though the
+*active* synapses had pressures well above it.
+
+### The fix (commit ``4b64038``)
+
+In ``src/continual_synapse/consolidation/trigger.py``, mask out
+zero-strength entries before averaging::
+
+    pressures = compute_pressure(synapse)
+    active_mask = synapse.strengths != 0
+    if not active_mask.any():
+        return False
+    avg = float(pressures[active_mask].mean().item())
+    return avg >= self.avg_pressure_threshold
+
+Dense mode has ``active_mask`` all-True so the masked mean equals
+the unmasked mean **bit-exact**. Every prior dense experiment's
+threshold dynamics are unchanged — verified by the existing 321
+tests continuing to pass. Three new tests in
+``test_consolidation_trigger.py`` lock the contract:
+
+- ``test_should_fire_mean_pressure_active_mask_matches_dense_at_full_density``
+  — dense backward compat.
+- ``test_should_fire_not_artificially_deflated_in_sparse_mode``
+  — equivalent active synapses produce equivalent threshold
+  sensitivity regardless of how many zero entries surround them.
+- ``test_should_fire_false_when_no_active_synapses`` — short-circuit
+  to ``False`` when every strength is zero (e.g. immediately after
+  a full drain), instead of accepting ``mean(zeros) == 0 >= 0``
+  as a "fire" signal.
+
+### Result: cs_full_sparse re-run with the fix
+
+15-task Permuted-MNIST, dropout=0.5, 5 seeds, same hyperparameters
+as experiment 12. Output:
+``results/logs/audit_fixes/1779620809_sparse_fix_T15.json``.
+
+| Method | per-seed ACC | mean ± std | mean FGT |
+|---|---|---|---|
+| cs_full_sparse (exp12 — broken) | 0.652, 0.679, 0.578, 0.423, 0.336 | 0.534 ± 0.149 | +0.431 ± 0.156 |
+| **cs_full_sparse (fixed)** | **0.680, 0.654, 0.654, 0.672, 0.674** | **0.667 ± 0.012** | **+0.291 ± 0.013** |
+| cs_full (exp12 — reference dense) | 0.664, 0.672, 0.669, 0.683, 0.676 | 0.673 ± 0.007 | +0.294 ± 0.008 |
+
+Headline: **ACC up 13.3 pp** (0.534 → 0.667). **Std down 12×**
+(0.149 → 0.012). The fixed sparse method is now within 0.6 pp ACC
+and 0.005 std of the dense reference. The catastrophic crash on
+seeds 3–4 is eliminated; every seed lands in a tight band.
+
+Mechanism diagnostics (final-task snapshot, per seed):
+
+| Variant | consolidations | store entries | final gate range |
+|---|---|---|---|
+| Original cs_full_sparse | 1–4 | 1–4 | −0.52 to −0.003 |
+| **Fixed cs_full_sparse** | **82–119** (avg ~101) | 82–119 | **−0.084 to +0.017** |
+| Dense cs_full | 123–153 (avg ~138) | 123–153 | −0.063 to +0.015 |
+
+Consolidation rate jumped ~30× to within the same order of
+magnitude as dense. The modulator gate now stays in the healthy
+``[−0.1, +0.02]`` band — no more runaway. Sparse density is
+unchanged at exactly ``0.250 = 64/256`` (as expected;
+``apply_topk_mask_inplace`` is independent of the trigger).
+
+### Cost: sparse is no longer "the fast variant"
+
+Per-seed wall-clock went from ~80 s (when the trigger almost
+never fired) to ~205 s (when it fires ~100 times per seed and
+each fire writes to chromadb + invalidates the retrieval cache).
+Total per-method runtime is now comparable to dense ``cs_full``
+(~17 min for 5 seeds, vs ~19 min for cs_full at exp12). The prior
+"sparse is cheap" estimate was an artifact of the bug — the
+correct architecture runs at the same scale as dense.
+
+### What this overturns in the audit narrative
+
+The post-experiment-11 audit entry (this file, dated 2026-05-23)
+listed component #9 (sparse top-k) as "✗ implemented but never
+activated" and component #24 (candidate selection) as "⚠ uses
+quantile not threshold; sensible deviation". Component #9 *was*
+activated in experiment 12 and produced the pathology described
+here; the fix completes that work. The pressure-metric dilution
+should also be added to the audit table as a separate row — the
+trigger's averaging convention assumed dense semantics implicitly
+and wasn't flagged when the top-k code path was added.
+
+### Implication for the architectural call
+
+Experiment 11 / 12 already established that the cold-storage
+architecture is statistically indistinguishable from naive on
+ACC at 15-task PermutedMNIST. The fixed sparse path does not
+change that headline (0.667 vs naive's 0.662 = +0.5 pp,
+overlapping std bands). It does, however, restore sparse mode
+as a *legitimate* memory-bounded alternative — at the same ACC
+and the same memory footprint per active synapse, with the
+expected ``O(n·k)`` strength density. So sparse remains a real
+engineering option for future scaling work, not an architectural
+dead-end. The Option B negative-results writeup stands; sparse
+goes from "broken" to "viable but not differentiating" in the
+follow-up article's mechanism section.
+
+### Follow-ups (intentionally deferred)
+
+- **Pairwise vs naive at 15 tasks.** Not run as part of this fix
+  because the question being answered was "does the fix work?",
+  not "does sparse beat naive?". The single-method run produces
+  no pairwise table. If we want a clean comparison, re-run with
+  ``--methods naive cs_full cs_full_sparse`` once.
+- **Extended-sequence sparse.** Whether sparse at 30 tasks
+  generalises like dense did is unknown. Not on the critical
+  path for the negative-results writeup.
+- **Trigger threshold semantics more broadly.** The audit's
+  component #24 (quantile vs absolute threshold for candidate
+  selection) is a related design choice; both ``should_fire`` and
+  ``candidate_mask`` could be revisited together if/when sparse
+  is the headline mechanism.
+
+---
+
 ## [2026-05-23] Three audit-fix implementations: consistency-reward transform, external-reward wiring, multi-pass query consistency
 
 Three implementation changes addressing audit items #11, #15, #16,
