@@ -206,3 +206,57 @@ def test_random_baseline_matches_class_balance() -> None:
     assert result.random_baseline.shape == (2,)
     for b in result.random_baseline:
         assert 0.4 <= b <= 0.7
+
+
+# ---- on_pre_optimizer_step hook (gradient-gating experiment 15 dep) ----
+
+
+def test_on_pre_optimizer_step_fires_between_backward_and_step() -> None:
+    """The hook must see non-None gradients (backward already ran) but
+    parameters must still be at their pre-step values (step hasn't yet)."""
+    call_count = [0]
+    seen_grad_norms: list[float] = []
+    seen_first_param_value: list[float] = []
+
+    def hook(i, task, model):
+        # Backward has run ⇒ gradients are populated.
+        for p in model.parameters():
+            if p.grad is not None:
+                seen_grad_norms.append(float(p.grad.norm().item()))
+                seen_first_param_value.append(float(p.data.flatten()[0].item()))
+                break
+        call_count[0] += 1
+
+    set_seed(0)
+    bench = _TwoTaskBenchmark(seed=0)
+    runner = ContinualRunner(
+        optimizer_factory=lambda p: torch.optim.SGD(p, lr=0.1),
+        epochs_per_task=1, batch_size=8, eval_batch_size=8, seed=0,
+        on_pre_optimizer_step=hook,
+    )
+    model = MLPClassifier(MLPConfig(input_dim=8, hidden_dim=4, num_classes=2))
+    initial_first_param = float(
+        next(model.parameters()).data.flatten()[0].item()
+    )
+    runner.run(model, bench)
+    # 2 tasks × ceil(51/8) = 2 * 7 = 14 invocations.
+    assert call_count[0] == 14
+    # Every call saw a non-zero gradient (since loss was non-trivial).
+    assert all(g > 0 for g in seen_grad_norms[:4])
+    # The first hook invocation saw the parameter at its initial value
+    # (step hadn't fired yet), confirming the ordering.
+    assert seen_first_param_value[0] == initial_first_param
+
+
+def test_on_pre_optimizer_step_default_none_does_not_break_existing_runners() -> None:
+    """Backward compat: omit the kwarg, training proceeds unchanged."""
+    set_seed(0)
+    bench = _TwoTaskBenchmark(seed=0)
+    runner = ContinualRunner(
+        optimizer_factory=lambda p: torch.optim.SGD(p, lr=0.1),
+        epochs_per_task=1, batch_size=8, eval_batch_size=8, seed=0,
+    )
+    model = MLPClassifier(MLPConfig(input_dim=8, hidden_dim=4, num_classes=2))
+    result = runner.run(model, bench)
+    assert result.accuracy_matrix.shape == (2, 2)
+    assert not np.isnan(result.accuracy_matrix[0, 0])

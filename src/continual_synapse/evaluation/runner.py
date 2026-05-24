@@ -25,6 +25,11 @@ subclassing:
   and before each evaluation. Multi-head models use it to switch
   the active classification head; single-head methods leave it
   unset and pay no cost.
+- ``on_pre_optimizer_step(i, task, model)`` fires after
+  ``loss.backward()`` and before ``optimizer.step()``. The
+  gradient-gating method (experiment 15) uses it to scale base
+  model gradients by a familiarity factor computed from the
+  synapse layer's accumulated patterns.
 """
 
 from __future__ import annotations
@@ -51,6 +56,7 @@ TaskChangeCallback = Callable[[int, Task, nn.Module], None]
 AfterBatchCallback = Callable[
     [int, Task, nn.Module, torch.Tensor, torch.Tensor], None
 ]
+PreOptimizerStepCallback = Callable[[int, Task, nn.Module], None]
 
 
 @dataclass
@@ -109,6 +115,7 @@ class ContinualRunner:
     on_task_end: TaskEndCallback | None = None
     on_after_batch: AfterBatchCallback | None = None
     on_task_change: TaskChangeCallback | None = None
+    on_pre_optimizer_step: PreOptimizerStepCallback | None = None
 
     def run(self, model: nn.Module, benchmark: ContinualBenchmark) -> RunResult:
         """Train ``model`` sequentially on ``benchmark`` and return results."""
@@ -185,6 +192,14 @@ class ContinualRunner:
                 if self.regulariser is not None:
                     loss = loss + self.regulariser(model)
                 loss.backward()
+                if self.on_pre_optimizer_step is not None:
+                    # Hook between backward and step. Used by the
+                    # gradient-gating method (experiment 15) to scale
+                    # base.parameters() gradients by Hebbian
+                    # familiarity before SGD applies them. The hook is
+                    # opt-in (None default), so existing experiments
+                    # are unaffected bit-exact.
+                    self.on_pre_optimizer_step(task_index, task, model)
                 optimizer.step()
                 if self.on_after_batch is not None:
                     self.on_after_batch(task_index, task, model, x, y)
