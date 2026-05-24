@@ -121,6 +121,10 @@ class SynapseAugmentedMLP(nn.Module):
         task_warmup_downweight: float = 1.0,
         # ---- Reward-modulated amplification flag ----
         reward_modulated_amplification: bool = False,
+        # ---- Gradient-gating (experiment 15) flags ----
+        gate_modulation_enabled: bool = True,
+        gradient_gating_enabled: bool = False,
+        gradient_gating_alpha: float = 0.9,
     ) -> None:
         super().__init__()
         if synapse.n_neurons != base.config.hidden_dim:
@@ -178,6 +182,11 @@ class SynapseAugmentedMLP(nn.Module):
                 f"task_warmup_downweight must be >= 0, got "
                 f"{task_warmup_downweight}"
             )
+        if not 0.0 <= gradient_gating_alpha <= 1.0:
+            raise ValueError(
+                f"gradient_gating_alpha must be in [0, 1], got "
+                f"{gradient_gating_alpha}"
+            )
         self.base = base
         self.synapse = synapse
         self.modulator = modulator if modulator is not None else SynapseModulation()
@@ -213,6 +222,28 @@ class SynapseAugmentedMLP(nn.Module):
         self.task_warmup_batches = int(task_warmup_batches)
         self.task_warmup_downweight = float(task_warmup_downweight)
         self.reward_modulated_amplification = bool(reward_modulated_amplification)
+        # Gradient-gating (experiment 15). When gate_modulation_enabled
+        # is False the output is the bare base.classify(f_base) (the
+        # synapse correction is skipped) AND the modulator gate is
+        # frozen at zero so the optimizer cannot revive it. When
+        # gradient_gating_enabled is True, the model exposes
+        # apply_gradient_gating() which scales base.parameters()
+        # gradients by ``1 - alpha * familiarity`` where familiarity
+        # = ||f_base @ effective_strengths|| normalised by its running
+        # max. The on_pre_optimizer_step runner hook drives this from
+        # experiment 15.
+        self.gate_modulation_enabled = bool(gate_modulation_enabled)
+        self.gradient_gating_enabled = bool(gradient_gating_enabled)
+        self.gradient_gating_alpha = float(gradient_gating_alpha)
+        if not self.gate_modulation_enabled:
+            with torch.no_grad():
+                self.modulator.gate.data.zero_()
+            self.modulator.gate.requires_grad_(False)
+        # Familiarity tracking state.
+        self._last_effective_strengths: torch.Tensor | None = None
+        self._familiarity_max: float = 1e-6
+        self._last_familiarity: float = 0.0
+        self._last_gradient_scale: float = 1.0
         # Cache of the most recently applied Hebbian reward, used by
         # reward-modulated amplification on the *next* forward pass.
         # None on cold start ⇒ the modulation factor defaults to 1.0
@@ -352,6 +383,19 @@ class SynapseAugmentedMLP(nn.Module):
         else:
             effective_strengths = self.synapse.strengths
 
+        # Cache for gradient gating (experiment 15). Detached so the
+        # autograd graph isn't extended; the gating computation runs
+        # under no_grad anyway.
+        self._last_effective_strengths = effective_strengths.detach()
+
+        if not self.gate_modulation_enabled:
+            # cs_gated: bare base output, synapse correction muted.
+            # The synapse layer still learns via apply_hebbian_update;
+            # the cold storage still retrieves and stays warm; the
+            # familiarity used by gradient gating still derives from
+            # the same effective_strengths we cached above. Only the
+            # *output-side* modulation is skipped.
+            return f_base
         return f_base + self.modulator(f_base, effective_strengths)
 
     def _get_or_refresh_retrieval(
@@ -679,6 +723,73 @@ class SynapseAugmentedMLP(nn.Module):
         loss. Only updated when ``retrieval_feedback_threshold > 0``.
         """
         return self._loss_ema
+
+    @property
+    def last_familiarity(self) -> float:
+        """Familiarity score from the most recent
+        :meth:`apply_gradient_gating` call (or 0.0 if not yet called).
+        Always in ``[0, 1]``. ``0`` means novel pattern (full
+        plasticity); ``1`` means most-familiar-yet (gradients reduced
+        to ``1 - gradient_gating_alpha`` of original).
+        """
+        return self._last_familiarity
+
+    @property
+    def last_gradient_scale(self) -> float:
+        """The scalar gradients were multiplied by on the most recent
+        :meth:`apply_gradient_gating` call, or 1.0 if not yet called.
+        Defined as ``1 - gradient_gating_alpha * last_familiarity``;
+        ``1.0`` means gradients passed through unchanged.
+        """
+        return self._last_gradient_scale
+
+    @property
+    def familiarity_max(self) -> float:
+        """Running max of the raw familiarity signal. Used as the
+        denominator in the per-batch normalisation. Useful diagnostic
+        to detect a single-spike scale-pinning event.
+        """
+        return self._familiarity_max
+
+    @torch.no_grad()
+    def apply_gradient_gating(self) -> float:
+        """Scale ``base.parameters()`` gradients by Hebbian familiarity.
+
+        Called by the runner's ``on_pre_optimizer_step`` hook between
+        ``loss.backward()`` and ``optimizer.step()``. No-op when
+        ``gradient_gating_enabled`` is False (preserves existing
+        methods bit-exact). No-op when no forward has been run yet
+        (``_last_features`` / ``_last_effective_strengths`` is None) —
+        defensive; the runner always forwards first.
+
+        Familiarity:
+
+            raw   = || f_base @ effective_strengths ||
+            max  ← max(max, raw)
+            fam  = min(raw / max, 1)
+            scale = 1 - alpha * fam
+
+        Returns the gradient scale that was applied (useful for the
+        on_after_batch diagnostics in experiment 15).
+        """
+        if not self.gradient_gating_enabled:
+            return 1.0
+        if (
+            self._last_features is None
+            or self._last_effective_strengths is None
+        ):
+            return 1.0
+        raw_signal = self._last_features @ self._last_effective_strengths
+        raw_familiarity = float(raw_signal.norm().item())
+        self._familiarity_max = max(self._familiarity_max, raw_familiarity)
+        familiarity = min(raw_familiarity / self._familiarity_max, 1.0)
+        gradient_scale = 1.0 - self.gradient_gating_alpha * familiarity
+        self._last_familiarity = float(familiarity)
+        self._last_gradient_scale = float(gradient_scale)
+        for param in self.base.parameters():
+            if param.grad is not None:
+                param.grad.mul_(gradient_scale)
+        return gradient_scale
 
     @property
     def last_reward(self) -> float | None:

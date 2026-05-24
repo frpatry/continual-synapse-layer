@@ -1538,3 +1538,162 @@ def test_last_reward_populated_after_apply_hebbian_update() -> None:
     aug(torch.ones(2, 4))
     aug.apply_hebbian_update(reward=0.42)
     assert aug.last_reward == 0.42
+
+
+# ---- Gradient gating (experiment 15: cs_gated) ----
+
+
+def _build_aug_for_gating(
+    *,
+    gate_modulation_enabled: bool = True,
+    gradient_gating_enabled: bool = False,
+    gradient_gating_alpha: float = 0.9,
+) -> SynapseAugmentedMLP:
+    """Augmented MLP with a non-zero initial gate so gate-modulation
+    effects are observable in tests that need them."""
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=8, learning_rate=1e-3)
+    return SynapseAugmentedMLP(
+        base, synapse, SynapseModulation(init_gate=0.5),
+        gate_modulation_enabled=gate_modulation_enabled,
+        gradient_gating_enabled=gradient_gating_enabled,
+        gradient_gating_alpha=gradient_gating_alpha,
+    )
+
+
+def test_gating_defaults_preserve_existing_behavior() -> None:
+    """Default flags (modulation on, gating off) leave forward and
+    backward bit-exact equivalent to the pre-gating implementation."""
+    aug = _build_aug_for_gating()
+    assert aug.gate_modulation_enabled
+    assert not aug.gradient_gating_enabled
+    # Gate parameter remains trainable.
+    assert aug.modulator.gate.requires_grad
+    # apply_gradient_gating is a no-op even after a forward.
+    aug.train()
+    x = torch.randn(3, 4)
+    aug(x)
+    scale = aug.apply_gradient_gating()
+    assert scale == 1.0
+    # No familiarity bookkeeping happened.
+    assert aug.last_familiarity == 0.0
+
+
+def test_gate_modulation_disabled_returns_bare_base_features() -> None:
+    """When gate_modulation_enabled is False, features(x) equals
+    base.features(x) bit-exact — no synapse correction added."""
+    aug = _build_aug_for_gating(gate_modulation_enabled=False)
+    # Manually inflate strengths so any leakage of the modulator path
+    # would be detectable.
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(2.0)
+    aug.eval()
+    x = torch.randn(5, 4)
+    expected = aug.base.features(x)
+    actual = aug.features(x)
+    torch.testing.assert_close(actual, expected)
+    # The gate parameter is frozen at 0 and not trainable.
+    assert aug.modulator.gate.item() == 0.0
+    assert not aug.modulator.gate.requires_grad
+
+
+def test_gate_modulation_disabled_still_caches_for_gating() -> None:
+    """Even when the modulator output is muted, _last_effective_strengths
+    is populated so gradient gating can read it."""
+    aug = _build_aug_for_gating(
+        gate_modulation_enabled=False, gradient_gating_enabled=True,
+    )
+    aug.train()
+    x = torch.randn(3, 4)
+    aug(x)
+    assert aug._last_effective_strengths is not None
+    assert aug._last_features is not None
+
+
+def test_apply_gradient_gating_noop_when_disabled() -> None:
+    aug = _build_aug_for_gating(gradient_gating_enabled=False)
+    aug.train()
+    x = torch.randn(3, 4)
+    out = aug(x)
+    out.sum().backward()
+    # Snapshot a gradient before any scaling.
+    p0 = next(aug.base.parameters())
+    grad_before = p0.grad.clone()
+    aug.apply_gradient_gating()
+    # No-op ⇒ gradient unchanged.
+    torch.testing.assert_close(p0.grad, grad_before)
+
+
+def test_apply_gradient_gating_passes_through_when_familiarity_is_zero() -> None:
+    """First batch on a fresh model: strengths=0 ⇒ effective_strengths=0
+    ⇒ raw_signal = activations @ 0 = 0 ⇒ familiarity = 0 ⇒ scale = 1.0."""
+    aug = _build_aug_for_gating(gradient_gating_enabled=True)
+    aug.train()
+    x = torch.randn(3, 4)
+    out = aug(x)
+    out.sum().backward()
+    p0 = next(aug.base.parameters())
+    grad_before = p0.grad.clone()
+    scale = aug.apply_gradient_gating()
+    assert scale == 1.0
+    assert aug.last_familiarity == 0.0
+    torch.testing.assert_close(p0.grad, grad_before)
+
+
+def test_apply_gradient_gating_reduces_gradients_at_full_familiarity() -> None:
+    """When raw_familiarity equals familiarity_max, familiarity saturates
+    to 1 and gradients are scaled by 1 - alpha = 0.1 at alpha=0.9."""
+    aug = _build_aug_for_gating(
+        gradient_gating_enabled=True, gradient_gating_alpha=0.9,
+    )
+    # Inflate strengths so raw_signal is non-trivial.
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(0.5)
+    aug.train()
+    x = torch.randn(3, 4)
+    out = aug(x)
+    out.sum().backward()
+    p0 = next(aug.base.parameters())
+    grad_before = p0.grad.clone()
+    # First call sets familiarity_max equal to this batch's
+    # raw_familiarity ⇒ familiarity = 1 ⇒ scale = 1 - 0.9 = 0.1.
+    scale = aug.apply_gradient_gating()
+    assert scale == pytest.approx(0.1, abs=1e-6)
+    assert aug.last_familiarity == pytest.approx(1.0)
+    torch.testing.assert_close(p0.grad, grad_before * 0.1)
+
+
+def test_familiarity_uses_effective_strengths_not_gate() -> None:
+    """The familiarity computation reads effective_strengths from the
+    forward pass, NOT the modulator gate. Changing the gate after the
+    forward must not change the familiarity computation."""
+    aug = _build_aug_for_gating(
+        gradient_gating_enabled=True, gradient_gating_alpha=0.9,
+    )
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(0.5)
+    aug.train()
+    x = torch.randn(3, 4)
+    aug(x)
+    cached_es = aug._last_effective_strengths.clone()
+    # Mutate the gate post-forward.
+    with torch.no_grad():
+        aug.modulator.gate.fill_(10.0)
+    # Run forward sum + backward so grads exist; then gate.
+    out = aug.base.classify(aug._last_features)  # cheap re-forward
+    out.sum().backward()
+    aug.apply_gradient_gating()
+    # The cached effective_strengths is what familiarity used.
+    torch.testing.assert_close(aug._last_effective_strengths, cached_es)
+
+
+def test_gradient_gating_alpha_validation() -> None:
+    cfg = MLPConfig(input_dim=4, hidden_dim=4, num_classes=2)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=4)
+    with pytest.raises(ValueError, match="gradient_gating_alpha"):
+        SynapseAugmentedMLP(base, synapse, gradient_gating_alpha=-0.1)
+    with pytest.raises(ValueError, match="gradient_gating_alpha"):
+        SynapseAugmentedMLP(base, synapse, gradient_gating_alpha=1.1)
