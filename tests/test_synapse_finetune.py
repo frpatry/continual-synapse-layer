@@ -1206,3 +1206,166 @@ def test_retrieval_feedback_validation_at_construction() -> None:
         SynapseAugmentedMLP(base, synapse, retrieval_feedback_threshold=-0.1)
     with pytest.raises(ValueError, match="retrieval_feedback_decay"):
         SynapseAugmentedMLP(base, synapse, retrieval_feedback_decay=1.5)
+
+
+# ---- Task-aware variant ----
+
+
+def _build_aug_task_aware(
+    *,
+    task_aware_decay: float = 0.5,
+    task_warmup_batches: int = 0,
+    task_warmup_downweight: float = 1.0,
+    amplification_alpha: float = 1.0,
+) -> SynapseAugmentedMLP:
+    import base64
+    from continual_synapse.cold_storage.compression import quantize
+    from continual_synapse.cold_storage.store import ColdStorage
+    from continual_synapse.consolidation.trigger import ConsolidationTrigger
+
+    cfg = MLPConfig(input_dim=4, hidden_dim=4, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=4, learning_rate=1e-9)
+    store = ColdStorage(collection_name=f"task_aware_{id(base)}")
+    # Pre-load one entry tagged with task_id=3.
+    pattern = torch.full((4, 4), 0.5)
+    store.store_cluster(
+        embedding=[1.0, 1.0, 1.0, 1.0],
+        metadata={
+            "precision": 32, "n_neurons": 4,
+            "age": 0, "access_count": 0, "created_at_step": 0,
+            "task_id": 3,
+        },
+        document=base64.b64encode(quantize(pattern, precision=32)).decode("ascii"),
+        entry_id="t3",
+    )
+    return SynapseAugmentedMLP(
+        base, synapse, SynapseModulation(init_gate=0.5),
+        cold_storage=store,
+        consolidation_trigger=ConsolidationTrigger(
+            avg_pressure_threshold=0.0, min_steps_between=0,
+            candidate_quantile=0.5,
+        ),
+        retrieval_k=1, retrieval_refresh_interval=1,
+        amplification_alpha=amplification_alpha,
+        task_aware_decay=task_aware_decay,
+        task_warmup_batches=task_warmup_batches,
+        task_warmup_downweight=task_warmup_downweight,
+    )
+
+
+def test_task_aware_defaults_preserve_behavior() -> None:
+    """All defaults (decay=0, warmup_batches=0, downweight=1) keep the
+    model bit-exact equivalent to a non-task-aware build."""
+    cfg = MLPConfig(input_dim=4, hidden_dim=4, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=4)
+    aug = SynapseAugmentedMLP(base, synapse, SynapseModulation())
+    # Defaults are inactive — current_task_id stays at sentinel -1.
+    assert aug.current_task_id == -1
+    # Warmup counter starts large so the window is inactive.
+    assert aug.batches_since_task_change > 1000
+
+
+def test_notify_task_change_resets_state() -> None:
+    aug = _build_aug_task_aware(
+        task_aware_decay=0.5, task_warmup_batches=10,
+        task_warmup_downweight=0.1,
+    )
+    aug.train()
+    x = torch.ones(2, 4)
+    # Drive a few apply_hebbian_update calls so the counter advances.
+    for _ in range(5):
+        aug(x)
+        aug.apply_hebbian_update()
+    assert aug.batches_since_task_change >= 5
+    aug.notify_task_change(7)
+    assert aug.current_task_id == 7
+    assert aug.batches_since_task_change == 0
+    # Cache marked stale — next forward will refresh.
+    assert aug._cache_invalidated
+
+
+def test_consolidations_get_tagged_with_current_task_id() -> None:
+    aug = _build_aug_task_aware(
+        task_aware_decay=0.0, task_warmup_batches=0,
+        task_warmup_downweight=1.0,
+    )
+    aug.notify_task_change(5)
+    aug.train()
+    # Populate synapse state with non-trivial strengths so consolidation fires.
+    with torch.no_grad():
+        aug.synapse.strengths.copy_(torch.full((4, 4), 0.5))
+        aug.synapse.evidence.copy_(torch.full((4, 4), 1.0))
+        aug.synapse.global_step.fill_(1000)
+    x = torch.ones(2, 4)
+    aug(x)
+    aug.apply_hebbian_update()
+    # The pre-loaded "t3" entry was there before; any new entry must
+    # carry task_id=5.
+    new_entries = [
+        e for e in aug.cold_storage.all_entries() if e.id != "t3"
+    ]
+    assert new_entries, "consolidation did not fire — adjust setup"
+    assert all(e.metadata.get("task_id") == 5 for e in new_entries)
+
+
+def test_task_warmup_downweights_retrieval_for_first_n_batches() -> None:
+    """During the first task_warmup_batches batches after notify_task_change,
+    retrieval is scaled by task_warmup_downweight in the composition.
+
+    We capture the ``effective_strengths`` argument that ``features()``
+    hands to the modulator — that's where the downweight materialises.
+    Going via end-to-end forward would be fragile because the base
+    MLP's ReLU stack can zero out activations for ``torch.ones`` input
+    and hide any composition difference."""
+    aug = _build_aug_task_aware(
+        task_aware_decay=0.0, task_warmup_batches=3,
+        task_warmup_downweight=0.0,  # full clear, easiest to assert
+        amplification_alpha=0.0,     # additive path so effective = S + retrieved
+    )
+    captured: list[torch.Tensor] = []
+    orig_modulator_forward = aug.modulator.forward
+
+    def spy(activations, strengths):
+        captured.append(strengths.detach().clone())
+        return orig_modulator_forward(activations, strengths)
+
+    aug.modulator.forward = spy  # type: ignore[method-assign]
+
+    aug.notify_task_change(0)
+    aug.train()
+    x = torch.ones(2, 4)
+    # Synapse strengths stay at zero (no Hebbian update lands here),
+    # so effective_strengths == downweight * retrieved during warmup,
+    # and == retrieved post-warmup.
+    aug(x); aug.apply_hebbian_update()  # batch 1: counter 0 → 1, in warmup
+    aug(x); aug.apply_hebbian_update()  # batch 2: counter 1 → 2, in warmup
+    aug(x); aug.apply_hebbian_update()  # batch 3: counter 2 → 3, in warmup
+    assert aug.batches_since_task_change == 3
+    aug(x); aug.apply_hebbian_update()  # batch 4: counter 3, past warmup
+
+    # First three captures (in warmup): effective_strengths is the
+    # zero-scaled retrieved ⇒ all zeros (downweight=0 × any = 0; plus
+    # synapse.strengths is zero from a fresh layer with lr~0).
+    for i in range(3):
+        assert torch.allclose(captured[i], torch.zeros_like(captured[i])), (
+            f"warmup batch {i+1}: expected zero effective_strengths, got "
+            f"{captured[i]}"
+        )
+    # Fourth capture (post-warmup): retrieval contributes ⇒ non-zero.
+    assert not torch.allclose(captured[3], torch.zeros_like(captured[3]))
+
+
+def test_task_aware_decay_validation_at_construction() -> None:
+    cfg = MLPConfig(input_dim=4, hidden_dim=4, num_classes=2)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=4)
+    with pytest.raises(ValueError, match="task_aware_decay"):
+        SynapseAugmentedMLP(base, synapse, task_aware_decay=-0.1)
+    with pytest.raises(ValueError, match="task_warmup_batches"):
+        SynapseAugmentedMLP(base, synapse, task_warmup_batches=-1)
+    with pytest.raises(ValueError, match="task_warmup_downweight"):
+        SynapseAugmentedMLP(base, synapse, task_warmup_downweight=-0.5)

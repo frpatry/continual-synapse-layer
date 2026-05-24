@@ -115,6 +115,10 @@ class SynapseAugmentedMLP(nn.Module):
         retrieval_feedback_threshold: float = 0.0,
         retrieval_feedback_decay: float = 0.95,
         retrieval_feedback_bump: float = 0.5,
+        # ---- Task-aware variant flags (defaults preserve current behavior) ----
+        task_aware_decay: float = 0.0,
+        task_warmup_batches: int = 0,
+        task_warmup_downweight: float = 1.0,
     ) -> None:
         super().__init__()
         if synapse.n_neurons != base.config.hidden_dim:
@@ -159,6 +163,19 @@ class SynapseAugmentedMLP(nn.Module):
                 f"retrieval_feedback_decay must be in (0, 1], got "
                 f"{retrieval_feedback_decay}"
             )
+        if task_aware_decay < 0:
+            raise ValueError(
+                f"task_aware_decay must be >= 0, got {task_aware_decay}"
+            )
+        if task_warmup_batches < 0:
+            raise ValueError(
+                f"task_warmup_batches must be >= 0, got {task_warmup_batches}"
+            )
+        if task_warmup_downweight < 0:
+            raise ValueError(
+                f"task_warmup_downweight must be >= 0, got "
+                f"{task_warmup_downweight}"
+            )
         self.base = base
         self.synapse = synapse
         self.modulator = modulator if modulator is not None else SynapseModulation()
@@ -190,6 +207,17 @@ class SynapseAugmentedMLP(nn.Module):
         self.retrieval_feedback_threshold = float(retrieval_feedback_threshold)
         self.retrieval_feedback_decay = float(retrieval_feedback_decay)
         self.retrieval_feedback_bump = float(retrieval_feedback_bump)
+        self.task_aware_decay = float(task_aware_decay)
+        self.task_warmup_batches = int(task_warmup_batches)
+        self.task_warmup_downweight = float(task_warmup_downweight)
+        # Task-aware state. The model is "task-agnostic" until the
+        # caller calls notify_task_change(). _current_task_id == -1
+        # writes the same "untagged" sentinel into consolidations as
+        # the omitted-kwarg default in consolidate_to_storage. The
+        # warmup counter starts very large so the warmup window is
+        # inactive until notify_task_change resets it to 0.
+        self._current_task_id: int = -1
+        self._batches_since_task_change: int = 10**9
         # Per-call buffer of (entry_id, pre_bump_access_count) tuples filled
         # by _get_or_refresh_retrieval when a refresh fires. Cleared by
         # apply_hebbian_update after any retrieval-feedback bookkeeping.
@@ -263,6 +291,21 @@ class SynapseAugmentedMLP(nn.Module):
                 self.synapse.buffer_average() if in_multi_pass else f_base
             )
             retrieved = self._get_or_refresh_retrieval(query_source)
+            # Task-warmup downweight: during the first ``task_warmup_batches``
+            # apply_hebbian_update calls after a task change, scale the
+            # cold-storage contribution by ``task_warmup_downweight`` so
+            # the new task isn't immediately overwritten by archive
+            # patterns. With the default downweight=1.0 this is a no-op,
+            # so non-task-aware methods are unaffected. The counter
+            # itself only advances when apply_hebbian_update fires (it
+            # is incremented there), so eval-mode forwards do not
+            # progress the warmup window.
+            if (
+                self.task_warmup_batches > 0
+                and self._batches_since_task_change < self.task_warmup_batches
+                and self.task_warmup_downweight != 1.0
+            ):
+                retrieved = retrieved * self.task_warmup_downweight
             if self.amplification_alpha == 0.0:
                 # Default additive composition — bit-exact equivalent to
                 # the pre-amplification path.
@@ -320,6 +363,12 @@ class SynapseAugmentedMLP(nn.Module):
                     n_neurons=self.synapse.n_neurons,
                     confidence_exponent=self.confidence_exponent,
                     out_retrieved_meta=retrieved_meta,
+                    current_task_id=(
+                        self._current_task_id
+                        if self._current_task_id >= 0
+                        else None
+                    ),
+                    task_recency_decay=self.task_aware_decay,
                 )
                 self._last_retrieved_meta = retrieved_meta
             # After this refresh, allow `interval - 1` reuses before
@@ -457,6 +506,7 @@ class SynapseAugmentedMLP(nn.Module):
                 activation_embedding=embedding,
                 drain=not self.no_drain_on_consolidate,
                 merge_threshold=self.repeat_consolidation_threshold,
+                task_id=self._current_task_id,
             )
             if outcome.fired:
                 self._consolidation_count += 1
@@ -520,10 +570,12 @@ class SynapseAugmentedMLP(nn.Module):
                 if ema is not None and effective_loss < ema * self.retrieval_feedback_threshold:
                     self._bump_retrieved_access_counts(self.retrieval_feedback_bump)
                     self._retrieval_feedback_event_count += 1
-        # The buffer is consumed-per-batch; clear regardless of the
-        # threshold so stale IDs from this batch don't bleed into the
-        # next one.
-        self._last_retrieved_meta = []
+        # NOTE: ``_last_retrieved_meta`` is deliberately NOT cleared here.
+        # The retrieval cache may be reused across many forwards
+        # (refresh_interval > 1); the IDs captured at the last refresh
+        # remain "the active retrieval set" until the next refresh
+        # overwrites them. Per-task diagnostics in experiment 13 read
+        # the property at every on_after_batch hook.
 
         # Either way, the next forward should start with a clean
         # multi-pass buffer. Defensive — consolidate() drained it
@@ -536,6 +588,11 @@ class SynapseAugmentedMLP(nn.Module):
         # Same for the cached logits — the next training forward
         # will re-populate them. Eval forwards will not.
         self._last_logits = None
+        # Advance the task-warmup counter exactly once per training
+        # batch (this method only fires from on_after_batch hooks).
+        # Eval-mode forwards do not get here so the warmup window
+        # does not "leak" through evaluation.
+        self._batches_since_task_change += 1
         return reward
 
     @property
@@ -592,6 +649,49 @@ class SynapseAugmentedMLP(nn.Module):
         loss. Only updated when ``retrieval_feedback_threshold > 0``.
         """
         return self._loss_ema
+
+    @property
+    def current_task_id(self) -> int:
+        """Identifier of the task currently being trained. ``-1`` until
+        :meth:`notify_task_change` is first called. Tagged into new
+        cold-storage entries; combined with ``task_aware_decay`` to
+        weight retrieval by task recency.
+        """
+        return self._current_task_id
+
+    @property
+    def batches_since_task_change(self) -> int:
+        """How many ``apply_hebbian_update`` calls have happened since
+        the most recent :meth:`notify_task_change`. Capped by the
+        warmup window: while this is ``< task_warmup_batches`` the
+        cold-storage retrieval is scaled by ``task_warmup_downweight``.
+        """
+        return self._batches_since_task_change
+
+    def notify_task_change(self, task_id: int) -> None:
+        """Tell the model "I'm about to train on task ``task_id`` next."
+
+        Three things happen:
+        - ``_current_task_id`` is set to ``task_id``. Subsequent
+          consolidations get tagged with this id (so task-recency
+          weighting can apply), and retrieval queries use this as the
+          "current" reference when computing
+          ``exp(-decay * (current - entry_task_id))``.
+        - The retrieval cache is invalidated. The next forward
+          re-queries cold storage so the cached pre-task-change
+          retrieval doesn't bleed into the new task's first batches.
+        - The warmup counter resets to ``0`` so the next
+          ``task_warmup_batches`` training batches see the
+          ``task_warmup_downweight`` scaling applied to retrieval.
+
+        Safe to call repeatedly (including for the same task_id, e.g.
+        before each evaluation hop in the runner) — the cache-clear
+        is idempotent and the warmup window only matters during
+        training, which can't enter from this call.
+        """
+        self._current_task_id = int(task_id)
+        self._cache_invalidated = True
+        self._batches_since_task_change = 0
 
     def _update_loss_ema(self, loss: float) -> None:
         """Cold-start EMA on the first call; exponential thereafter."""
