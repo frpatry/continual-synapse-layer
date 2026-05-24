@@ -6,6 +6,66 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-23] Post-experiment-11 audit: 48-component verification of the architecture
+
+A structured read-only audit walked DESIGN.md and PROJECT_PLAN.md
+component-by-component (48 items total: synapse layer, modulation,
+reward components, consolidation, cold storage, runner, wrappers)
+and cross-referenced each against the implementation as of commit
+`9dec81f` (the experiment-11 architectural-call commit). This
+entry records the audit's findings as facts about the codebase at
+that point in time. It is intentionally separate from any
+interpretation of how these findings relate to prior experimental
+results — that interpretation, if warranted, will be logged after
+experiment 12 reports.
+
+### Component status table
+
+Status legend:
+- ✓ implemented and active in at least one experiment
+- ✗ not implemented, or implemented but never activated
+- ⚠ implemented and active but with a runtime deviation from spec
+
+| # | Component (DESIGN / PLAN reference) | Status | Note |
+|---|-------------------------------------|:------:|------|
+| 2 | Per-synapse confidence (`SynapseLayer.confidence`) | ✗ | Populated mechanically by `consolidate()`; no consumer in the codebase. |
+| 3 | Per-synapse age (`SynapseLayer.age`) | ✗ | Incremented in `consolidate()`; no consumer in the codebase. |
+| 9 | Sparse top-k partner selection (DESIGN §3.2) | ✗ | `SynapseLayer(sparse=True, top_k=…)` implemented and unit-tested; every experiment 03–11 instantiated with `sparse=False`. |
+| 10 | Top-k eviction logic | ✗ | Same as #9 — implementation present, never activated. |
+| 11 | Multi-pass averaging (DESIGN §3.2, PLAN §4.2.1) | ⚠ | Buffer + `observe()` / `buffer_average()` present and exercised. Query path into cold storage in `SynapseAugmentedMLP.features` uses the first forward's `f_base.mean` rather than `buffer_average()`. |
+| 15 | External reward (`ExternalReward`) | ⚠ | Class implemented; no caller updates `external.value` away from its `default=1.0` in any experiment script. Effectively constant at runtime. |
+| 16 | Consistency reward (`ConsistencyReward`) | ⚠ | Saturates around 0.97 once the EMA warms up (centered on a `1.0` similarity floor; no transform applied). Output is near-constant per batch. |
+| 19 | Reward mixing α(t) (`RewardMixer`) | ⚠ | Mechanism present and correct, but the two input streams (#15 and #16) are both near-constant at runtime, so the mixed signal is also near-constant. |
+| 24 | Consolidation candidate selection | ⚠ | Implemented via `ConsolidationTrigger(candidate_quantile=…)` (a quantile, e.g. lowest-resistance 5%). DESIGN spec uses an absolute threshold. Sensible deviation; not previously recorded as such. |
+| 25 | K-means clustering of candidates | ✗ | DESIGN specifies clustering; `consolidation/pipeline.py` documents one Chroma entry per cycle (no clustering) at lines 10–13. Deferred in source comment, not in this log until now. |
+| 28 | Cold-storage metadata fidelity tracking | ⚠ | Compression tier and timestamp tracked; per-entry decompression fidelity is not tracked at runtime. |
+| 35 | Decompression fidelity in retrieval | ⚠ | Decompression is correct; we don't measure how much fidelity loss accumulates as entries cycle through 32 → 16 → 8 → 4 bit tiers. |
+
+The remaining 36 components verified clean against the spec.
+(Other deviations such as the retrieval cache at `interval=20`
+batches and Chroma HNSW determinism are noted in the source but
+fall outside the audit's component list.)
+
+### What the audit did not do
+
+The audit did not re-run or re-interpret prior experiments. The
+status entries above are observations about the codebase. Whether
+any of these gaps materially affected experiment 11's headline
+result (cs_full ≈ naive on ACC) is what experiment 12 is being
+run to answer; that interpretation will be logged separately when
+the results land.
+
+### Why this is logged now
+
+Several of these items have been informal knowledge since earlier
+phases (k-means deferral, confidence/age unused) but were never
+collected into one auditable place. The post-experiment-11 audit
+is the first time they were verified together against current
+code, and the count is large enough that a single entry is the
+correct unit of record.
+
+---
+
 ## [2026-05-23] Architectural completion Part 3: experiment 11 result and the final architectural call
 
 ### The five-method comparison (15 tasks Permuted-MNIST, dropout=0.5, 5 seeds)
