@@ -20,6 +20,12 @@ Methods:
 - cs_full_amplified: cs_full + the five amplification flags above.
   Fake reward like cs_full so the amplification effect is isolated
   from the real-reward effect.
+- cs_full_amplified_sparse: cs_full_amplified + sparse top-k partner
+  selection (k=64 on a 256-d hidden state). Depends on the
+  pressure-metric fix (commit ``4b64038``) that normalises mean
+  pressure by active-synapse count rather than total entries;
+  without that fix the trigger almost never fires under sparse
+  density and consolidation stays empty.
 
 Extended per-task diagnostics over experiment 12:
 - consolidation_count, merge_count, store_count, compression sweep
@@ -95,6 +101,7 @@ _DEFAULT_METHODS = (
     "cs_full",
     "cs_full_real_reward",
     "cs_full_amplified",
+    "cs_full_amplified_sparse",
 )
 
 
@@ -130,6 +137,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--consistency-clip-min", type=float, default=-1.0)
     p.add_argument("--consistency-clip-max", type=float, default=1.0)
+    p.add_argument(
+        "--top-k", type=int, default=64,
+        help="Sparse top-k partners per source neuron in sparse variants.",
+    )
     # ---- Amplification-variant flags. Defaults match the cs_full_amplified
     # configuration. Override on the command line to ablate individual flags.
     p.add_argument("--amplification-alpha", type=float, default=1.0)
@@ -245,6 +256,7 @@ def _build_factories(
         *,
         use_real_reward: bool,
         amplification: bool,
+        sparse: bool = False,
     ):
         set_seed(seed)
         base = _build_mlp(args, num_classes)
@@ -252,7 +264,8 @@ def _build_factories(
             n_neurons=args.hidden_dim,
             learning_rate=args.synapse_lr,
             resistance_beta=args.beta,
-            sparse=False,
+            sparse=sparse,
+            top_k=args.top_k,
             n_passes=args.n_passes,
         )
         modulator = SynapseModulation(init_gate=0.0)
@@ -393,13 +406,23 @@ def _build_factories(
     factories: dict[str, Callable] = {
         "naive": naive,
         "cs_full": lambda s: _synapse(
-            s, "cs_full", use_real_reward=False, amplification=False
+            s, "cs_full", use_real_reward=False, amplification=False,
+            sparse=False,
         ),
         "cs_full_real_reward": lambda s: _synapse(
-            s, "cs_full_real_reward", use_real_reward=True, amplification=False
+            s, "cs_full_real_reward", use_real_reward=True, amplification=False,
+            sparse=False,
         ),
         "cs_full_amplified": lambda s: _synapse(
-            s, "cs_full_amplified", use_real_reward=False, amplification=True
+            s, "cs_full_amplified", use_real_reward=False, amplification=True,
+            sparse=False,
+        ),
+        # +sparse on top of the amplified stack. Depends on the
+        # pressure-metric fix (commit 4b64038) so the trigger fires
+        # at a reasonable rate when 75% of strengths are zeroed.
+        "cs_full_amplified_sparse": lambda s: _synapse(
+            s, "cs_full_amplified_sparse", use_real_reward=False, amplification=True,
+            sparse=True,
         ),
     }
     return factories, diagnostics, reward_samples
