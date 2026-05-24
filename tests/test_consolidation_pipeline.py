@@ -345,3 +345,28 @@ def test_outcome_dataclass_fired_property() -> None:
     assert not not_fired.fired
     assert new_entry.fired
     assert merged.fired
+
+
+# ---- Task-aware variant: task_id tagging on consolidation ----
+
+
+def test_task_id_default_is_minus_one_in_metadata() -> None:
+    layer = _populated_layer()
+    store = ColdStorage(collection_name="pipe_task_default")
+    outcome = consolidate_to_storage(
+        layer, store, _trigger(), activation_embedding=torch.zeros(4)
+    )
+    entry = store.get_by_id(outcome.entry_id)
+    assert entry.metadata["task_id"] == -1
+
+
+def test_task_id_stored_in_metadata_when_supplied() -> None:
+    layer = _populated_layer()
+    store = ColdStorage(collection_name="pipe_task_tagged")
+    outcome = consolidate_to_storage(
+        layer, store, _trigger(),
+        activation_embedding=torch.zeros(4),
+        task_id=7,
+    )
+    entry = store.get_by_id(outcome.entry_id)
+    assert entry.metadata["task_id"] == 7

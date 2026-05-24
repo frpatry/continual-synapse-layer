@@ -30,6 +30,7 @@ the pressure metric of any future consolidation cycle.
 from __future__ import annotations
 
 import base64
+import math
 from typing import Any
 
 import torch
@@ -48,6 +49,8 @@ def reconstruct_strengths(
     bump_access_count: bool = True,
     confidence_exponent: float = 0.0,
     out_retrieved_meta: list[tuple[str, int]] | None = None,
+    current_task_id: int | None = None,
+    task_recency_decay: float = 0.0,
 ) -> torch.Tensor:
     """Return a ``(n_neurons, n_neurons)`` reconstructed strengths matrix.
 
@@ -82,6 +85,20 @@ def reconstruct_strengths(
             without re-querying the store. Pre-bump means the value
             recorded is the access_count *before* ``bump_access_count``
             increments it on this call.
+        current_task_id: Identifier of the task the caller is
+            currently training on. Combined with ``task_recency_decay``
+            (and the per-entry ``task_id`` metadata written by
+            ``consolidate_to_storage``) to scale each entry's weight
+            by ``exp(-decay * max(current_task_id - entry_task_id, 0))``.
+            ``None`` (the default) disables the task-recency factor
+            entirely.
+        task_recency_decay: Decay constant in the recency formula
+            above. ``0.0`` (the default) leaves weights bit-exact
+            equivalent to the pre-task-aware path because
+            ``exp(0) == 1``. A value of ``0.5`` means entries from the
+            previous task contribute at ~60% weight, entries two
+            tasks back at ~37%, etc. Entries that were stored without
+            a task_id (metadata value ``-1``) are not scaled.
 
     Returns:
         A float32 ``(n_neurons, n_neurons)`` tensor on the same
@@ -139,6 +156,20 @@ def reconstruct_strengths(
         # bit-exact equivalent to the pre-amplification path.
         if confidence_exponent != 0.0:
             w = w * (1.0 + pre_bump_access) ** float(confidence_exponent)
+        # Task-recency weighting: ``exp(-decay * task_distance)``.
+        # decay=0 collapses to exp(0)=1; entries without a task_id
+        # (-1 = "untagged") are skipped so older runs' archives are
+        # used as-is.
+        if (
+            task_recency_decay != 0.0
+            and current_task_id is not None
+        ):
+            entry_task_id = int(meta.get("task_id", -1))
+            if entry_task_id >= 0:
+                distance = max(int(current_task_id) - entry_task_id, 0)
+                w = w * math.exp(
+                    -float(task_recency_decay) * float(distance)
+                )
         weights.append(w)
 
         if out_retrieved_meta is not None:

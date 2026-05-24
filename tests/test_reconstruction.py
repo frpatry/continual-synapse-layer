@@ -289,3 +289,122 @@ def test_out_retrieved_meta_captures_ids_and_pre_bump_access() -> None:
     assert captured == [("seven", 7)]
     # The bump did fire — post-call the value is 8.
     assert store.get_by_id("seven").metadata["access_count"] == 8
+
+
+# ---- Task-aware variant: task_recency_decay weighting ----
+
+
+def _store_with_task_id(
+    store: ColdStorage,
+    embedding: list[float],
+    strengths: torch.Tensor,
+    task_id: int,
+    entry_id: str,
+) -> None:
+    blob = quantize(strengths, precision=32)
+    doc = base64.b64encode(blob).decode("ascii")
+    store.store_cluster(
+        embedding=embedding,
+        metadata={
+            "precision": 32, "n_neurons": int(strengths.shape[0]),
+            "age": 0, "access_count": 0, "created_at_step": 0,
+            "task_id": int(task_id),
+        },
+        document=doc,
+        entry_id=entry_id,
+    )
+
+
+def test_task_recency_decay_default_is_identity() -> None:
+    """decay=0 ⇒ exp(0)=1 ⇒ weights bit-exact equal to the
+    pre-task-aware path. Backward-compat guarantee."""
+    store = ColdStorage(collection_name="recon_task_default")
+    _store_with_task_id(store, [1.0, 0.0], torch.full((2, 2), 1.0),
+                        task_id=0, entry_id="a")
+    _store_with_task_id(store, [0.0, 1.0], torch.full((2, 2), -1.0),
+                        task_id=5, entry_id="b")
+
+    out_no_task = reconstruct_strengths(
+        store, torch.tensor([0.5, 0.5]), k=2, n_neurons=2,
+        bump_access_count=False,
+    )
+    out_decay_zero = reconstruct_strengths(
+        store, torch.tensor([0.5, 0.5]), k=2, n_neurons=2,
+        bump_access_count=False, current_task_id=10, task_recency_decay=0.0,
+    )
+    torch.testing.assert_close(out_no_task, out_decay_zero)
+
+
+def test_task_recency_decay_downweights_older_entries() -> None:
+    """Two equidistant entries; the one from an older task gets less
+    weight under task_recency_decay > 0."""
+    store = ColdStorage(collection_name="recon_task_decay")
+    s_new = torch.full((2, 2), 1.0)
+    s_old = torch.full((2, 2), -1.0)
+    _store_with_task_id(store, [1.0, 0.0], s_new, task_id=10, entry_id="new")
+    _store_with_task_id(store, [0.0, 1.0], s_old, task_id=8, entry_id="old")
+
+    # Without decay, equidistant entries average to ~0.
+    out_neutral = reconstruct_strengths(
+        store, torch.tensor([0.5, 0.5]), k=2, n_neurons=2,
+        bump_access_count=False,
+    )
+    assert abs(out_neutral.mean().item()) < 1e-6
+
+    # With decay=0.5 and current_task_id=10:
+    # new entry distance = 0 → weight × exp(0) = ×1
+    # old entry distance = 2 → weight × exp(-1) ≈ ×0.368
+    # The new entry (+1.0) dominates ⇒ mean > 0.
+    out_recency = reconstruct_strengths(
+        store, torch.tensor([0.5, 0.5]), k=2, n_neurons=2,
+        bump_access_count=False,
+        current_task_id=10, task_recency_decay=0.5,
+    )
+    assert out_recency.mean().item() > 0.4
+
+
+def test_task_recency_skips_untagged_entries() -> None:
+    """Entries with task_id=-1 (or missing) get no recency adjustment —
+    they're treated as "unknown task" rather than "very old"."""
+    store = ColdStorage(collection_name="recon_task_untagged")
+    s_tagged = torch.full((2, 2), 1.0)
+    s_untagged = torch.full((2, 2), -1.0)
+    _store_with_task_id(store, [1.0, 0.0], s_tagged, task_id=0, entry_id="t")
+    # Untagged entry: omit task_id from metadata (simulate older runs).
+    blob = quantize(s_untagged, precision=32)
+    store.store_cluster(
+        embedding=[0.0, 1.0],
+        metadata={
+            "precision": 32, "n_neurons": 2,
+            "age": 0, "access_count": 0, "created_at_step": 0,
+            # no task_id field
+        },
+        document=base64.b64encode(blob).decode("ascii"),
+        entry_id="u",
+    )
+    # With heavy decay and current_task=100, the tagged entry from task 0
+    # would be downweighted to exp(-50) ≈ 0, but the untagged stays at
+    # its base weight ⇒ untagged dominates the output (-1.0).
+    out = reconstruct_strengths(
+        store, torch.tensor([0.5, 0.5]), k=2, n_neurons=2,
+        bump_access_count=False,
+        current_task_id=100, task_recency_decay=0.5,
+    )
+    assert out.mean().item() < -0.4
+
+
+def test_task_recency_clamps_negative_distance_to_zero() -> None:
+    """If an entry's task_id > current_task_id (shouldn't normally happen
+    but be safe), the distance clamps to 0 ⇒ exp(0)=1 ⇒ no penalty."""
+    store = ColdStorage(collection_name="recon_task_future")
+    _store_with_task_id(store, [1.0, 0.0], torch.full((2, 2), 1.0),
+                        task_id=10, entry_id="future")
+    # Current task is 5; entry is from "future" task 10 — distance is
+    # max(5-10, 0) = 0, so weight unaffected.
+    out = reconstruct_strengths(
+        store, torch.tensor([1.0, 0.0]), k=1, n_neurons=2,
+        bump_access_count=False,
+        current_task_id=5, task_recency_decay=10.0,  # massive decay
+    )
+    # Entry recovered at full weight despite heavy decay.
+    torch.testing.assert_close(out, torch.full((2, 2), 1.0))

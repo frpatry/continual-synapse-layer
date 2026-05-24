@@ -82,6 +82,7 @@ def consolidate_to_storage(
     merge_threshold: float = 1.0,
     merge_access_bump: float = 10.0,
     embedding_running_average_decay: float = 0.9,
+    task_id: int = -1,
 ) -> ConsolidationOutcome:
     """Run one consolidation cycle.
 
@@ -120,6 +121,12 @@ def consolidate_to_storage(
             existing entry's embedding is replaced with
             ``decay * old + (1 - decay) * new``. Set to ``1.0`` to
             keep the original embedding untouched.
+        task_id: Identifier of the task currently being trained.
+            Stored in the new entry's metadata under ``"task_id"``
+            so that retrieval can apply a task-recency weighting.
+            Default ``-1`` means "untagged" — readers treat untagged
+            entries as having no task affinity and skip the recency
+            adjustment for them.
 
     Returns:
         A :class:`ConsolidationOutcome` describing what happened.
@@ -198,6 +205,7 @@ def consolidate_to_storage(
         "access_count": 0,
         "created_at_step": int(step),
         "num_candidates": int(mask.sum().item()),
+        "task_id": int(task_id),
     }
     entry_id = store.store_cluster(
         embedding=embedding.tolist(),
