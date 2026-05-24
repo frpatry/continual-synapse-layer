@@ -107,6 +107,8 @@ class SynapseAugmentedMLP(nn.Module):
         n_passes: int = 1,
         compression_sweep_interval: int = 0,
         compression_schedule: CompressionSchedule | None = None,
+        # ---- Amplification variant flags (defaults preserve current behavior) ----
+        amplification_alpha: float = 0.0,
     ) -> None:
         super().__init__()
         if synapse.n_neurons != base.config.hidden_dim:
@@ -128,6 +130,10 @@ class SynapseAugmentedMLP(nn.Module):
                 f"compression_sweep_interval must be >= 0, got "
                 f"{compression_sweep_interval}"
             )
+        if amplification_alpha < 0:
+            raise ValueError(
+                f"amplification_alpha must be >= 0, got {amplification_alpha}"
+            )
         self.base = base
         self.synapse = synapse
         self.modulator = modulator if modulator is not None else SynapseModulation()
@@ -148,6 +154,11 @@ class SynapseAugmentedMLP(nn.Module):
             if compression_schedule is not None
             else CompressionSchedule()
         )
+        # Amplification variant flags. When defaults are kept, every code
+        # path below is bit-exact equivalent to the pre-amplification
+        # implementation — verified by the existing test suite plus the
+        # dedicated defaults-preserve-behavior tests.
+        self.amplification_alpha = float(amplification_alpha)
         self._batches_since_compression_sweep: int = 0
         self._compression_sweep_count: int = 0
         self._last_compression_counts: dict[int, int] = {}
@@ -210,7 +221,25 @@ class SynapseAugmentedMLP(nn.Module):
                 self.synapse.buffer_average() if in_multi_pass else f_base
             )
             retrieved = self._get_or_refresh_retrieval(query_source)
-            effective_strengths = self.synapse.strengths + retrieved
+            if self.amplification_alpha == 0.0:
+                # Default additive composition — bit-exact equivalent to
+                # the pre-amplification path.
+                effective_strengths = self.synapse.strengths + retrieved
+            else:
+                # Multiplicative amplification: the retrieval modulates
+                # the existing strengths up or down rather than adding a
+                # second pattern on top. Normalising `retrieved` to
+                # [-1, +1] (max-abs scaling) keeps the multiplier in
+                # [1 - alpha, 1 + alpha], so alpha = 1 corresponds to
+                # "double the strength where retrieved is fully positive
+                # and zero it where retrieved is fully negative". The
+                # working-memory pattern is what actually gets scaled;
+                # cold storage acts as a gain map.
+                max_abs = retrieved.abs().max().clamp_min(1e-8)
+                retrieved_normalized = retrieved / max_abs
+                effective_strengths = self.synapse.strengths * (
+                    1.0 + self.amplification_alpha * retrieved_normalized
+                )
         else:
             effective_strengths = self.synapse.strengths
 

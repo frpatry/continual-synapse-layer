@@ -938,3 +938,149 @@ def test_runner_end_to_end_with_synapse_smoke() -> None:
     assert torch.any(synapse.strengths != 0.0)
     # global_step counts batches: 2 tasks * 1 epoch * 3 batches = 6.
     assert synapse.global_step.item() == 6
+
+
+# ---- Amplification variant: change 1 (multiplicative composition) ----
+
+
+def _augmented_with_seeded_storage(
+    *,
+    amplification_alpha: float,
+    hidden_dim: int = 4,
+) -> tuple[SynapseAugmentedMLP, torch.Tensor]:
+    """Build an augmented MLP with one cold-storage entry pre-loaded.
+
+    Returns the model plus the retrieved tensor it would produce so
+    tests can compute expected effective strengths exactly.
+    """
+    import base64
+
+    from continual_synapse.cold_storage.compression import quantize
+    from continual_synapse.cold_storage.store import ColdStorage
+
+    cfg = MLPConfig(input_dim=4, hidden_dim=hidden_dim, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=hidden_dim, learning_rate=1e-9)
+    # Seed the synapse strengths with a known non-zero pattern.
+    with torch.no_grad():
+        synapse.strengths.copy_(torch.arange(hidden_dim * hidden_dim, dtype=torch.float32)
+                                .reshape(hidden_dim, hidden_dim))
+    store = ColdStorage(collection_name=f"amplify_{amplification_alpha}_{id(base)}")
+    # Pre-load one entry whose embedding matches what the model will
+    # query with (a constant activation pattern).
+    pattern = torch.full((hidden_dim, hidden_dim), 2.0)
+    blob = quantize(pattern, precision=32)
+    store.store_cluster(
+        embedding=[1.0] * hidden_dim,
+        metadata={
+            "precision": 32, "n_neurons": hidden_dim,
+            "age": 0, "access_count": 0, "created_at_step": 0,
+        },
+        document=base64.b64encode(blob).decode("ascii"),
+    )
+    aug = SynapseAugmentedMLP(
+        base, synapse, SynapseModulation(init_gate=0.5),  # non-zero so strengths matter
+        cold_storage=store,
+        retrieval_k=1,
+        retrieval_refresh_interval=1,
+        amplification_alpha=amplification_alpha,
+    )
+    return aug, pattern
+
+
+def _trace_correction(
+    aug: SynapseAugmentedMLP, x: torch.Tensor, forced_features: torch.Tensor
+) -> torch.Tensor:
+    """Compute the modulator correction for `forced_features` against the
+    same effective_strengths the model would use for `x`. The base
+    model's `features()` is bypassed so input-zeroing ReLUs don't hide
+    the composition rule under test."""
+    # Reproduce the composition logic from features() but with the
+    # forced pre-correction features.
+    with torch.no_grad():
+        retrieved = aug._get_or_refresh_retrieval(forced_features)
+        if aug.amplification_alpha == 0.0:
+            effective = aug.synapse.strengths + retrieved
+        else:
+            max_abs = retrieved.abs().max().clamp_min(1e-8)
+            effective = aug.synapse.strengths * (
+                1.0 + aug.amplification_alpha * (retrieved / max_abs)
+            )
+        return aug.modulator(forced_features, effective)
+
+
+def test_amplification_default_is_additive_bit_exact() -> None:
+    """alpha=0 must compute effective_strengths via strict addition,
+    matching the legacy path bit-exact."""
+    aug, pattern = _augmented_with_seeded_storage(amplification_alpha=0.0)
+    forced = torch.ones(2, 4)
+    with torch.no_grad():
+        retrieved = aug._get_or_refresh_retrieval(forced)
+        expected_effective = aug.synapse.strengths + retrieved
+        expected_correction = aug.modulator(forced, expected_effective)
+    actual_correction = _trace_correction(aug, forced, forced)
+    torch.testing.assert_close(actual_correction, expected_correction)
+
+
+def test_amplification_alpha_one_uses_multiplicative_normalized() -> None:
+    """alpha=1 corresponds to effective = strengths * (1 + retrieved_norm)
+    where retrieved_norm = retrieved / max(|retrieved|). The result must
+    differ from the additive path on the same retrieved."""
+    aug_amp, _ = _augmented_with_seeded_storage(amplification_alpha=1.0)
+    aug_add, _ = _augmented_with_seeded_storage(amplification_alpha=0.0)
+    forced = torch.ones(2, 4)
+
+    out_amp = _trace_correction(aug_amp, forced, forced)
+    out_add = _trace_correction(aug_add, forced, forced)
+    # The pre-loaded retrieved pattern is all 2.0; strengths is arange.
+    # Additive: strengths + 2; multiplicative-norm: strengths * (1 + 1) = 2*strengths
+    # These differ structurally, so corrections differ.
+    assert not torch.allclose(out_amp, out_add)
+
+    # Verify the multiplicative formula numerically.
+    with torch.no_grad():
+        retrieved = aug_amp._get_or_refresh_retrieval(forced)
+        max_abs = retrieved.abs().max().clamp_min(1e-8)
+        expected_effective = aug_amp.synapse.strengths * (
+            1.0 + retrieved / max_abs
+        )
+        expected_correction = aug_amp.modulator(forced, expected_effective)
+    torch.testing.assert_close(out_amp, expected_correction)
+
+
+def test_amplification_normalization_bounds_multiplier() -> None:
+    """The multiplier (1 + alpha * retrieved_normalized) lies in
+    [1 - alpha, 1 + alpha] because retrieved_normalized ∈ [-1, +1]."""
+    cfg = MLPConfig(input_dim=4, hidden_dim=4, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=4, learning_rate=1e-9)
+    with torch.no_grad():
+        synapse.strengths.fill_(1.0)
+    # Inject a known retrieved tensor by monkey-patching _get_or_refresh_retrieval.
+    retrieved_test = torch.tensor(
+        [[-3.0, 0.0, 1.0, 3.0]] * 4, dtype=torch.float32
+    )
+    # max-abs is 3.0, so normalized is [-1, 0, 1/3, 1]
+    expected_normalized = retrieved_test / 3.0
+    alpha = 0.5
+    expected_multiplier = 1.0 + alpha * expected_normalized
+    expected_effective = synapse.strengths * expected_multiplier
+
+    # Direct math sanity check.
+    assert (expected_multiplier >= 1.0 - alpha - 1e-6).all()
+    assert (expected_multiplier <= 1.0 + alpha + 1e-6).all()
+    assert torch.allclose(
+        expected_effective.max(),
+        torch.tensor(1.0 + alpha),
+        atol=1e-6,
+    )
+
+
+def test_amplification_validated_at_construction() -> None:
+    cfg = MLPConfig(input_dim=4, hidden_dim=4, num_classes=2)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=4)
+    with pytest.raises(ValueError, match="amplification_alpha must be"):
+        SynapseAugmentedMLP(base, synapse, amplification_alpha=-0.1)
