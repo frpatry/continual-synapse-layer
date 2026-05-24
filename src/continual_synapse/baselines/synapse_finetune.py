@@ -125,6 +125,7 @@ class SynapseAugmentedMLP(nn.Module):
         gate_modulation_enabled: bool = True,
         gradient_gating_enabled: bool = False,
         gradient_gating_alpha: float = 0.9,
+        familiarity_mode: str = "magnitude",
     ) -> None:
         super().__init__()
         if synapse.n_neurons != base.config.hidden_dim:
@@ -187,6 +188,11 @@ class SynapseAugmentedMLP(nn.Module):
                 f"gradient_gating_alpha must be in [0, 1], got "
                 f"{gradient_gating_alpha}"
             )
+        if familiarity_mode not in ("magnitude", "cosine"):
+            raise ValueError(
+                f"familiarity_mode must be 'magnitude' or 'cosine', "
+                f"got {familiarity_mode!r}"
+            )
         self.base = base
         self.synapse = synapse
         self.modulator = modulator if modulator is not None else SynapseModulation()
@@ -235,6 +241,11 @@ class SynapseAugmentedMLP(nn.Module):
         self.gate_modulation_enabled = bool(gate_modulation_enabled)
         self.gradient_gating_enabled = bool(gradient_gating_enabled)
         self.gradient_gating_alpha = float(gradient_gating_alpha)
+        self.familiarity_mode = str(familiarity_mode)
+        # Snapshot of the most recent cosine-similarity vector against
+        # cold storage, populated by apply_gradient_gating in cosine
+        # mode. Empty list otherwise. Exposed via last_similarities.
+        self._last_similarities: list[float] = []
         if not self.gate_modulation_enabled:
             with torch.no_grad():
                 self.modulator.gate.data.zero_()
@@ -751,6 +762,16 @@ class SynapseAugmentedMLP(nn.Module):
         """
         return self._familiarity_max
 
+    @property
+    def last_similarities(self) -> list[float]:
+        """Cosine similarities computed by the most recent
+        :meth:`apply_gradient_gating` call in ``"cosine"`` mode, one
+        per stored cold-storage entry in insertion order. Empty list
+        in magnitude mode or before the first call. Useful for
+        per-task distribution diagnostics in experiment 16.
+        """
+        return list(self._last_similarities)
+
     @torch.no_grad()
     def apply_gradient_gating(self) -> float:
         """Scale ``base.parameters()`` gradients by Hebbian familiarity.
@@ -775,19 +796,39 @@ class SynapseAugmentedMLP(nn.Module):
           query-consistency fix in ``features()`` itself (audit
           fix 3/3).
 
-        Familiarity:
+        Familiarity is computed according to ``familiarity_mode``:
 
-            raw   = || features @ effective_strengths ||
-            max  ← max(max, raw)
-            fam  = min(raw / max, 1)
-            scale = 1 - alpha * fam
+        - ``"magnitude"`` (default, backward-compat with cs_gated):
+
+              raw = || features @ effective_strengths ||
+              max ← max(max, raw)
+              fam = min(raw / max, 1)
+
+          An aggregate magnitude measure that saturates as the synapse
+          layer accumulates patterns. The mechanism behind the original
+          exp-15 cs_gated baseline.
+
+        - ``"cosine"`` (experiment 16's cs_gated_cosine):
+
+              activation = features.mean(0)
+              sims = cold_storage.compute_similarities(activation)
+              fam  = max(0, max(sims))  if sims else 0
+
+          A pattern-specific recognition measure. Cosine is naturally
+          bounded in ``[-1, +1]``; the ``max(0, ·)`` clamp turns
+          anti-correlation into "no familiarity" rather than negative
+          familiarity. No adaptive normalisation needed.
+
+        Final scaling is the same either way:
+
+              scale = 1 - alpha * fam
 
         Returns the gradient scale that was applied (useful for the
-        on_after_batch diagnostics in experiment 15).
+        on_after_batch diagnostics in experiments 15 and 16).
         """
         if not self.gradient_gating_enabled:
             return 1.0
-        if self._last_effective_strengths is None:
+        if self._last_effective_strengths is None and self.familiarity_mode != "cosine":
             return 1.0
         features_for_familiarity = self._last_features
         if features_for_familiarity is None:
@@ -798,10 +839,34 @@ class SynapseAugmentedMLP(nn.Module):
                 features_for_familiarity = self.synapse.buffer_average()
             else:
                 return 1.0
-        raw_signal = features_for_familiarity @ self._last_effective_strengths
-        raw_familiarity = float(raw_signal.norm().item())
-        self._familiarity_max = max(self._familiarity_max, raw_familiarity)
-        familiarity = min(raw_familiarity / self._familiarity_max, 1.0)
+
+        if self.familiarity_mode == "cosine":
+            # Pattern-specific recognition via cosine similarity against
+            # every stored cold-storage embedding.
+            if self.cold_storage is None or self.cold_storage.count() == 0:
+                self._last_similarities = []
+                self._last_familiarity = 0.0
+                self._last_gradient_scale = 1.0
+                return 1.0
+            query = features_for_familiarity.mean(dim=0).detach()
+            sims = self.cold_storage.compute_similarities(query.tolist())
+            self._last_similarities = list(sims)
+            if not sims:
+                self._last_familiarity = 0.0
+                self._last_gradient_scale = 1.0
+                return 1.0
+            raw_familiarity = max(0.0, float(max(sims)))
+            self._familiarity_max = max(self._familiarity_max, raw_familiarity)
+            familiarity = float(raw_familiarity)  # already in [0, 1]
+        else:
+            # "magnitude" — original cs_gated path.
+            if self._last_effective_strengths is None:
+                return 1.0
+            raw_signal = features_for_familiarity @ self._last_effective_strengths
+            raw_familiarity = float(raw_signal.norm().item())
+            self._familiarity_max = max(self._familiarity_max, raw_familiarity)
+            familiarity = min(raw_familiarity / self._familiarity_max, 1.0)
+
         gradient_scale = 1.0 - self.gradient_gating_alpha * familiarity
         self._last_familiarity = float(familiarity)
         self._last_gradient_scale = float(gradient_scale)

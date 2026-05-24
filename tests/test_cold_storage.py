@@ -407,3 +407,94 @@ def test_re_evaluate_reduces_total_byte_size() -> None:
     )
     # 4-bit entries are roughly 1/8 the size of 32-bit.
     assert after_bytes < before_bytes / 4
+
+
+# ---- compute_similarities (experiment 16: cosine-familiarity helper) ----
+
+
+def test_compute_similarities_empty_store_returns_empty_list() -> None:
+    store = ColdStorage(collection_name="sims_empty")
+    assert store.compute_similarities([1.0, 0.0, 0.0]) == []
+
+
+def test_compute_similarities_identical_pattern_returns_one() -> None:
+    store = ColdStorage(collection_name="sims_identical")
+    store.store_cluster(
+        embedding=[1.0, 0.0, 0.0],
+        metadata={"precision": 32, "n_neurons": 3},
+        document="x",
+        entry_id="same",
+    )
+    sims = store.compute_similarities([1.0, 0.0, 0.0])
+    assert len(sims) == 1
+    assert sims[0] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_compute_similarities_orthogonal_pattern_returns_zero() -> None:
+    store = ColdStorage(collection_name="sims_orthogonal")
+    store.store_cluster(
+        embedding=[1.0, 0.0, 0.0],
+        metadata={"precision": 32, "n_neurons": 3},
+        document="x",
+        entry_id="x_axis",
+    )
+    sims = store.compute_similarities([0.0, 1.0, 0.0])
+    assert len(sims) == 1
+    assert sims[0] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_compute_similarities_antiparallel_pattern_returns_minus_one() -> None:
+    store = ColdStorage(collection_name="sims_antiparallel")
+    store.store_cluster(
+        embedding=[1.0, 0.0, 0.0],
+        metadata={"precision": 32, "n_neurons": 3},
+        document="x",
+        entry_id="positive_x",
+    )
+    sims = store.compute_similarities([-1.0, 0.0, 0.0])
+    assert sims[0] == pytest.approx(-1.0, abs=1e-6)
+
+
+def test_compute_similarities_multiple_entries_in_insertion_order() -> None:
+    """Returned list matches all_entries() order — caller can map back
+    to entry ids by zipping."""
+    store = ColdStorage(collection_name="sims_multi")
+    for i, (emb, eid) in enumerate([
+        ([1.0, 0.0], "a"),
+        ([0.0, 1.0], "b"),
+        ([1.0, 1.0], "c"),
+    ]):
+        store.store_cluster(
+            embedding=emb, metadata={"precision": 32, "n_neurons": 2},
+            document="x", entry_id=eid,
+        )
+    sims = store.compute_similarities([1.0, 0.0])
+    assert len(sims) == 3
+    # In insertion order: ~1, ~0, ~0.707
+    assert sims[0] == pytest.approx(1.0, abs=1e-6)
+    assert sims[1] == pytest.approx(0.0, abs=1e-6)
+    assert sims[2] == pytest.approx(0.7071, abs=1e-3)
+    # Ordering matches all_entries.
+    by_id = {e.id: sim for e, sim in zip(store.all_entries(), sims)}
+    assert by_id["a"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_compute_similarities_handles_zero_vectors_without_nan() -> None:
+    """Zero-norm vectors should not produce NaN (clamp_min protects)."""
+    store = ColdStorage(collection_name="sims_zero")
+    store.store_cluster(
+        embedding=[0.0, 0.0, 0.0],
+        metadata={"precision": 32, "n_neurons": 3},
+        document="x",
+    )
+    sims = store.compute_similarities([1.0, 0.0, 0.0])
+    # Numerator is zero, denominator is clamped → result is 0, not NaN.
+    assert sims[0] == 0.0
+    # Zero query against non-zero entry also OK.
+    store2 = ColdStorage(collection_name="sims_zero_q")
+    store2.store_cluster(
+        embedding=[1.0, 1.0, 1.0],
+        metadata={"precision": 32, "n_neurons": 3},
+        document="x",
+    )
+    assert store2.compute_similarities([0.0, 0.0, 0.0]) == [0.0]

@@ -1778,3 +1778,169 @@ def test_apply_gradient_gating_uses_buffer_average_consistently() -> None:
     # familiarity_max now equals expected_raw because it's the first
     # observation. The bookkeeping must agree with the manual computation.
     assert aug.familiarity_max == pytest.approx(expected_raw, rel=1e-5)
+
+
+# ---- familiarity_mode = "cosine" (experiment 16: cs_gated_cosine) ----
+
+
+def _build_aug_cosine_gating(
+    *,
+    pre_load_pattern: torch.Tensor | None = None,
+    pre_load_embedding: list[float] | None = None,
+) -> SynapseAugmentedMLP:
+    """Augmented MLP with cosine familiarity mode and optional pre-loaded
+    cold storage entry for testing the cosine path."""
+    import base64
+    from continual_synapse.cold_storage.compression import quantize
+    from continual_synapse.cold_storage.store import ColdStorage
+
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2, dropout=0.5)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=8, learning_rate=1e-3, n_passes=5)
+    store = ColdStorage(
+        collection_name=f"cos_gating_{id(base)}"
+    )
+    if pre_load_pattern is not None and pre_load_embedding is not None:
+        blob = quantize(pre_load_pattern, precision=32)
+        store.store_cluster(
+            embedding=pre_load_embedding,
+            metadata={
+                "precision": 32, "n_neurons": 8,
+                "age": 0, "access_count": 0, "created_at_step": 0,
+            },
+            document=base64.b64encode(blob).decode("ascii"),
+            entry_id="seed",
+        )
+    return SynapseAugmentedMLP(
+        base, synapse, SynapseModulation(init_gate=0.0),
+        cold_storage=store,
+        n_passes=5,
+        retrieval_k=1, retrieval_refresh_interval=1,
+        gate_modulation_enabled=False,
+        gradient_gating_enabled=True,
+        gradient_gating_alpha=0.9,
+        familiarity_mode="cosine",
+    )
+
+
+def test_cosine_familiarity_empty_store_passes_through() -> None:
+    """Empty cold storage ⇒ familiarity = 0 ⇒ scale = 1 ⇒ gradients
+    untouched. Same outcome as 'no cold storage at all'."""
+    aug = _build_aug_cosine_gating()
+    assert aug.cold_storage.count() == 0
+    aug.train()
+    x = torch.randn(3, 4)
+    out = aug(x)
+    out.sum().backward()
+    p0 = next(aug.base.parameters())
+    grad_before = p0.grad.clone()
+    scale = aug.apply_gradient_gating()
+    assert scale == 1.0
+    assert aug.last_familiarity == 0.0
+    assert aug.last_similarities == []
+    torch.testing.assert_close(p0.grad, grad_before)
+
+
+def test_cosine_familiarity_identical_pattern_saturates_to_one() -> None:
+    """Query matches stored embedding ⇒ cosine sim = 1 ⇒ familiarity = 1
+    ⇒ scale = 1 - 0.9 = 0.1."""
+    # We force the activation that flows through the model to match the
+    # stored embedding by setting the synapse buffer manually after a
+    # forward (the forward populates the buffer; we then overwrite it
+    # with a known vector that matches what we stored).
+    aug = _build_aug_cosine_gating(
+        pre_load_pattern=torch.zeros(8, 8),
+        pre_load_embedding=[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    aug.train()
+    aug(torch.randn(3, 4))  # populates buffer; we'll overwrite next
+    # Replace the buffer with three copies of the same vector that
+    # matches the stored embedding [1, 0, ..., 0]. Buffer average
+    # then equals that vector.
+    target = torch.zeros(3, 8)
+    target[:, 0] = 1.0
+    aug.synapse._activation_buffer = [target.clone() for _ in range(5)]
+    p0 = next(aug.base.parameters())
+    p0.grad = torch.ones_like(p0)  # placeholder gradient
+    grad_before = p0.grad.clone()
+    scale = aug.apply_gradient_gating()
+    assert scale == pytest.approx(0.1, abs=1e-5)
+    assert aug.last_familiarity == pytest.approx(1.0, abs=1e-5)
+    assert len(aug.last_similarities) == 1
+    assert aug.last_similarities[0] == pytest.approx(1.0, abs=1e-5)
+    torch.testing.assert_close(p0.grad, grad_before * 0.1)
+
+
+def test_cosine_familiarity_orthogonal_pattern_passes_through() -> None:
+    """Query orthogonal to stored embedding ⇒ sim = 0 ⇒ fam = 0 ⇒
+    scale = 1 ⇒ gradients pass through unchanged."""
+    aug = _build_aug_cosine_gating(
+        pre_load_pattern=torch.zeros(8, 8),
+        pre_load_embedding=[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    aug.train()
+    aug(torch.randn(3, 4))
+    # Buffer is orthogonal to stored embedding (zero in dim 0, nonzero in dim 1).
+    target = torch.zeros(3, 8)
+    target[:, 1] = 1.0
+    aug.synapse._activation_buffer = [target.clone() for _ in range(5)]
+    p0 = next(aug.base.parameters())
+    p0.grad = torch.ones_like(p0)
+    grad_before = p0.grad.clone()
+    scale = aug.apply_gradient_gating()
+    assert scale == pytest.approx(1.0, abs=1e-5)
+    assert aug.last_familiarity == pytest.approx(0.0, abs=1e-5)
+    torch.testing.assert_close(p0.grad, grad_before)
+
+
+def test_cosine_familiarity_clamps_negative_to_zero() -> None:
+    """Anti-parallel query gives cosine = -1 ⇒ clamped to 0 ⇒ fam = 0
+    ⇒ scale = 1. The intent is that anti-correlation means "this is a
+    different kind of pattern, not a familiar one"."""
+    aug = _build_aug_cosine_gating(
+        pre_load_pattern=torch.zeros(8, 8),
+        pre_load_embedding=[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    aug.train()
+    aug(torch.randn(3, 4))
+    target = torch.zeros(3, 8)
+    target[:, 0] = -1.0  # anti-parallel
+    aug.synapse._activation_buffer = [target.clone() for _ in range(5)]
+    p0 = next(aug.base.parameters())
+    p0.grad = torch.ones_like(p0)
+    scale = aug.apply_gradient_gating()
+    assert scale == pytest.approx(1.0, abs=1e-5)
+    assert aug.last_familiarity == pytest.approx(0.0, abs=1e-5)
+    # Diagnostic still records the raw similarity (-1) for inspection.
+    assert aug.last_similarities[0] == pytest.approx(-1.0, abs=1e-5)
+
+
+def test_magnitude_mode_is_backward_compatible_default() -> None:
+    """The default mode is 'magnitude' so existing cs_gated behaves
+    bit-exact as before. Verified by reproducing the
+    'reduces_gradients_at_full_familiarity' result on an instance
+    that doesn't explicitly set familiarity_mode."""
+    aug = _build_aug_for_gating(
+        gradient_gating_enabled=True, gradient_gating_alpha=0.9,
+    )
+    assert aug.familiarity_mode == "magnitude"
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(0.5)
+    aug.train()
+    out = aug(torch.randn(3, 4))
+    out.sum().backward()
+    p0 = next(aug.base.parameters())
+    grad_before = p0.grad.clone()
+    scale = aug.apply_gradient_gating()
+    # Same numeric result as the magnitude-mode test above.
+    assert scale == pytest.approx(0.1, abs=1e-6)
+    torch.testing.assert_close(p0.grad, grad_before * 0.1)
+
+
+def test_familiarity_mode_validation() -> None:
+    cfg = MLPConfig(input_dim=4, hidden_dim=4, num_classes=2)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=4)
+    with pytest.raises(ValueError, match="familiarity_mode"):
+        SynapseAugmentedMLP(base, synapse, familiarity_mode="other")

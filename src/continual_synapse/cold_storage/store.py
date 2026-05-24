@@ -290,6 +290,39 @@ class ColdStorage:
         )
         return list(_unpack_query(result))
 
+    def compute_similarities(
+        self, query_embedding: Sequence[float]
+    ) -> list[float]:
+        """Return cosine similarity between ``query_embedding`` and every
+        stored entry.
+
+        Unlike :meth:`retrieve_similar`, this method does NOT use
+        Chroma's distance metric — Chroma's default is squared-L2 and
+        the collection's metric is fixed at create-time. We pull every
+        entry's embedding, compute cosines locally with PyTorch, and
+        return them in insertion order.
+
+        Returns:
+            A list of cosine similarities in ``[-1, +1]`` with one
+            entry per stored embedding, in the same order as
+            :meth:`all_entries`. Empty list when the store is empty.
+        """
+        if self.count() == 0:
+            return []
+        entries = self.all_entries()
+        if not entries:
+            return []
+        import torch  # local import to avoid making torch a hard dep here
+
+        q = torch.tensor(list(query_embedding), dtype=torch.float32)
+        q_norm = q.norm().clamp_min(1e-8)
+        stored = torch.tensor(
+            [list(e.embedding) for e in entries], dtype=torch.float32
+        )
+        stored_norms = stored.norm(dim=1).clamp_min(1e-8)
+        sims = (stored @ q) / (stored_norms * q_norm)
+        return sims.tolist()
+
     def get_by_id(self, entry_id: str) -> StoredEntry:
         """Fetch one entry by id. Raises ``KeyError`` if absent."""
         result = self._collection.get(
