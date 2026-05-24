@@ -6,6 +6,131 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-23] Three audit-fix implementations: consistency-reward transform, external-reward wiring, multi-pass query consistency
+
+Three implementation changes addressing audit items #11, #15, #16,
+and #19 from the [post-experiment-11 audit entry below](#). Each
+fix is gated behind explicit per-experiment opt-in so prior
+results remain bit-exact reproducible. All three were committed
+before experiment 12 was launched; this entry documents the
+implementation choices, not the results (which will be logged
+separately).
+
+### Commit summary
+
+| Commit | Audit items addressed | Scope |
+|--------|-----------------------|-------|
+| `e362cd1` | #16 | `ConsistencyReward` gains optional center / scale / clip parameters. |
+| `7c337a1` | #15, #19, #11 | `SynapseAugmentedMLP` caches training-mode logits; `apply_hebbian_update` accepts `training_target=` and pushes per-batch accuracy into the mixer's `ExternalReward`. The multi-pass cold-storage retrieval query uses `synapse.buffer_average()` instead of the first forward's `f_base.mean`. |
+| `fb57a5a` | (harness) | `experiments/12_audit_fixes.py`: five-method comparison (naive, cs_full, cs_full_sparse, cs_full_real_reward, cs_full_complete). |
+
+### Fix 1 — `ConsistencyReward` center / scale / clip (`e362cd1`)
+
+**Implementation:** Four new optional kwargs — `center`, `scale`,
+`clip_min`, `clip_max` — with defaults `0.0`, `1.0`, `-inf`,
+`+inf`. A `_transform(x)` helper applies
+`clip((x - center) / scale, clip_min, clip_max)` and is also
+applied to the first-call seeded `1.0` so the very first reward
+sample obeys the same transform as subsequent ones. Defaults
+preserve the pre-fix behaviour bit-exact.
+
+**Audit-fix configuration** (used by `cs_full_real_reward` and
+`cs_full_complete` in experiment 12): `center=0.95, scale=0.05,
+clip_min=-1.0, clip_max=1.0`. The choice of `center=0.95` was
+based on the saturation point observed in earlier diagnostics
+(consistency hovered at ≈0.97 once the EMA warmed up);
+`scale=0.05` re-stretches the active range to roughly [-1, +1];
+the clip prevents runaway values at task switches.
+
+**Why parameterised rather than hard-coded:** Existing experiments
+03–11 should not change behaviour. The constructor defaults are
+the identity transform, so any caller that does not opt in gets
+the pre-fix output exactly.
+
+**Tests:** 5 new tests in `tests/test_reward_components.py` covering
+default identity, recentered output, clip behaviour, and
+first-call transform.
+
+### Fix 2 — External-reward wiring from per-batch accuracy (`7c337a1`)
+
+**Implementation:**
+- `SynapseAugmentedMLP.forward` caches `self._last_logits` (detached)
+  when in training mode. Eval-mode forwards do not cache.
+- `apply_hebbian_update` gains a new kwarg `training_target=None`.
+  When supplied, **and** `self.reward_computer` is a `RewardMixer`
+  with a non-None `external`, the method computes per-batch
+  accuracy from `_last_logits` and `training_target`, and writes
+  it to `self.reward_computer.external.value` before the mixer
+  computes the blended reward.
+- `_last_logits` is cleared at the end of `apply_hebbian_update`
+  so that a stale logit batch is never re-used.
+
+**Why the `isinstance(RewardMixer)` check:** The training_target
+path is opt-in via the kwarg AND requires the canonical reward
+stack. Callers that compose or subclass `RewardMixer` will not
+trigger the auto-wire path — they retain manual control over
+external. This is a robustness trade-off documented here for
+future reference.
+
+**Why per-batch accuracy as the external signal:** The audit
+flagged that #15 was effectively `1.0` for the lifetime of every
+prior experiment. Per-batch accuracy gives a 0–1 signal that
+genuinely varies across the training trajectory and across task
+boundaries (task switches drop it sharply). Other choices — loss,
+loss delta, calibrated confidence — were considered; per-batch
+accuracy was selected for being the most directly interpretable
+and the one most likely to differ from `1.0` at task switches.
+
+**Tests:** 5 new tests in `tests/test_synapse_finetune.py` covering
+the logits cache, the training_target path, and the no-op
+behaviour when `training_target` is omitted.
+
+### Fix 3 — Multi-pass query consistency (`7c337a1`, second hunk)
+
+**Implementation:** In `SynapseAugmentedMLP.features`, when
+`self.n_passes > 1` the cold-storage retrieval query vector is
+now built from `synapse.buffer_average()` (the average over all
+N forwards' activations) instead of the first forward's
+`f_base.mean(...)`. When `n_passes == 1` the original single-pass
+path is preserved bit-exact.
+
+**Why this matters:** Before the fix, the Hebbian update used the
+denoised buffer-averaged activations while the retrieval query
+used the noisy first-forward mean. The two parts of the same
+mechanism were looking at different signals. The fix unifies them
+so that "the activation the synapse layer learned from" equals
+"the activation we used to query cold storage".
+
+### What is opt-in vs always-on
+
+- Fix 1 (consistency transform): off by default; opted into via
+  constructor kwargs.
+- Fix 2 (external-reward wiring): off by default; opted into by
+  the caller passing `training_target=` to `apply_hebbian_update`.
+- Fix 3 (multi-pass query): always-on when `n_passes > 1`. There
+  is no opt-out because the single-pass code path is preserved
+  unchanged and is the previous behaviour for that mode.
+
+### Verification before launching experiment 12
+
+A 3-task × 2-seed smoke run of `experiments/12_audit_fixes.py`
+confirmed the mechanisms work at runtime:
+- `cs_full_real_reward` per-batch reward std was ≈54× larger than
+  `cs_full` (std 0.164 vs 0.003), and the reward range included
+  negative values down to −0.604.
+- `cs_full_sparse` end-of-run strength density was 0.250
+  (= 64/256, matching `top_k=64`), vs 1.000 for dense.
+
+Both fixes did what they were designed to do at the mechanism
+level. Whether they translate into an ACC change is what
+experiment 12 will answer.
+
+### Test count
+
+296 → 301 tests passing (+5 from the new test files).
+
+---
+
 ## [2026-05-23] Post-experiment-11 audit: 48-component verification of the architecture
 
 A structured read-only audit walked DESIGN.md and PROJECT_PLAN.md
