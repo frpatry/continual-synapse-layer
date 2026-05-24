@@ -72,11 +72,27 @@ class ConsolidationTrigger:
             )
 
     def should_fire(self, synapse: SynapseLayer) -> bool:
-        """Return True if it's time to consolidate ``synapse``."""
+        """Return True if it's time to consolidate ``synapse``.
+
+        The "mean pressure across the synapse state" is taken over the
+        *active* synapses — i.e. those with a non-zero strength —
+        rather than the full ``(n, n)`` buffer. Sparse top-k mode zeros
+        out most entries; including those zeros in the mean
+        artificially dilutes pressure by ``1 / density`` and was the
+        root cause of the cs_full_sparse pathology surfaced after
+        experiment 12 (consolidation barely fired in sparse mode,
+        cold storage stayed empty, modulator gate ran away negative).
+        Dense mode has an all-True active mask, so the masked mean
+        equals the unmasked mean bit-exact.
+        """
         step = int(synapse.global_step.item())
         if step - self._last_fire_step < self.min_steps_between:
             return False
-        avg = compute_pressure(synapse).mean().item()
+        pressures = compute_pressure(synapse)
+        active_mask = synapse.strengths != 0
+        if not active_mask.any():
+            return False
+        avg = float(pressures[active_mask].mean().item())
         return avg >= self.avg_pressure_threshold
 
     def candidate_mask(self, synapse: SynapseLayer) -> torch.Tensor:

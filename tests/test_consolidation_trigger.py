@@ -198,3 +198,104 @@ def test_pressure_does_not_propagate_gradients() -> None:
     p = compute_pressure(layer)
     assert not p.requires_grad
     assert p.grad_fn is None
+
+
+# ---- Active-mask pressure normalization (sparse-mode pathology fix) ----
+
+
+def test_should_fire_mean_pressure_active_mask_matches_dense_at_full_density() -> None:
+    """Dense mode (all strengths non-zero) ⇒ active mask is all-True
+    ⇒ masked mean equals unmasked mean. Bit-exact backward compat."""
+    layer = SynapseLayer(n_neurons=4)
+    _populate(
+        layer,
+        strength=torch.full((4, 4), 0.5),  # all entries non-zero
+        evidence=torch.full((4, 4), 1.0),
+        access_count=torch.zeros(4, 4, dtype=torch.int64),
+    )
+    with torch.no_grad():
+        layer.global_step.fill_(1000)
+    # Mean pressure = 0.5 * 1 / 1 = 0.5 everywhere; mean = 0.5.
+    # Threshold of 0.4 must fire; threshold of 0.6 must not.
+    assert ConsolidationTrigger(
+        avg_pressure_threshold=0.4, min_steps_between=0
+    ).should_fire(layer)
+    assert not ConsolidationTrigger(
+        avg_pressure_threshold=0.6, min_steps_between=0
+    ).should_fire(layer)
+
+
+def test_should_fire_not_artificially_deflated_in_sparse_mode() -> None:
+    """The regression. Equivalent active synapses produce equivalent
+    mean pressure regardless of how many zero entries surround them.
+
+    Setup: two 4×4 layers with the same 4 active synapses at the same
+    strength/evidence/access_count. Layer A has the other 12 entries
+    set to zero (mimics sparse top-k masking). Layer B has the other
+    12 entries set to the same active values (full density). Before
+    the fix, layer A's mean was ~4× lower than B's. After the fix,
+    the masked mean is identical."""
+    layer_sparse = SynapseLayer(n_neurons=4)
+    layer_dense = SynapseLayer(n_neurons=4)
+    # Active synapses: top-left 2×2 block at strength 0.5, evidence 1, access 0.
+    s_sparse = torch.zeros(4, 4)
+    s_sparse[:2, :2] = 0.5
+    e_sparse = torch.zeros(4, 4)
+    e_sparse[:2, :2] = 1.0
+    s_dense = torch.full((4, 4), 0.5)
+    e_dense = torch.full((4, 4), 1.0)
+    _populate(
+        layer_sparse, strength=s_sparse, evidence=e_sparse,
+        access_count=torch.zeros(4, 4, dtype=torch.int64),
+    )
+    _populate(
+        layer_dense, strength=s_dense, evidence=e_dense,
+        access_count=torch.zeros(4, 4, dtype=torch.int64),
+    )
+    for layer in (layer_sparse, layer_dense):
+        with torch.no_grad():
+            layer.global_step.fill_(1000)
+
+    trigger = ConsolidationTrigger(
+        avg_pressure_threshold=0.4, min_steps_between=0
+    )
+    # Both must fire at threshold 0.4 — sparse should not be artificially
+    # below threshold despite the 12 zero entries.
+    assert trigger.should_fire(layer_sparse)
+    assert trigger.should_fire(layer_dense)
+
+    # Crucially, the threshold sensitivity must be the same — try a
+    # threshold that's just above the active-synapse pressure (0.5).
+    trigger_borderline = ConsolidationTrigger(
+        avg_pressure_threshold=0.51, min_steps_between=0
+    )
+    assert not trigger_borderline.should_fire(layer_sparse)
+    assert not trigger_borderline.should_fire(layer_dense)
+    # And one just below — both fire.
+    trigger_below = ConsolidationTrigger(
+        avg_pressure_threshold=0.49, min_steps_between=0
+    )
+    assert trigger_below.should_fire(layer_sparse)
+    assert trigger_below.should_fire(layer_dense)
+
+
+def test_should_fire_false_when_no_active_synapses() -> None:
+    """If every strength is zero (e.g. immediately after a full drain),
+    there's nothing to consolidate; the trigger must decline."""
+    layer = SynapseLayer(n_neurons=3)
+    _populate(
+        layer,
+        strength=torch.zeros(3, 3),
+        # Non-zero evidence — but pressure is strength * evidence / (1+access)
+        # so it's still zero, and the active mask is all-False either way.
+        evidence=torch.full((3, 3), 5.0),
+        access_count=torch.zeros(3, 3, dtype=torch.int64),
+    )
+    with torch.no_grad():
+        layer.global_step.fill_(1000)
+    trigger = ConsolidationTrigger(
+        avg_pressure_threshold=0.0, min_steps_between=0
+    )
+    # Even with threshold=0 (which would have fired pre-fix because
+    # mean of zeros == 0 >= 0), the all-zero active mask short-circuits.
+    assert not trigger.should_fire(layer)
