@@ -1697,3 +1697,84 @@ def test_gradient_gating_alpha_validation() -> None:
         SynapseAugmentedMLP(base, synapse, gradient_gating_alpha=-0.1)
     with pytest.raises(ValueError, match="gradient_gating_alpha"):
         SynapseAugmentedMLP(base, synapse, gradient_gating_alpha=1.1)
+
+
+def test_apply_gradient_gating_works_in_multi_pass_mode() -> None:
+    """Regression for the cs_gated familiarity=0 bug.
+
+    With n_passes > 1 in training mode, features() clears
+    _last_features (the buffer is the source of truth). Before the
+    fix, apply_gradient_gating early-returned on _last_features=None.
+    After the fix it must fall back to synapse.buffer_average() and
+    produce a real familiarity / gradient_scale."""
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2, dropout=0.5)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=8, learning_rate=1e-3, n_passes=5)
+    aug = SynapseAugmentedMLP(
+        base, synapse, SynapseModulation(init_gate=0.0),
+        n_passes=5,
+        gate_modulation_enabled=False,
+        gradient_gating_enabled=True,
+        gradient_gating_alpha=0.9,
+    )
+    # Inflate strengths so familiarity raw signal is non-trivial.
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(0.5)
+    aug.train()
+    x = torch.randn(3, 4)
+    logits = aug(x)
+    # Multi-pass should have cleared _last_features and populated the
+    # synapse buffer (5 observations).
+    assert aug._last_features is None
+    assert aug.synapse.buffer_size == 5
+    assert aug._last_effective_strengths is not None
+    # Run backward so gradients exist.
+    logits.sum().backward()
+    p0 = next(aug.base.parameters())
+    grad_before = p0.grad.clone()
+    # Before the fix: this returned 1.0 (early-return) and never
+    # touched the gradients. After the fix: the buffer average is
+    # used, raw_familiarity is non-zero, familiarity saturates to 1
+    # on the first call ⇒ scale = 1 - 0.9 = 0.1, gradients × 0.1.
+    scale = aug.apply_gradient_gating()
+    assert scale == pytest.approx(0.1, abs=1e-6), (
+        f"gating did not fire in multi-pass mode (got scale={scale})"
+    )
+    assert aug.last_familiarity == pytest.approx(1.0)
+    assert aug.familiarity_max > 1e-6
+    torch.testing.assert_close(p0.grad, grad_before * 0.1)
+
+
+def test_apply_gradient_gating_uses_buffer_average_consistently() -> None:
+    """The familiarity computation in multi-pass mode must use the same
+    averaged activations that the Hebbian update consumes. Verified by
+    comparing two paths: gating-with-buffer vs gating-with-explicit
+    average derived the same way."""
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=8, learning_rate=1e-3, n_passes=3)
+    aug = SynapseAugmentedMLP(
+        base, synapse, SynapseModulation(init_gate=0.0),
+        n_passes=3,
+        gate_modulation_enabled=False,
+        gradient_gating_enabled=True,
+        gradient_gating_alpha=0.9,
+    )
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(0.5)
+    aug.train()
+    x = torch.randn(3, 4)
+    aug(x)
+    # Snapshot what the buffer average will yield.
+    expected_features = aug.synapse.buffer_average().clone()
+    expected_raw = float(
+        (expected_features @ aug._last_effective_strengths).norm().item()
+    )
+    # Run gating (no backward needed — we're only checking familiarity
+    # bookkeeping, not the actual grad multiplication).
+    aug.apply_gradient_gating()
+    # familiarity_max now equals expected_raw because it's the first
+    # observation. The bookkeeping must agree with the manual computation.
+    assert aug.familiarity_max == pytest.approx(expected_raw, rel=1e-5)

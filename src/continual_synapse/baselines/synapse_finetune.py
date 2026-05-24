@@ -759,12 +759,25 @@ class SynapseAugmentedMLP(nn.Module):
         ``loss.backward()`` and ``optimizer.step()``. No-op when
         ``gradient_gating_enabled`` is False (preserves existing
         methods bit-exact). No-op when no forward has been run yet
-        (``_last_features`` / ``_last_effective_strengths`` is None) —
+        and there is nothing in the multi-pass buffer either —
         defensive; the runner always forwards first.
+
+        Activation source for the familiarity computation:
+
+        - Single-pass training (``n_passes == 1``): use the cached
+          ``_last_features`` populated by ``features()``.
+        - Multi-pass training (``n_passes > 1``): ``features()``
+          deliberately clears ``_last_features`` (the buffer is the
+          source of truth) and pushes ``n_passes`` activations into
+          ``synapse._activation_buffer``. Average the buffer here so
+          the familiarity reflects the same denoised activations the
+          Hebbian update will consume. This matches the multi-pass
+          query-consistency fix in ``features()`` itself (audit
+          fix 3/3).
 
         Familiarity:
 
-            raw   = || f_base @ effective_strengths ||
+            raw   = || features @ effective_strengths ||
             max  ← max(max, raw)
             fam  = min(raw / max, 1)
             scale = 1 - alpha * fam
@@ -774,12 +787,18 @@ class SynapseAugmentedMLP(nn.Module):
         """
         if not self.gradient_gating_enabled:
             return 1.0
-        if (
-            self._last_features is None
-            or self._last_effective_strengths is None
-        ):
+        if self._last_effective_strengths is None:
             return 1.0
-        raw_signal = self._last_features @ self._last_effective_strengths
+        features_for_familiarity = self._last_features
+        if features_for_familiarity is None:
+            # Multi-pass path: features() set _last_features = None so
+            # apply_hebbian_update reads from the buffer. Mirror that
+            # convention here.
+            if self.synapse.buffer_size > 0:
+                features_for_familiarity = self.synapse.buffer_average()
+            else:
+                return 1.0
+        raw_signal = features_for_familiarity @ self._last_effective_strengths
         raw_familiarity = float(raw_signal.norm().item())
         self._familiarity_max = max(self._familiarity_max, raw_familiarity)
         familiarity = min(raw_familiarity / self._familiarity_max, 1.0)
