@@ -46,6 +46,8 @@ def reconstruct_strengths(
     n_neurons: int,
     weighting: str = "similarity",
     bump_access_count: bool = True,
+    confidence_exponent: float = 0.0,
+    out_retrieved_meta: list[tuple[str, int]] | None = None,
 ) -> torch.Tensor:
     """Return a ``(n_neurons, n_neurons)`` reconstructed strengths matrix.
 
@@ -63,6 +65,23 @@ def reconstruct_strengths(
             entry's ``access_count`` metadata is incremented by 1.
             Set to False for diagnostic queries that should not
             disturb the schedule.
+        confidence_exponent: Power applied to ``(1 + access_count)``
+            before mixing it into the per-entry weight. ``0.0`` (the
+            default) leaves weights bit-exact equivalent to the
+            pre-amplification path because ``x**0 == 1``. Positive
+            values upweight frequently-accessed (i.e. proven-useful)
+            entries; 0.5 is the amplified-variant default. The factor
+            multiplies the similarity weight, so the combined form
+            is ``weight = (1 / (1 + d)) * (1 + access_count) ** k``
+            in similarity mode, and ``weight = (1 + access_count) ** k``
+            in uniform mode.
+        out_retrieved_meta: Optional list the function appends
+            ``(entry_id, pre_bump_access_count)`` tuples to for each
+            entry actually used in the reconstruction. Lets the caller
+            measure how stale or how popular the retrieved entries are
+            without re-querying the store. Pre-bump means the value
+            recorded is the access_count *before* ``bump_access_count``
+            increments it on this call.
 
     Returns:
         A float32 ``(n_neurons, n_neurons)`` tensor on the same
@@ -109,16 +128,25 @@ def reconstruct_strengths(
         matrices.append(
             dequantize(blob, precision=precision, shape=(n_neurons, n_neurons))
         )
+        pre_bump_access = int(meta.get("access_count", 0))
         if weighting == "uniform":
             w = 1.0
         else:
             d = entry.distance if entry.distance is not None else 0.0
             w = 1.0 / (1.0 + max(float(d), 0.0))
+        # Confidence weighting: ``(1 + access_count) ** k``. ``k = 0``
+        # collapses to a constant factor of 1.0 so the weighted sum is
+        # bit-exact equivalent to the pre-amplification path.
+        if confidence_exponent != 0.0:
+            w = w * (1.0 + pre_bump_access) ** float(confidence_exponent)
         weights.append(w)
+
+        if out_retrieved_meta is not None:
+            out_retrieved_meta.append((entry.id, pre_bump_access))
 
         if bump_access_count:
             new_meta = dict(meta)
-            new_meta["access_count"] = int(meta.get("access_count", 0)) + 1
+            new_meta["access_count"] = pre_bump_access + 1
             bumped.append((entry.id, new_meta))
 
     if not matrices:

@@ -109,6 +109,7 @@ class SynapseAugmentedMLP(nn.Module):
         compression_schedule: CompressionSchedule | None = None,
         # ---- Amplification variant flags (defaults preserve current behavior) ----
         amplification_alpha: float = 0.0,
+        confidence_exponent: float = 0.0,
     ) -> None:
         super().__init__()
         if synapse.n_neurons != base.config.hidden_dim:
@@ -133,6 +134,10 @@ class SynapseAugmentedMLP(nn.Module):
         if amplification_alpha < 0:
             raise ValueError(
                 f"amplification_alpha must be >= 0, got {amplification_alpha}"
+            )
+        if confidence_exponent < 0:
+            raise ValueError(
+                f"confidence_exponent must be >= 0, got {confidence_exponent}"
             )
         self.base = base
         self.synapse = synapse
@@ -159,6 +164,11 @@ class SynapseAugmentedMLP(nn.Module):
         # implementation — verified by the existing test suite plus the
         # dedicated defaults-preserve-behavior tests.
         self.amplification_alpha = float(amplification_alpha)
+        self.confidence_exponent = float(confidence_exponent)
+        # Per-call buffer of (entry_id, pre_bump_access_count) tuples filled
+        # by _get_or_refresh_retrieval when a refresh fires. Cleared by
+        # apply_hebbian_update after any retrieval-feedback bookkeeping.
+        self._last_retrieved_meta: list[tuple[int, int]] = []
         self._batches_since_compression_sweep: int = 0
         self._compression_sweep_count: int = 0
         self._last_compression_counts: dict[int, int] = {}
@@ -266,12 +276,20 @@ class SynapseAugmentedMLP(nn.Module):
         if needs_refresh:
             with torch.no_grad():
                 query = f_base.detach().mean(dim=0)
+                # Capture (entry_id, pre_bump_access_count) for any
+                # downstream consumer (retrieval-success feedback, per-task
+                # average-access-count diagnostics). The retrieval cache
+                # logic below is unchanged.
+                retrieved_meta: list[tuple[str, int]] = []
                 self._retrieved_cache = reconstruct_strengths(
                     self.cold_storage,  # type: ignore[arg-type]
                     query,
                     k=self.retrieval_k,
                     n_neurons=self.synapse.n_neurons,
+                    confidence_exponent=self.confidence_exponent,
+                    out_retrieved_meta=retrieved_meta,
                 )
+                self._last_retrieved_meta = retrieved_meta
             # After this refresh, allow `interval - 1` reuses before
             # the next refresh. `interval = 1` means zero reuses, i.e.
             # refresh on every forward.
