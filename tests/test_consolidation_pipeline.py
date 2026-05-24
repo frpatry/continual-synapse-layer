@@ -6,9 +6,12 @@ import base64
 import pytest
 import torch
 
-from continual_synapse.cold_storage.compression import dequantize
+from continual_synapse.cold_storage.compression import dequantize, quantize
 from continual_synapse.cold_storage.store import ColdStorage
-from continual_synapse.consolidation.pipeline import consolidate_to_storage
+from continual_synapse.consolidation.pipeline import (
+    ConsolidationOutcome,
+    consolidate_to_storage,
+)
 from continual_synapse.consolidation.trigger import ConsolidationTrigger
 from continual_synapse.synapse_layer.layer import SynapseLayer
 
@@ -40,12 +43,14 @@ def test_consolidate_fires_and_stores_entry() -> None:
     layer = _populated_layer()
     store = ColdStorage(collection_name="pipe_fire")
     embedding = torch.arange(4, dtype=torch.float32)
-    eid = consolidate_to_storage(
+    outcome = consolidate_to_storage(
         layer, store, _trigger(), activation_embedding=embedding
     )
-    assert isinstance(eid, str)
+    assert outcome.fired
+    assert not outcome.was_merged
+    assert isinstance(outcome.entry_id, str)
     assert store.count() == 1
-    entry = store.get_by_id(eid)
+    entry = store.get_by_id(outcome.entry_id)
     assert entry.embedding == embedding.tolist()
     assert entry.metadata["precision"] == 32
     assert entry.metadata["n_neurons"] == 4
@@ -59,10 +64,12 @@ def test_consolidate_returns_none_when_trigger_declines() -> None:
     trigger = ConsolidationTrigger(
         avg_pressure_threshold=1e9, min_steps_between=0
     )
-    out = consolidate_to_storage(
+    outcome = consolidate_to_storage(
         layer, store, trigger, activation_embedding=torch.zeros(4)
     )
-    assert out is None
+    assert not outcome.fired
+    assert outcome.entry_id is None
+    assert outcome.merged_into is None
     assert store.count() == 0
 
 
@@ -72,10 +79,10 @@ def test_force_bypasses_trigger() -> None:
     trigger = ConsolidationTrigger(
         avg_pressure_threshold=1e9, min_steps_between=0
     )
-    eid = consolidate_to_storage(
+    outcome = consolidate_to_storage(
         layer, store, trigger, activation_embedding=torch.zeros(4), force=True
     )
-    assert eid is not None
+    assert outcome.fired and outcome.entry_id is not None
 
 
 def test_drain_resets_strength_evidence_access_on_candidates() -> None:
@@ -132,10 +139,10 @@ def test_stored_document_round_trips_through_dequantize() -> None:
     trigger = _trigger()
     mask = trigger.candidate_mask(layer).clone()
     expected = (layer.strengths * mask.to(layer.strengths.dtype)).clone()
-    eid = consolidate_to_storage(
+    outcome = consolidate_to_storage(
         layer, store, trigger, activation_embedding=torch.zeros(4)
     )
-    entry = store.get_by_id(eid)
+    entry = store.get_by_id(outcome.entry_id)
     blob = base64.b64decode(entry.document)
     recovered = dequantize(
         blob, precision=entry.metadata["precision"], shape=(4, 4)
@@ -181,8 +188,160 @@ def test_consolidate_refuses_empty_candidate_mask() -> None:
     trigger = _EmptyTrigger(
         avg_pressure_threshold=0.0, min_steps_between=0
     )
-    out = consolidate_to_storage(
+    outcome = consolidate_to_storage(
         layer, store, trigger, activation_embedding=torch.zeros(4)
     )
-    assert out is None
+    assert not outcome.fired
+    assert outcome.entry_id is None and outcome.merged_into is None
     assert store.count() == 0
+
+
+# ---- Amplification variant: change 3 (no-drain) ----
+
+
+def test_drain_default_true_zeros_candidates() -> None:
+    """Regression check: the default drain=True preserves the original
+    behaviour where candidate synapses are reset post-archival."""
+    layer = _populated_layer()
+    store = ColdStorage(collection_name="pipe_drain_default")
+    trigger = _trigger()
+    mask = trigger.candidate_mask(layer).clone()
+    consolidate_to_storage(
+        layer, store, trigger, activation_embedding=torch.zeros(4)
+    )
+    assert torch.all(layer.strengths[mask] == 0)
+    assert torch.all(layer.evidence[mask] == 0)
+
+
+def test_no_drain_keeps_synapse_state_intact() -> None:
+    """With drain=False, candidate synapses survive post-archival."""
+    layer = _populated_layer()
+    store = ColdStorage(collection_name="pipe_no_drain")
+    trigger = _trigger()
+    mask = trigger.candidate_mask(layer).clone()
+    pre_strengths = layer.strengths.clone()
+    pre_evidence = layer.evidence.clone()
+    pre_access = layer.access_count.clone()
+    outcome = consolidate_to_storage(
+        layer, store, trigger,
+        activation_embedding=torch.zeros(4),
+        drain=False,
+    )
+    assert outcome.fired and not outcome.was_merged
+    # Source synapses are bit-exact untouched.
+    torch.testing.assert_close(layer.strengths, pre_strengths)
+    torch.testing.assert_close(layer.evidence, pre_evidence)
+    assert torch.equal(layer.access_count, pre_access)
+    # But the archive still received the candidate-only matrix.
+    assert store.count() == 1
+
+
+# ---- Amplification variant: change 4 (repeat-consolidation merging) ----
+
+
+def _seed_one_entry(
+    store: ColdStorage,
+    embedding: list[float],
+    strengths: torch.Tensor,
+    access_count: int = 3,
+    entry_id: str = "seed",
+) -> None:
+    blob = quantize(strengths, precision=32)
+    doc = base64.b64encode(blob).decode("ascii")
+    store.store_cluster(
+        embedding=embedding,
+        metadata={
+            "precision": 32, "n_neurons": int(strengths.shape[0]),
+            "age": 0, "access_count": int(access_count),
+            "created_at_step": 0, "num_candidates": 0,
+        },
+        document=doc,
+        entry_id=entry_id,
+    )
+
+
+def test_default_threshold_one_never_merges() -> None:
+    """merge_threshold=1.0 (default) means similarity must exceed 1, which
+    cosine cannot — every cycle creates a new entry. Backward compat."""
+    layer = _populated_layer()
+    store = ColdStorage(collection_name="pipe_merge_default")
+    _seed_one_entry(store, embedding=[1.0, 2.0, 3.0, 4.0],
+                    strengths=torch.zeros(4, 4))
+    outcome = consolidate_to_storage(
+        layer, store, _trigger(),
+        # Exact embedding match → similarity = 1, but threshold = 1
+        # strictly excludes equality (we use > not >=).
+        activation_embedding=torch.tensor([1.0, 2.0, 3.0, 4.0]),
+    )
+    assert outcome.fired
+    assert outcome.entry_id is not None
+    assert not outcome.was_merged
+    assert store.count() == 2  # original + new
+
+
+def test_merge_fires_when_similarity_above_threshold() -> None:
+    """A close embedding bumps access_count of the existing entry and
+    does not create a new row."""
+    layer = _populated_layer()
+    store = ColdStorage(collection_name="pipe_merge_hit")
+    _seed_one_entry(store, embedding=[1.0, 0.0, 0.0, 0.0],
+                    strengths=torch.zeros(4, 4), access_count=5)
+    pre_count = store.count()
+    outcome = consolidate_to_storage(
+        layer, store, _trigger(),
+        activation_embedding=torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        merge_threshold=0.5,  # Threshold permissive enough to fire.
+        merge_access_bump=10,
+        embedding_running_average_decay=1.0,  # Keep embedding pinned for assert.
+    )
+    assert outcome.fired and outcome.was_merged
+    assert outcome.entry_id is None
+    assert outcome.merged_into == "seed"
+    assert store.count() == pre_count  # No new entry.
+    # access_count bumped by 10.
+    assert store.get_by_id("seed").metadata["access_count"] == 15
+
+
+def test_merge_does_not_fire_when_similarity_below_threshold() -> None:
+    """A far embedding does not merge and falls through to new-entry."""
+    layer = _populated_layer()
+    store = ColdStorage(collection_name="pipe_merge_miss")
+    _seed_one_entry(store, embedding=[10.0, 10.0, 10.0, 10.0],
+                    strengths=torch.zeros(4, 4))
+    outcome = consolidate_to_storage(
+        layer, store, _trigger(),
+        activation_embedding=torch.tensor([0.0, 0.0, 0.0, 0.0]),
+        merge_threshold=0.9,
+    )
+    assert outcome.fired
+    assert outcome.entry_id is not None
+    assert not outcome.was_merged
+    assert store.count() == 2
+
+
+def test_merge_updates_embedding_via_running_average() -> None:
+    """With decay < 1, the merged entry's embedding moves toward the new one."""
+    layer = _populated_layer()
+    store = ColdStorage(collection_name="pipe_merge_blend")
+    _seed_one_entry(store, embedding=[1.0, 0.0, 0.0, 0.0],
+                    strengths=torch.zeros(4, 4))
+    new_embedding = torch.tensor([1.0, 0.01, 0.0, 0.0])  # Close enough to merge.
+    consolidate_to_storage(
+        layer, store, _trigger(),
+        activation_embedding=new_embedding,
+        merge_threshold=0.5,
+        embedding_running_average_decay=0.9,
+    )
+    blended = store.get_by_id("seed").embedding
+    # Expected: 0.9 * [1,0,0,0] + 0.1 * [1,0.01,0,0] = [1, 0.001, 0, 0].
+    assert abs(blended[0] - 1.0) < 1e-5
+    assert abs(blended[1] - 0.001) < 1e-5
+
+
+def test_outcome_dataclass_fired_property() -> None:
+    not_fired = ConsolidationOutcome(entry_id=None, merged_into=None, was_merged=False)
+    new_entry = ConsolidationOutcome(entry_id="a", merged_into=None, was_merged=False)
+    merged = ConsolidationOutcome(entry_id=None, merged_into="b", was_merged=True)
+    assert not not_fired.fired
+    assert new_entry.fired
+    assert merged.fired

@@ -110,6 +110,8 @@ class SynapseAugmentedMLP(nn.Module):
         # ---- Amplification variant flags (defaults preserve current behavior) ----
         amplification_alpha: float = 0.0,
         confidence_exponent: float = 0.0,
+        no_drain_on_consolidate: bool = False,
+        repeat_consolidation_threshold: float = 1.0,
     ) -> None:
         super().__init__()
         if synapse.n_neurons != base.config.hidden_dim:
@@ -139,6 +141,11 @@ class SynapseAugmentedMLP(nn.Module):
             raise ValueError(
                 f"confidence_exponent must be >= 0, got {confidence_exponent}"
             )
+        if not 0.0 < repeat_consolidation_threshold <= 1.0:
+            raise ValueError(
+                f"repeat_consolidation_threshold must be in (0, 1], "
+                f"got {repeat_consolidation_threshold}"
+            )
         self.base = base
         self.synapse = synapse
         self.modulator = modulator if modulator is not None else SynapseModulation()
@@ -165,10 +172,13 @@ class SynapseAugmentedMLP(nn.Module):
         # dedicated defaults-preserve-behavior tests.
         self.amplification_alpha = float(amplification_alpha)
         self.confidence_exponent = float(confidence_exponent)
+        self.no_drain_on_consolidate = bool(no_drain_on_consolidate)
+        self.repeat_consolidation_threshold = float(repeat_consolidation_threshold)
         # Per-call buffer of (entry_id, pre_bump_access_count) tuples filled
         # by _get_or_refresh_retrieval when a refresh fires. Cleared by
         # apply_hebbian_update after any retrieval-feedback bookkeeping.
         self._last_retrieved_meta: list[tuple[int, int]] = []
+        self._merge_count: int = 0
         self._batches_since_compression_sweep: int = 0
         self._compression_sweep_count: int = 0
         self._last_compression_counts: dict[int, int] = {}
@@ -406,14 +416,18 @@ class SynapseAugmentedMLP(nn.Module):
             and self.consolidation_trigger is not None
         ):
             embedding = features.mean(dim=0).to(torch.float32)
-            entry_id = consolidate_to_storage(
+            outcome = consolidate_to_storage(
                 self.synapse,
                 self.cold_storage,
                 self.consolidation_trigger,
                 activation_embedding=embedding,
+                drain=not self.no_drain_on_consolidate,
+                merge_threshold=self.repeat_consolidation_threshold,
             )
-            if entry_id is not None:
+            if outcome.fired:
                 self._consolidation_count += 1
+                if outcome.was_merged:
+                    self._merge_count += 1
                 # Mark the retrieval cache as stale so the next
                 # forward picks up the just-archived pattern.
                 self._cache_invalidated = True
@@ -472,5 +486,20 @@ class SynapseAugmentedMLP(nn.Module):
 
     @property
     def consolidation_count(self) -> int:
-        """Number of consolidation cycles that have fired on this instance."""
+        """Number of consolidation cycles that have fired on this instance.
+
+        Counts both new-entry and merged-into-existing cycles. The
+        ``merge_count`` property is the subset that resolved by
+        merging; new-entry cycles are ``consolidation_count -
+        merge_count``.
+        """
         return self._consolidation_count
+
+    @property
+    def merge_count(self) -> int:
+        """Of the fired consolidation cycles, how many merged into an
+        existing cold-storage entry rather than creating a new one.
+
+        Always 0 unless ``repeat_consolidation_threshold < 1.0``.
+        """
+        return self._merge_count
