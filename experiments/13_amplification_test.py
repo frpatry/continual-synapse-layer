@@ -26,6 +26,15 @@ Methods:
   pressure by active-synapse count rather than total entries;
   without that fix the trigger almost never fires under sparse
   density and consolidation stays empty.
+- cs_full_amplified_task_aware: cs_full_amplified + task-aware
+  retrieval. Stored entries are tagged with task_id at consolidation;
+  retrieval applies an ``exp(-decay * task_distance)`` weight
+  (decay=0.5 ⇒ previous-task entries ≈ 60%, two-tasks-back ≈ 37%).
+  At each task change the retrieval cache is cleared and the
+  first 100 batches of the new task downweight the cold-storage
+  contribution by 10× (warmup window). Tests whether explicit task
+  awareness lets the amplification mechanism behave the way it was
+  originally intended.
 
 Extended per-task diagnostics over experiment 12:
 - consolidation_count, merge_count, store_count, compression sweep
@@ -102,6 +111,7 @@ _DEFAULT_METHODS = (
     "cs_full_real_reward",
     "cs_full_amplified",
     "cs_full_amplified_sparse",
+    "cs_full_amplified_task_aware",
 )
 
 
@@ -153,6 +163,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--retrieval-feedback-threshold", type=float, default=0.9)
     p.add_argument("--retrieval-feedback-decay", type=float, default=0.95)
     p.add_argument("--retrieval-feedback-bump", type=float, default=0.5)
+    # ---- Task-aware variant flags ----
+    p.add_argument("--task-aware-decay", type=float, default=0.5)
+    p.add_argument("--task-warmup-batches", type=int, default=100)
+    p.add_argument("--task-warmup-downweight", type=float, default=0.1)
     p.add_argument(
         "--age-thresholds", type=int, nargs="+", default=[100, 500, 2000]
     )
@@ -257,6 +271,7 @@ def _build_factories(
         use_real_reward: bool,
         amplification: bool,
         sparse: bool = False,
+        task_aware: bool = False,
     ):
         set_seed(seed)
         base = _build_mlp(args, num_classes)
@@ -289,6 +304,12 @@ def _build_factories(
                 retrieval_feedback_threshold=args.retrieval_feedback_threshold,
                 retrieval_feedback_decay=args.retrieval_feedback_decay,
                 retrieval_feedback_bump=args.retrieval_feedback_bump,
+            )
+        if task_aware:
+            amp_kwargs.update(
+                task_aware_decay=args.task_aware_decay,
+                task_warmup_batches=args.task_warmup_batches,
+                task_warmup_downweight=args.task_warmup_downweight,
             )
         model = SynapseAugmentedMLP(
             base,
@@ -381,6 +402,8 @@ def _build_factories(
                     "loss_ema": (
                         None if m.loss_ema is None else float(m.loss_ema)
                     ),
+                    "current_task_id": int(m.current_task_id),
+                    "batches_since_task_change": int(m.batches_since_task_change),
                 }
             )
             # Reset per-task accumulators for the next task.
@@ -392,10 +415,21 @@ def _build_factories(
                 m.retrieval_feedback_event_count
             )
 
+        # on_task_change forwards the task index to the model so the
+        # task-aware variant can tag consolidations and reset its
+        # warmup window. notify_task_change is a no-op for non-task-
+        # aware methods because their defaults disable every flag the
+        # call touches, so it's safe to fire for every cs_full*
+        # variant. Naive uses no SynapseAugmentedMLP and gets no
+        # on_task_change wiring (naive's factory returns earlier).
+        def on_task_change_notify(j, task, m):
+            m.notify_task_change(int(j))
+
         runner = ContinualRunner(
             seed=seed,
             on_after_batch=on_after_batch,
             on_task_end=on_task_end_diag,
+            on_task_change=on_task_change_notify,
             **runner_kwargs,
         )
         diagnostics[method_key].append(
@@ -423,6 +457,16 @@ def _build_factories(
         "cs_full_amplified_sparse": lambda s: _synapse(
             s, "cs_full_amplified_sparse", use_real_reward=False, amplification=True,
             sparse=True,
+        ),
+        # +task-aware retrieval on top of the amplified stack. Stored
+        # entries are tagged with task_id, retrieval applies an
+        # exp(-decay * task_distance) weight, and the first
+        # task_warmup_batches batches of a new task downweight the
+        # cold-storage contribution.
+        "cs_full_amplified_task_aware": lambda s: _synapse(
+            s, "cs_full_amplified_task_aware",
+            use_real_reward=False, amplification=True,
+            sparse=False, task_aware=True,
         ),
     }
     return factories, diagnostics, reward_samples
