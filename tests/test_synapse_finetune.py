@@ -1084,3 +1084,125 @@ def test_amplification_validated_at_construction() -> None:
     synapse = SynapseLayer(n_neurons=4)
     with pytest.raises(ValueError, match="amplification_alpha must be"):
         SynapseAugmentedMLP(base, synapse, amplification_alpha=-0.1)
+
+
+# ---- Amplification variant: change 5 (retrieval-success feedback) ----
+
+
+def _build_aug_with_storage_and_one_entry(
+    *,
+    retrieval_feedback_threshold: float,
+    retrieval_feedback_bump: float = 0.5,
+) -> SynapseAugmentedMLP:
+    """Helper: augmented MLP with one cold-storage entry pre-loaded so
+    every forward in training mode pulls that entry into
+    _last_retrieved_meta."""
+    import base64
+    from continual_synapse.cold_storage.compression import quantize
+    from continual_synapse.cold_storage.store import ColdStorage
+
+    cfg = MLPConfig(input_dim=4, hidden_dim=4, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=4, learning_rate=1e-9)
+    store = ColdStorage(
+        collection_name=f"feedback_{retrieval_feedback_threshold}_{id(base)}"
+    )
+    pattern = torch.full((4, 4), 0.1)
+    blob = quantize(pattern, precision=32)
+    store.store_cluster(
+        embedding=[1.0, 1.0, 1.0, 1.0],
+        metadata={
+            "precision": 32, "n_neurons": 4,
+            "age": 0, "access_count": 0, "created_at_step": 0,
+        },
+        document=base64.b64encode(blob).decode("ascii"),
+        entry_id="only",
+    )
+    return SynapseAugmentedMLP(
+        base, synapse, SynapseModulation(init_gate=0.0),
+        cold_storage=store,
+        retrieval_k=1, retrieval_refresh_interval=1,
+        retrieval_feedback_threshold=retrieval_feedback_threshold,
+        retrieval_feedback_bump=retrieval_feedback_bump,
+    )
+
+
+def test_retrieval_feedback_default_threshold_is_noop() -> None:
+    """threshold=0 ⇒ retrieval feedback never fires, even when loss
+    is provided. Backward-compat guarantee for non-amplified methods."""
+    aug = _build_aug_with_storage_and_one_entry(retrieval_feedback_threshold=0.0)
+    aug.train()
+    x = torch.ones(2, 4)
+    y = torch.zeros(2, dtype=torch.int64)
+    aug(x)
+    aug.apply_hebbian_update(training_target=y, loss=0.001)
+    # Cold storage entry's access_count was bumped by the retrieval
+    # cache's automatic bump (== 1), but not by the feedback path.
+    entry = aug.cold_storage.get_by_id("only")
+    assert int(entry.metadata["access_count"]) == 1
+    assert aug.retrieval_feedback_event_count == 0
+
+
+def test_retrieval_feedback_bumps_on_low_loss() -> None:
+    """With threshold=0.9 and the first loss seeding the EMA, a
+    much-smaller second loss must trip the bump."""
+    aug = _build_aug_with_storage_and_one_entry(
+        retrieval_feedback_threshold=0.9, retrieval_feedback_bump=0.5,
+    )
+    aug.train()
+    x = torch.ones(2, 4)
+    y = torch.zeros(2, dtype=torch.int64)
+    # First call: seeds the EMA at loss=1.0. No prior history → no bump.
+    aug(x)
+    aug.apply_hebbian_update(training_target=y, loss=1.0)
+    pre_event_count = aug.retrieval_feedback_event_count
+    # Second call: loss=0.1 ≪ EMA * 0.9 = 0.9 ⇒ bump fires.
+    aug(x)
+    aug.apply_hebbian_update(training_target=y, loss=0.1)
+    assert aug.retrieval_feedback_event_count == pre_event_count + 1
+    # The entry's access_count = 2 (one bump per retrieve) + 0.5 (one feedback
+    # bump fired against the second batch). int() floors to 2.
+    entry = aug.cold_storage.get_by_id("only")
+    assert float(entry.metadata["access_count"]) == pytest.approx(2.5)
+
+
+def test_retrieval_feedback_no_bump_when_loss_above_threshold() -> None:
+    """A loss above the EMA × threshold cut-off must not bump."""
+    aug = _build_aug_with_storage_and_one_entry(
+        retrieval_feedback_threshold=0.9,
+    )
+    aug.train()
+    x = torch.ones(2, 4)
+    y = torch.zeros(2, dtype=torch.int64)
+    aug(x)
+    aug.apply_hebbian_update(training_target=y, loss=1.0)
+    aug(x)
+    # Loss = 0.95, EMA * 0.9 = 0.9; 0.95 > 0.9 ⇒ no bump.
+    aug.apply_hebbian_update(training_target=y, loss=0.95)
+    assert aug.retrieval_feedback_event_count == 0
+
+
+def test_retrieval_feedback_derives_loss_from_cached_logits_when_loss_arg_omitted() -> None:
+    """If the caller doesn't pass loss but did pass training_target, the
+    model computes CE from _last_logits. Verified by the EMA moving."""
+    aug = _build_aug_with_storage_and_one_entry(
+        retrieval_feedback_threshold=0.9,
+    )
+    aug.train()
+    x = torch.ones(2, 4)
+    y = torch.zeros(2, dtype=torch.int64)
+    aug(x)
+    aug.apply_hebbian_update(training_target=y)  # no loss kwarg
+    # EMA was None pre-call; a derived loss should have seeded it.
+    assert aug.loss_ema is not None and aug.loss_ema > 0
+
+
+def test_retrieval_feedback_validation_at_construction() -> None:
+    cfg = MLPConfig(input_dim=4, hidden_dim=4, num_classes=2)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=4)
+    with pytest.raises(ValueError, match="retrieval_feedback_threshold"):
+        SynapseAugmentedMLP(base, synapse, retrieval_feedback_threshold=-0.1)
+    with pytest.raises(ValueError, match="retrieval_feedback_decay"):
+        SynapseAugmentedMLP(base, synapse, retrieval_feedback_decay=1.5)

@@ -112,6 +112,9 @@ class SynapseAugmentedMLP(nn.Module):
         confidence_exponent: float = 0.0,
         no_drain_on_consolidate: bool = False,
         repeat_consolidation_threshold: float = 1.0,
+        retrieval_feedback_threshold: float = 0.0,
+        retrieval_feedback_decay: float = 0.95,
+        retrieval_feedback_bump: float = 0.5,
     ) -> None:
         super().__init__()
         if synapse.n_neurons != base.config.hidden_dim:
@@ -146,6 +149,16 @@ class SynapseAugmentedMLP(nn.Module):
                 f"repeat_consolidation_threshold must be in (0, 1], "
                 f"got {repeat_consolidation_threshold}"
             )
+        if retrieval_feedback_threshold < 0:
+            raise ValueError(
+                f"retrieval_feedback_threshold must be >= 0, got "
+                f"{retrieval_feedback_threshold}"
+            )
+        if not 0.0 < retrieval_feedback_decay <= 1.0:
+            raise ValueError(
+                f"retrieval_feedback_decay must be in (0, 1], got "
+                f"{retrieval_feedback_decay}"
+            )
         self.base = base
         self.synapse = synapse
         self.modulator = modulator if modulator is not None else SynapseModulation()
@@ -174,11 +187,20 @@ class SynapseAugmentedMLP(nn.Module):
         self.confidence_exponent = float(confidence_exponent)
         self.no_drain_on_consolidate = bool(no_drain_on_consolidate)
         self.repeat_consolidation_threshold = float(repeat_consolidation_threshold)
+        self.retrieval_feedback_threshold = float(retrieval_feedback_threshold)
+        self.retrieval_feedback_decay = float(retrieval_feedback_decay)
+        self.retrieval_feedback_bump = float(retrieval_feedback_bump)
         # Per-call buffer of (entry_id, pre_bump_access_count) tuples filled
         # by _get_or_refresh_retrieval when a refresh fires. Cleared by
         # apply_hebbian_update after any retrieval-feedback bookkeeping.
         self._last_retrieved_meta: list[tuple[int, int]] = []
         self._merge_count: int = 0
+        # EMA of the per-batch loss, fed by apply_hebbian_update(loss=...)
+        # (or by the cached-logits fallback below). Compared against the
+        # current batch's loss to decide whether the just-retrieved
+        # entries deserve a "you helped" access_count bump.
+        self._loss_ema: float | None = None
+        self._retrieval_feedback_event_count: int = 0
         self._batches_since_compression_sweep: int = 0
         self._compression_sweep_count: int = 0
         self._last_compression_counts: dict[int, int] = {}
@@ -336,6 +358,7 @@ class SynapseAugmentedMLP(nn.Module):
         self,
         reward: float | None = None,
         training_target: torch.Tensor | None = None,
+        loss: float | None = None,
     ) -> float:
         """Push the most recently observed features into the synapse layer.
 
@@ -363,6 +386,17 @@ class SynapseAugmentedMLP(nn.Module):
                 always 1.0" pathway carry a genuine signal. No-op
                 when the reward_computer is anything else or the
                 training_target is None.
+            loss: Explicit per-batch loss for retrieval-success
+                feedback (amplification variant change 5). When
+                ``retrieval_feedback_threshold > 0`` and this batch's
+                loss falls below ``EMA(loss) * threshold``, the entries
+                that contributed to this batch's retrieval get a
+                small access_count bump — a "you helped" signal. If
+                ``loss`` is None but ``training_target`` and cached
+                logits are both available, the model computes
+                cross-entropy itself so callers don't have to pass it
+                explicitly. No-op when the threshold is zero or no
+                retrieval happened this batch.
 
         When cold storage and a trigger are configured, also attempt
         a consolidation cycle. The cycle is a no-op if the trigger
@@ -461,6 +495,36 @@ class SynapseAugmentedMLP(nn.Module):
                 # re-fetches from the freshly-quantised entries.
                 self._cache_invalidated = True
 
+        # Retrieval-success feedback (amplification variant change 5).
+        # Skipped entirely at the default threshold of 0.0.
+        if (
+            self.retrieval_feedback_threshold > 0.0
+            and self.cold_storage is not None
+            and self._last_retrieved_meta
+        ):
+            effective_loss: float | None = loss
+            if effective_loss is None and (
+                training_target is not None and self._last_logits is not None
+            ):
+                with torch.no_grad():
+                    target = training_target.to(self._last_logits.device)
+                    if target.numel() > 0:
+                        effective_loss = float(
+                            torch.nn.functional.cross_entropy(
+                                self._last_logits, target
+                            ).item()
+                        )
+            if effective_loss is not None:
+                self._update_loss_ema(effective_loss)
+                ema = self._loss_ema  # local for type narrowing
+                if ema is not None and effective_loss < ema * self.retrieval_feedback_threshold:
+                    self._bump_retrieved_access_counts(self.retrieval_feedback_bump)
+                    self._retrieval_feedback_event_count += 1
+        # The buffer is consumed-per-batch; clear regardless of the
+        # threshold so stale IDs from this batch don't bleed into the
+        # next one.
+        self._last_retrieved_meta = []
+
         # Either way, the next forward should start with a clean
         # multi-pass buffer. Defensive — consolidate() drained it
         # in the multi-pass path; this is a no-op when buffer is
@@ -503,3 +567,57 @@ class SynapseAugmentedMLP(nn.Module):
         Always 0 unless ``repeat_consolidation_threshold < 1.0``.
         """
         return self._merge_count
+
+    @property
+    def retrieval_feedback_event_count(self) -> int:
+        """How many times a retrieval-success bump fired.
+
+        Always 0 unless ``retrieval_feedback_threshold > 0``.
+        """
+        return self._retrieval_feedback_event_count
+
+    @property
+    def last_retrieved_meta(self) -> list[tuple[str, int]]:
+        """``(entry_id, pre_bump_access_count)`` tuples for the most
+        recent retrieval. Cleared at the end of
+        :meth:`apply_hebbian_update`; populated by retrieval-cache
+        refreshes inside :meth:`features`.
+        """
+        return list(self._last_retrieved_meta)
+
+    @property
+    def loss_ema(self) -> float | None:
+        """Running EMA of the per-batch loss, or ``None`` before the
+        first ``apply_hebbian_update`` that supplied or derived a
+        loss. Only updated when ``retrieval_feedback_threshold > 0``.
+        """
+        return self._loss_ema
+
+    def _update_loss_ema(self, loss: float) -> None:
+        """Cold-start EMA on the first call; exponential thereafter."""
+        if self._loss_ema is None:
+            self._loss_ema = float(loss)
+        else:
+            decay = self.retrieval_feedback_decay
+            self._loss_ema = decay * self._loss_ema + (1.0 - decay) * float(loss)
+
+    def _bump_retrieved_access_counts(self, bump: float) -> None:
+        """Add ``bump`` to ``access_count`` for every entry recorded in
+        ``_last_retrieved_meta``. access_count is stored as a number
+        in metadata; downstream consumers ``int(...)`` it, so floating
+        increments accumulate gracefully.
+        """
+        if self.cold_storage is None:
+            return
+        for entry_id, pre_bump in self._last_retrieved_meta:
+            try:
+                # The retrieval cache may have re-bumped this entry once
+                # already (reconstruct_strengths defaults bump_access_count
+                # to True). Read fresh, add the feedback bump.
+                entry = self.cold_storage.get_by_id(entry_id)
+            except KeyError:
+                continue
+            new_meta = dict(entry.metadata)
+            current = float(new_meta.get("access_count", 0))
+            new_meta["access_count"] = current + float(bump)
+            self.cold_storage.update_metadata(entry_id, new_meta)
