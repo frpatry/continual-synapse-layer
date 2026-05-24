@@ -1369,3 +1369,172 @@ def test_task_aware_decay_validation_at_construction() -> None:
         SynapseAugmentedMLP(base, synapse, task_warmup_batches=-1)
     with pytest.raises(ValueError, match="task_warmup_downweight"):
         SynapseAugmentedMLP(base, synapse, task_warmup_downweight=-0.5)
+
+
+# ---- Reward-modulated amplification ----
+
+
+def _build_aug_reward_modulated(
+    *,
+    reward_modulated: bool,
+    amplification_alpha: float = 1.0,
+) -> SynapseAugmentedMLP:
+    """Augmented MLP with one cold-storage entry, ready for composition
+    tests via the captured-modulator-arg pattern."""
+    import base64
+    from continual_synapse.cold_storage.compression import quantize
+    from continual_synapse.cold_storage.store import ColdStorage
+
+    cfg = MLPConfig(input_dim=4, hidden_dim=4, num_classes=2)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=4, learning_rate=1e-9)
+    with torch.no_grad():
+        synapse.strengths.fill_(1.0)  # known non-zero baseline
+    store = ColdStorage(collection_name=f"reward_mod_{reward_modulated}_{id(base)}")
+    pattern = torch.full((4, 4), 0.5)
+    store.store_cluster(
+        embedding=[1.0, 1.0, 1.0, 1.0],
+        metadata={
+            "precision": 32, "n_neurons": 4,
+            "age": 0, "access_count": 0, "created_at_step": 0,
+        },
+        document=base64.b64encode(quantize(pattern, precision=32)).decode("ascii"),
+        entry_id="only",
+    )
+    return SynapseAugmentedMLP(
+        base, synapse, SynapseModulation(init_gate=0.5),
+        cold_storage=store,
+        retrieval_k=1, retrieval_refresh_interval=1,
+        amplification_alpha=amplification_alpha,
+        reward_modulated_amplification=reward_modulated,
+    )
+
+
+def test_reward_modulation_default_off_preserves_amplification() -> None:
+    """The default reward_modulated_amplification=False produces the
+    same effective_strengths as the plain amplification path even after
+    a reward has been cached."""
+    aug = _build_aug_reward_modulated(reward_modulated=False)
+    captured: list[torch.Tensor] = []
+    orig = aug.modulator.forward
+
+    def spy(activations, strengths):
+        captured.append(strengths.detach().clone())
+        return orig(activations, strengths)
+
+    aug.modulator.forward = spy  # type: ignore[method-assign]
+
+    aug.train()
+    x = torch.ones(2, 4)
+    # First forward + update populates _last_reward (= 1.0 since no
+    # reward_computer is wired and the default is 1.0).
+    aug(x)
+    aug.apply_hebbian_update()
+    assert aug.last_reward == 1.0
+    # Now manually flip _last_reward to a wildly different value so we
+    # can detect any modulation that's NOT supposed to happen.
+    aug._last_reward = -5.0
+    aug(x)
+    # The composition must still use plain amplification: effective =
+    # strengths * (1 + alpha * retrieved_norm). The captured tensor
+    # should not reflect any -5.0 scaling.
+    captured_first = captured[0]   # post-first-forward
+    captured_second = captured[1]  # post-_last_reward override
+    # Without modulation, _last_reward is ignored ⇒ both compositions
+    # use the same alpha, same retrieved ⇒ identical effective_strengths.
+    torch.testing.assert_close(captured_first, captured_second)
+
+
+def test_reward_modulation_active_scales_alpha_by_last_reward() -> None:
+    """With the flag on, effective_alpha = alpha * last_reward."""
+    aug = _build_aug_reward_modulated(
+        reward_modulated=True, amplification_alpha=0.1
+    )
+    captured: list[torch.Tensor] = []
+    orig = aug.modulator.forward
+    aug.modulator.forward = lambda a, s: (captured.append(s.detach().clone()) or orig(a, s))  # type: ignore[method-assign]
+
+    aug.train()
+    x = torch.ones(2, 4)
+    # Cold start ⇒ _last_reward = None ⇒ defaults to 1.0 in the
+    # composition. This first capture is the baseline.
+    aug(x)
+    # Now set a known reward and forward again.
+    aug._last_reward = 0.5
+    aug(x)
+    aug._last_reward = -1.0
+    aug(x)
+
+    # Reconstruct expected effective_strengths analytically.
+    retrieved = aug._get_or_refresh_retrieval(torch.ones(2, 4))
+    max_abs = retrieved.abs().max().clamp_min(1e-8)
+    retrieved_norm = retrieved / max_abs
+    strengths = aug.synapse.strengths
+
+    def expected(eff_alpha: float) -> torch.Tensor:
+        return strengths * (1.0 + eff_alpha * retrieved_norm)
+
+    # Capture 0: reward=None ⇒ effective_alpha = 0.1 * 1.0 = 0.1
+    torch.testing.assert_close(captured[0], expected(0.1))
+    # Capture 1: reward=0.5 ⇒ effective_alpha = 0.1 * 0.5 = 0.05
+    torch.testing.assert_close(captured[1], expected(0.05))
+    # Capture 2: reward=-1.0 ⇒ effective_alpha = -0.1 (anti-amplification)
+    torch.testing.assert_close(captured[2], expected(-0.1))
+
+
+def test_reward_modulation_anti_amplifies_at_negative_reward() -> None:
+    """Negative reward inverts the amplification sign: the retrieval
+    pattern that would normally boost strengths instead suppresses them."""
+    aug = _build_aug_reward_modulated(
+        reward_modulated=True, amplification_alpha=1.0
+    )
+    captured: list[torch.Tensor] = []
+    orig = aug.modulator.forward
+    aug.modulator.forward = lambda a, s: (captured.append(s.detach().clone()) or orig(a, s))  # type: ignore[method-assign]
+
+    aug.train()
+    x = torch.ones(2, 4)
+    aug._last_reward = +1.0
+    aug(x)
+    aug._last_reward = -1.0
+    aug(x)
+    # With strengths=ones and retrieved>0 (pattern=0.5), at +1 reward
+    # effective is strengths * (1 + retrieved_norm) > 1. At -1 reward,
+    # effective is strengths * (1 - retrieved_norm) < 1. Opposite sides
+    # of the original strengths.
+    pos, neg = captured[0], captured[1]
+    assert (pos > 1.0).any() and (neg < 1.0).any()
+    # The element-wise deviation from strengths is symmetric around 1.
+    torch.testing.assert_close(pos - 1.0, -(neg - 1.0))
+
+
+def test_reward_modulation_ignored_when_alpha_is_zero() -> None:
+    """If amplification_alpha=0, the additive composition is taken
+    regardless of the modulation flag. reward_modulated only affects
+    the multiplicative branch."""
+    aug = _build_aug_reward_modulated(
+        reward_modulated=True, amplification_alpha=0.0
+    )
+    captured: list[torch.Tensor] = []
+    orig = aug.modulator.forward
+    aug.modulator.forward = lambda a, s: (captured.append(s.detach().clone()) or orig(a, s))  # type: ignore[method-assign]
+
+    aug.train()
+    x = torch.ones(2, 4)
+    aug._last_reward = 0.5  # Would scale alpha if it were nonzero.
+    aug(x)
+    # Expected: additive path ⇒ effective = strengths + retrieved.
+    retrieved = aug._get_or_refresh_retrieval(torch.ones(2, 4))
+    expected = aug.synapse.strengths + retrieved
+    torch.testing.assert_close(captured[0], expected)
+
+
+def test_last_reward_populated_after_apply_hebbian_update() -> None:
+    """The property starts None and becomes the applied reward."""
+    aug = _build_aug_reward_modulated(reward_modulated=False)
+    assert aug.last_reward is None
+    aug.train()
+    aug(torch.ones(2, 4))
+    aug.apply_hebbian_update(reward=0.42)
+    assert aug.last_reward == 0.42

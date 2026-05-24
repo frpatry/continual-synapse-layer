@@ -119,6 +119,8 @@ class SynapseAugmentedMLP(nn.Module):
         task_aware_decay: float = 0.0,
         task_warmup_batches: int = 0,
         task_warmup_downweight: float = 1.0,
+        # ---- Reward-modulated amplification flag ----
+        reward_modulated_amplification: bool = False,
     ) -> None:
         super().__init__()
         if synapse.n_neurons != base.config.hidden_dim:
@@ -210,6 +212,14 @@ class SynapseAugmentedMLP(nn.Module):
         self.task_aware_decay = float(task_aware_decay)
         self.task_warmup_batches = int(task_warmup_batches)
         self.task_warmup_downweight = float(task_warmup_downweight)
+        self.reward_modulated_amplification = bool(reward_modulated_amplification)
+        # Cache of the most recently applied Hebbian reward, used by
+        # reward-modulated amplification on the *next* forward pass.
+        # None on cold start ⇒ the modulation factor defaults to 1.0
+        # so the first batch behaves like standard (non-modulated)
+        # amplification. Populated at the end of every successful
+        # apply_hebbian_update.
+        self._last_reward: float | None = None
         # Task-aware state. The model is "task-agnostic" until the
         # caller calls notify_task_change(). _current_task_id == -1
         # writes the same "untagged" sentinel into consolidations as
@@ -322,8 +332,22 @@ class SynapseAugmentedMLP(nn.Module):
                 # cold storage acts as a gain map.
                 max_abs = retrieved.abs().max().clamp_min(1e-8)
                 retrieved_normalized = retrieved / max_abs
+                # Reward-modulated amplification: when enabled, scale
+                # ``alpha`` by the most recently applied per-batch
+                # reward so high-confidence updates produce stronger
+                # amplification, low-confidence updates produce weaker
+                # amplification, and negative-reward batches (anti-
+                # correlated retrieval) produce anti-amplification.
+                # The reward is from the *previous* batch's
+                # apply_hebbian_update — a one-batch lag, acceptable for
+                # a continuous signal. Cold-start ⇒ no prior reward ⇒
+                # default 1.0 (standard amplification behavior).
+                effective_alpha = self.amplification_alpha
+                if self.reward_modulated_amplification:
+                    last = self._last_reward if self._last_reward is not None else 1.0
+                    effective_alpha = effective_alpha * float(last)
                 effective_strengths = self.synapse.strengths * (
-                    1.0 + self.amplification_alpha * retrieved_normalized
+                    1.0 + effective_alpha * retrieved_normalized
                 )
         else:
             effective_strengths = self.synapse.strengths
@@ -593,6 +617,12 @@ class SynapseAugmentedMLP(nn.Module):
         # Eval-mode forwards do not get here so the warmup window
         # does not "leak" through evaluation.
         self._batches_since_task_change += 1
+        # Cache for reward-modulated amplification on the NEXT forward.
+        # Stored even when reward_modulated_amplification is False —
+        # the cache is cheap and lets a caller flip the flag mid-run
+        # without a cold-start window. Read sites still respect the
+        # flag, so non-modulated methods are unaffected.
+        self._last_reward = float(reward)
         return reward
 
     @property
@@ -649,6 +679,15 @@ class SynapseAugmentedMLP(nn.Module):
         loss. Only updated when ``retrieval_feedback_threshold > 0``.
         """
         return self._loss_ema
+
+    @property
+    def last_reward(self) -> float | None:
+        """Reward applied by the most recent ``apply_hebbian_update``,
+        or ``None`` before the first such call. Cached for
+        :attr:`reward_modulated_amplification` to consume on the next
+        forward; also useful as a diagnostic.
+        """
+        return self._last_reward
 
     @property
     def current_task_id(self) -> int:
