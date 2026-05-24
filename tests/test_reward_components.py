@@ -112,6 +112,57 @@ def test_consistency_rejects_bad_constructor_args() -> None:
         ConsistencyReward(n_neurons=3, decay=-0.5)
 
 
+def test_consistency_center_scale_default_is_identity() -> None:
+    """Default center=0, scale=1 reproduces raw cosine sim."""
+    cr = ConsistencyReward(n_neurons=2)
+    cr(torch.tensor([[1.0, 0.0]]))  # seed
+    r = cr(torch.tensor([[1.0, 0.0]]))
+    assert math.isclose(r, 1.0, abs_tol=1e-6)
+
+
+def test_consistency_center_scale_recenters_saturated_range() -> None:
+    """The audit observation: raw sim ~0.97 saturates; centering to
+    (r - 0.95) / 0.05 rescales the saturated band to a useful range."""
+    cr = ConsistencyReward(
+        n_neurons=2, center=0.95, scale=0.05
+    )
+    # First call returns transform(1.0) = (1.0 - 0.95) / 0.05 = 1.0.
+    r0 = cr(torch.tensor([[1.0, 0.0]]))
+    assert math.isclose(r0, 1.0, abs_tol=1e-6)
+    # Identical follow-up: raw sim = 1.0 -> transform = 1.0.
+    r1 = cr(torch.tensor([[1.0, 0.0]]))
+    assert math.isclose(r1, 1.0, abs_tol=1e-6)
+
+
+def test_consistency_clipping_bounds_output() -> None:
+    cr = ConsistencyReward(
+        n_neurons=2, center=0.95, scale=0.05, clip_min=-1.0, clip_max=1.0
+    )
+    cr(torch.tensor([[1.0, 0.0]]))  # seed
+    # Orthogonal input: raw cos sim = 0 -> (0 - 0.95) / 0.05 = -19 -> clipped to -1.
+    r = cr(torch.tensor([[0.0, 1.0]]))
+    assert r == -1.0
+
+
+def test_consistency_clip_max_bounds_high_values() -> None:
+    cr = ConsistencyReward(
+        n_neurons=2, center=-1.0, scale=0.5, clip_max=2.0
+    )
+    cr(torch.tensor([[1.0, 0.0]]))  # seed
+    # Identical: raw 1.0 -> (1.0 - (-1.0)) / 0.5 = 4.0 -> clipped to 2.0.
+    r = cr(torch.tensor([[1.0, 0.0]]))
+    assert r == 2.0
+
+
+def test_consistency_rejects_bad_center_scale_args() -> None:
+    with pytest.raises(ValueError, match="scale"):
+        ConsistencyReward(n_neurons=2, scale=0.0)
+    with pytest.raises(ValueError, match="scale"):
+        ConsistencyReward(n_neurons=2, scale=-1.0)
+    with pytest.raises(ValueError, match="clip"):
+        ConsistencyReward(n_neurons=2, clip_min=1.0, clip_max=0.0)
+
+
 def test_consistency_does_not_track_gradients() -> None:
     cr = ConsistencyReward(n_neurons=3)
     a = torch.randn(4, 3, requires_grad=True)
