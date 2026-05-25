@@ -320,7 +320,12 @@ def _multi_seed_to_jsonable(run: MultiSeedRun) -> dict:
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    # Path objects from --prior-log / --naive-log / --output-dir get
+    # passed through ``vars(args)`` into the payload's "config" block;
+    # json doesn't know how to serialise them. Coerce via default=str
+    # rather than walking the dict — keeps the write site simple and
+    # safe for any future Path-valued flags.
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str))
     os.replace(tmp, path)
 
 
