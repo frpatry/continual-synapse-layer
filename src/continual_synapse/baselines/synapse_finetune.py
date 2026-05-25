@@ -126,6 +126,8 @@ class SynapseAugmentedMLP(nn.Module):
         gradient_gating_enabled: bool = False,
         gradient_gating_alpha: float = 0.9,
         familiarity_mode: str = "magnitude",
+        # ---- Developmental maturity (experiment 19) ----
+        maturity_target_consolidations: int = 0,
     ) -> None:
         super().__init__()
         if synapse.n_neurons != base.config.hidden_dim:
@@ -193,6 +195,11 @@ class SynapseAugmentedMLP(nn.Module):
                 f"familiarity_mode must be 'magnitude' or 'cosine', "
                 f"got {familiarity_mode!r}"
             )
+        if maturity_target_consolidations < 0:
+            raise ValueError(
+                f"maturity_target_consolidations must be >= 0, got "
+                f"{maturity_target_consolidations}"
+            )
         self.base = base
         self.synapse = synapse
         self.modulator = modulator if modulator is not None else SynapseModulation()
@@ -242,6 +249,17 @@ class SynapseAugmentedMLP(nn.Module):
         self.gradient_gating_enabled = bool(gradient_gating_enabled)
         self.gradient_gating_alpha = float(gradient_gating_alpha)
         self.familiarity_mode = str(familiarity_mode)
+        # Developmental maturity (experiment 19). Default 0 means
+        # "maturity is irrelevant" — apply_gradient_gating then uses
+        # the raw alpha as before. With target > 0, the effective
+        # alpha at any moment is scaled by
+        # min(consolidation_count / target, 1) so the gating ramps up
+        # from "no protection" (when the system has accumulated no
+        # consolidations yet) to full protection (when the count
+        # reaches target). Models the idea that the system has weak
+        # conviction about what it knows when it knows little.
+        self.maturity_target_consolidations = int(maturity_target_consolidations)
+        self._last_maturity: float = 1.0
         # Snapshot of the most recent cosine-similarity vector against
         # cold storage, populated by apply_gradient_gating in cosine
         # mode. Empty list otherwise. Exposed via last_similarities.
@@ -772,6 +790,18 @@ class SynapseAugmentedMLP(nn.Module):
         """
         return list(self._last_similarities)
 
+    @property
+    def last_maturity(self) -> float:
+        """Developmental-maturity factor used by the most recent
+        :meth:`apply_gradient_gating` call. Defined as
+        ``min(consolidation_count / maturity_target_consolidations, 1)``
+        when the target is positive; ``1.0`` otherwise (i.e. when
+        maturity scaling is disabled, the maturity factor is the
+        identity). Reported per task in experiment 19 to show the
+        ramp-up trajectory.
+        """
+        return self._last_maturity
+
     @torch.no_grad()
     def apply_gradient_gating(self) -> float:
         """Scale ``base.parameters()`` gradients by Hebbian familiarity.
@@ -867,7 +897,24 @@ class SynapseAugmentedMLP(nn.Module):
             self._familiarity_max = max(self._familiarity_max, raw_familiarity)
             familiarity = min(raw_familiarity / self._familiarity_max, 1.0)
 
-        gradient_scale = 1.0 - self.gradient_gating_alpha * familiarity
+        # Developmental maturity scales the effective alpha by how much
+        # consolidation experience the system has accumulated. With
+        # target=0 (the default) maturity is fixed at 1.0 and the
+        # scaling reduces to the standard formula bit-exact. With
+        # target>0, effective_alpha grows linearly from 0 to alpha as
+        # consolidation_count grows from 0 to target, then stays
+        # saturated.
+        if self.maturity_target_consolidations > 0:
+            maturity = min(
+                self._consolidation_count
+                / float(self.maturity_target_consolidations),
+                1.0,
+            )
+        else:
+            maturity = 1.0
+        self._last_maturity = float(maturity)
+        effective_alpha = self.gradient_gating_alpha * maturity
+        gradient_scale = 1.0 - effective_alpha * familiarity
         self._last_familiarity = float(familiarity)
         self._last_gradient_scale = float(gradient_scale)
         for param in self.base.parameters():

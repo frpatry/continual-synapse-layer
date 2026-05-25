@@ -1944,3 +1944,144 @@ def test_familiarity_mode_validation() -> None:
     synapse = SynapseLayer(n_neurons=4)
     with pytest.raises(ValueError, match="familiarity_mode"):
         SynapseAugmentedMLP(base, synapse, familiarity_mode="other")
+
+
+# ---- Developmental maturity (experiment 19) ----
+
+
+def test_maturity_default_is_one_and_preserves_behavior() -> None:
+    """Default maturity_target_consolidations=0 ⇒ maturity is fixed at
+    1.0 ⇒ apply_gradient_gating produces the same gradient_scale as
+    the pre-maturity implementation (effective_alpha == alpha)."""
+    aug = _build_aug_for_gating(
+        gradient_gating_enabled=True, gradient_gating_alpha=0.9,
+    )
+    assert aug.maturity_target_consolidations == 0
+    # Force familiarity to saturate so scale = 1 - alpha * 1 = 0.1.
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(0.5)
+    aug.train()
+    out = aug(torch.randn(3, 4))
+    out.sum().backward()
+    scale = aug.apply_gradient_gating()
+    assert scale == pytest.approx(0.1, abs=1e-6)
+    assert aug.last_maturity == 1.0
+
+
+def test_maturity_zero_consolidations_disables_gating_entirely() -> None:
+    """With target > 0 and consolidation_count == 0, maturity is 0 ⇒
+    effective_alpha is 0 ⇒ scale = 1.0 regardless of familiarity."""
+    aug = _build_aug_for_gating(
+        gradient_gating_enabled=True, gradient_gating_alpha=0.9,
+    )
+    aug.maturity_target_consolidations = 10
+    aug._consolidation_count = 0  # explicit (defaults but be sure)
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(0.5)
+    aug.train()
+    out = aug(torch.randn(3, 4))
+    out.sum().backward()
+    p0 = next(aug.base.parameters())
+    grad_before = p0.grad.clone()
+    scale = aug.apply_gradient_gating()
+    # familiarity should saturate to 1; without maturity scaling would
+    # produce scale=0.1; with maturity=0 it produces scale=1.0.
+    assert aug.last_familiarity == pytest.approx(1.0)
+    assert aug.last_maturity == 0.0
+    assert scale == 1.0
+    torch.testing.assert_close(p0.grad, grad_before)
+
+
+def test_maturity_halfway_halves_effective_alpha() -> None:
+    """With target=10 and consolidation_count=5, maturity=0.5 ⇒
+    effective_alpha = 0.9 * 0.5 = 0.45 ⇒ scale = 1 - 0.45 * fam."""
+    aug = _build_aug_for_gating(
+        gradient_gating_enabled=True, gradient_gating_alpha=0.9,
+    )
+    aug.maturity_target_consolidations = 10
+    aug._consolidation_count = 5
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(0.5)
+    aug.train()
+    out = aug(torch.randn(3, 4))
+    out.sum().backward()
+    scale = aug.apply_gradient_gating()
+    assert aug.last_familiarity == pytest.approx(1.0)
+    assert aug.last_maturity == pytest.approx(0.5)
+    # scale = 1 - 0.45 * 1 = 0.55
+    assert scale == pytest.approx(0.55, abs=1e-6)
+
+
+def test_maturity_saturates_at_one_above_target() -> None:
+    """With consolidation_count > target, maturity caps at 1.0."""
+    aug = _build_aug_for_gating(
+        gradient_gating_enabled=True, gradient_gating_alpha=0.9,
+    )
+    aug.maturity_target_consolidations = 10
+    aug._consolidation_count = 100  # well above target
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(0.5)
+    aug.train()
+    out = aug(torch.randn(3, 4))
+    out.sum().backward()
+    scale = aug.apply_gradient_gating()
+    assert aug.last_maturity == 1.0
+    # Standard scale: 1 - 0.9 * 1 = 0.1
+    assert scale == pytest.approx(0.1, abs=1e-6)
+
+
+def test_maturity_validation_at_construction() -> None:
+    cfg = MLPConfig(input_dim=4, hidden_dim=4, num_classes=2)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=4)
+    with pytest.raises(ValueError, match="maturity_target_consolidations"):
+        SynapseAugmentedMLP(base, synapse, maturity_target_consolidations=-1)
+
+
+def test_maturity_integration_with_cosine_mode() -> None:
+    """Maturity scaling works the same way regardless of familiarity_mode."""
+    import base64
+    from continual_synapse.cold_storage.compression import quantize
+    from continual_synapse.cold_storage.store import ColdStorage
+
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2, dropout=0.5)
+    set_seed(0)
+    base = MLPClassifier(cfg)
+    synapse = SynapseLayer(n_neurons=8, learning_rate=1e-3, n_passes=5)
+    store = ColdStorage(collection_name=f"maturity_cosine_{id(base)}")
+    # Seed an entry that the buffer-average will perfectly match.
+    pattern = torch.full((8, 8), 0.5)
+    store.store_cluster(
+        embedding=[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        metadata={
+            "precision": 32, "n_neurons": 8,
+            "age": 0, "access_count": 0, "created_at_step": 0,
+        },
+        document=base64.b64encode(quantize(pattern, precision=32)).decode("ascii"),
+        entry_id="seed",
+    )
+    aug = SynapseAugmentedMLP(
+        base, synapse, SynapseModulation(init_gate=0.0),
+        cold_storage=store,
+        n_passes=5,
+        retrieval_k=1, retrieval_refresh_interval=1,
+        gate_modulation_enabled=False,
+        gradient_gating_enabled=True,
+        gradient_gating_alpha=0.9,
+        familiarity_mode="cosine",
+        maturity_target_consolidations=4,
+    )
+    # Set consolidation_count to 2 ⇒ maturity = 0.5.
+    aug._consolidation_count = 2
+    aug.train()
+    aug(torch.randn(3, 4))
+    # Force the buffer to match the stored embedding ⇒ familiarity=1.
+    target = torch.zeros(3, 8); target[:, 0] = 1.0
+    aug.synapse._activation_buffer = [target.clone() for _ in range(5)]
+    p0 = next(aug.base.parameters())
+    p0.grad = torch.ones_like(p0)
+    scale = aug.apply_gradient_gating()
+    assert aug.last_familiarity == pytest.approx(1.0, abs=1e-5)
+    assert aug.last_maturity == pytest.approx(0.5)
+    # effective_alpha = 0.9 * 0.5 = 0.45 ⇒ scale = 1 - 0.45 * 1 = 0.55
+    assert scale == pytest.approx(0.55, abs=1e-5)
