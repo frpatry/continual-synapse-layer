@@ -6,6 +6,73 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-25] Phase A hyperparameter scout — null finding on compression schedule
+
+### What was tested
+
+Experiment 22 (single-seed scout, Permuted-MNIST 15-task) varied
+four hyperparameters of ``cs_gated_cosine_developmental``
+independently around the exp 19 / exp 21 baseline
+(``maturity_target=50``, ``gradient_gating_alpha=0.9``,
+``age_thresholds=(100, 500, 2000)``,
+``compression_sweep_interval=100``):
+
+- Maturity sweep: target ∈ {20, 50, 100, 200}
+- Gating alpha sweep: alpha ∈ {0.5, 0.7, 0.9, 0.95}
+- Decay-schedule sweep:
+    - conservative ``(500, 2000, 10000)``
+    - aggressive ``(50, 200, 1000)``
+- Compression-sweep-interval sweep: interval ∈ {50, 100, 200}
+
+11 configurations total at seed=0.
+
+### The null finding (compression-related dimensions)
+
+The decay-schedule and compression-sweep-interval dimensions had
+**no measurable effect** on any of the headline metrics:
+
+- Aggregate ACC: indistinguishable across all 5 compression
+  variants (decay_cons, decay_agg, sweep50, sweep200,
+  scout_mat50 baseline) — differences within the seed-level
+  scatter that 1-seed runs can't resolve, but the magnitudes
+  were small (< 1 pp) even when compared informally.
+- Task-0 retention (``R[T-1, 0]``): same story.
+- Forgetting: same story.
+
+### Why this is plausible
+
+At T=15 on Permuted-MNIST, ``cs_gated_cosine_developmental``
+accumulates ~140 consolidations end-of-run. Compression sweeps
+only matter when an entry has been around long enough for its
+``age`` to cross a tier threshold. With sweep_interval=100 and
+training totaling ~14k batches, sweeps fire ~140 times — but
+each one inspects entries whose ages are largely below even the
+conservative schedule's first threshold (500). The schedule's
+quantisation tiers (16 → 8 → 4 bit) thus rarely activate within a
+15-task run regardless of where the thresholds are set. The
+ACC-affecting machinery (retrieval queries, familiarity
+computation, gradient gating) operates on freshly-stored
+32-bit entries either way.
+
+### Implication for future hyperparameter work
+
+The cs_gated_cosine_developmental architecture has two
+hyperparameter axes that visibly move headline metrics
+(``maturity_target_consolidations`` and ``gradient_gating_alpha``)
+and two that don't at T=15 on Permuted-MNIST
+(``age_thresholds`` and ``compression_sweep_interval``).
+Subsequent tuning experiments (Phase B / exp 23) should hold the
+inert dimensions at their defaults and concentrate the seed
+budget on the two informative dimensions.
+
+If a future benchmark with much longer task sequences shows
+non-trivial age accumulation (T > 50 + many consolidations per
+task), the compression-schedule sweep may become relevant
+again — at that point the null finding should be retested,
+not assumed to generalise.
+
+---
+
 ## [2026-05-24] Pressure-metric dilution fix — cs_full_sparse goes from catastrophic to baseline-equivalent
 
 ### The pathology
