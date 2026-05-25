@@ -1,0 +1,227 @@
+{
+  "best_config_per_T": {
+    "15": "scout_a095_validated"
+  },
+  "experiment": "24_retention_analysis",
+  "metrics": {
+    "15": {
+      "scout_a095_validated": {
+        "config": "scout_a095_validated",
+        "final_acc_per_task_mean": [
+          0.8248200000000001,
+          0.865,
+          0.8756999999999999,
+          0.8131,
+          0.78222,
+          0.69126,
+          0.6968,
+          0.78102,
+          0.756,
+          0.821,
+          0.8314600000000001,
+          0.86806,
+          0.8865399999999999,
+          0.889,
+          0.9079599999999999
+        ],
+        "final_acc_per_task_std": [
+          0.023586373184531804,
+          0.017394683095704837,
+          0.015764358534364805,
+          0.03233921767761242,
+          0.05581121751046113,
+          0.025973890736660923,
+          0.0332628170785338,
+          0.019161863166195486,
+          0.02367857681534092,
+          0.013601286703837971,
+          0.02094165705000444,
+          0.006745220530123538,
+          0.006334271860285119,
+          0.007094716343871692,
+          0.0013722244714331514
+        ],
+        "integrated_retention": 0.8193293333333334,
+        "integrated_retention_std": 0.012163834008147929,
+        "n_seeds": 5,
+        "new_half_retention": 0.84263,
+        "new_half_retention_std": 0.0061035120524989515,
+        "num_tasks": 15,
+        "old_half_retention": 0.7927,
+        "old_half_retention_std": 0.019278477478202227,
+        "plasticity_stability_ratio": 1.06334330167024,
+        "plasticity_stability_ratio_std": 0.018436949085517483,
+        "task0_final_acc": 0.8248200000000001,
+        "task0_final_acc_per_seed": [
+          0.8028,
+          0.7965,
+          0.8477,
+          0.8429,
+          0.8342
+        ],
+        "task0_final_acc_std": 0.023586373184531804,
+        "task_last_final_acc": 0.9079599999999999,
+        "task_last_final_acc_std": 0.0013722244714331514,
+        "task_mid_final_acc": 0.78102,
+        "task_mid_final_acc_std": 0.019161863166195486
+      },
+      "scout_combined": {
+        "config": "scout_combined",
+        "final_acc_per_task_mean": [
+          0.67648,
+          0.76944,
+          0.83424,
+          0.81662,
+          0.8395400000000001,
+          0.7989999999999999,
+          0.7792600000000001,
+          0.84374,
+          0.80044,
+          0.86236,
+          0.8505199999999998,
+          0.8619199999999999,
+          0.8805200000000001,
+          0.8885,
+          0.90256
+        ],
+        "final_acc_per_task_std": [
+          0.05198386288070558,
+          0.06783754859957722,
+          0.02746639765240429,
+          0.037201303740594875,
+          0.018739076818242693,
+          0.03155178283393826,
+          0.031665170140076644,
+          0.02482998187675536,
+          0.01924403803779242,
+          0.01790371469835239,
+          0.013743434796294546,
+          0.015724407778991232,
+          0.015638797907767718,
+          0.009644428443407125,
+          0.004576898513185553
+        ],
+        "integrated_retention": 0.8270093333333334,
+        "integrated_retention_std": 0.008147189835901847,
+        "n_seeds": 5,
+        "new_half_retention": 0.8613199999999999,
+        "new_half_retention_std": 0.006388316973194134,
+        "num_tasks": 15,
+        "old_half_retention": 0.7877971428571429,
+        "old_half_retention_std": 0.02366515866614627,
+        "plasticity_stability_ratio": 1.0943133127072935,
+        "plasticity_stability_ratio_std": 0.041145157107705874,
+        "task0_final_acc": 0.67648,
+        "task0_final_acc_per_seed": [
+          0.7253,
+          0.6685,
+          0.7235,
+          0.5987,
+          0.6664
+        ],
+        "task0_final_acc_std": 0.05198386288070558,
+        "task_last_final_acc": 0.90256,
+        "task_last_final_acc_std": 0.004576898513185553,
+        "task_mid_final_acc": 0.84374,
+        "task_mid_final_acc_std": 0.02482998187675536
+      },
+      "scout_mat100_validated": {
+        "config": "scout_mat100_validated",
+        "final_acc_per_task_mean": [
+          0.6253,
+          0.7759199999999999,
+          0.8168200000000001,
+          0.8162,
+          0.8452400000000001,
+          0.79,
+          0.7995,
+          0.8301999999999999,
+          0.8007799999999999,
+          0.8542799999999999,
+          0.87026,
+          0.8645000000000002,
+          0.8815999999999999,
+          0.89476,
+          0.9135199999999999
+        ],
+        "final_acc_per_task_std": [
+          0.03807689588188617,
+          0.02318797101947474,
+          0.024196631997036287,
+          0.017016756447690042,
+          0.010757462526079266,
+          0.05316234569693102,
+          0.03643727487065958,
+          0.0329180801384285,
+          0.044634986277582764,
+          0.01896040611379408,
+          0.016405883091135307,
+          0.013040130367446504,
+          0.011164452516805307,
+          0.009485146282477637,
+          0.004427979223076806
+        ],
+        "integrated_retention": 0.8252586666666666,
+        "integrated_retention_std": 0.0055663880169780034,
+        "n_seeds": 5,
+        "new_half_retention": 0.8637374999999998,
+        "new_half_retention_std": 0.01452044894278409,
+        "num_tasks": 15,
+        "old_half_retention": 0.7812828571428572,
+        "old_half_retention_std": 0.01030542951802694,
+        "plasticity_stability_ratio": 1.105830150384945,
+        "plasticity_stability_ratio_std": 0.03071208491203458,
+        "task0_final_acc": 0.6253,
+        "task0_final_acc_per_seed": [
+          0.6618,
+          0.6024,
+          0.6646,
+          0.5765,
+          0.6212
+        ],
+        "task0_final_acc_std": 0.03807689588188617,
+        "task_last_final_acc": 0.9135199999999999,
+        "task_last_final_acc_std": 0.004427979223076806,
+        "task_mid_final_acc": 0.8301999999999999,
+        "task_mid_final_acc_std": 0.0329180801384285
+      }
+    }
+  },
+  "source_logs": {
+    "15": "/Users/francoispatry/Documents/continual-synapse-layer/results/logs/phase_b_validation/1779744145_23_phase_b_T15.json"
+  },
+  "task_lengths": [
+    15
+  ],
+  "wilcoxon_task0": {
+    "15": [
+      {
+        "config_a": "scout_mat100_validated",
+        "config_b": "scout_a095_validated",
+        "n": 5,
+        "p_value": 0.0625,
+        "p_value_bonferroni": 0.1875,
+        "significant_05": false,
+        "statistic": 0.0
+      },
+      {
+        "config_a": "scout_mat100_validated",
+        "config_b": "scout_combined",
+        "n": 5,
+        "p_value": 0.0625,
+        "p_value_bonferroni": 0.1875,
+        "significant_05": false,
+        "statistic": 0.0
+      },
+      {
+        "config_a": "scout_a095_validated",
+        "config_b": "scout_combined",
+        "n": 5,
+        "p_value": 0.0625,
+        "p_value_bonferroni": 0.1875,
+        "significant_05": false,
+        "statistic": 0.0
+      }
+    ]
+  }
+}
