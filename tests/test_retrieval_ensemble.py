@@ -32,17 +32,32 @@ def _bare_mlp(hidden_dim: int = 8, num_classes: int = 3) -> MLPClassifier:
 
 
 def _populate_store(
-    store: ColdStorage, embeddings: list[list[float]], n_neurons: int
+    store: ColdStorage,
+    embeddings: list[list[float]],
+    n_neurons: int,
+    *,
+    true_labels: list[int | None] | None = None,
 ) -> None:
-    """Insert one entry per embedding with a dummy document."""
+    """Insert one entry per embedding with a dummy document.
+
+    When ``true_labels`` is supplied, ``true_labels[i]`` (if not None)
+    is written into entry ``i``'s metadata as ``"true_label"``. Use
+    ``None`` for individual entries to simulate path-B / mixed-vintage
+    stores where only some entries carry labels.
+    """
+    if true_labels is not None and len(true_labels) != len(embeddings):
+        raise ValueError("true_labels must align with embeddings")
     for i, emb in enumerate(embeddings):
         blob = quantize(torch.zeros(n_neurons, n_neurons), precision=32)
+        md: dict = {
+            "precision": 32, "n_neurons": n_neurons,
+            "age": 0, "access_count": 0, "created_at_step": 0,
+        }
+        if true_labels is not None and true_labels[i] is not None:
+            md["true_label"] = int(true_labels[i])
         store.store_cluster(
             embedding=emb,
-            metadata={
-                "precision": 32, "n_neurons": n_neurons,
-                "age": 0, "access_count": 0, "created_at_step": 0,
-            },
+            metadata=md,
             document=base64.b64encode(blob).decode("ascii"),
             entry_id=f"e{i}",
         )
@@ -274,6 +289,165 @@ def test_predict_synapse_augmented_uses_base_features_only() -> None:
     with torch.no_grad():
         bare = base.classify(base.features(x))
     torch.testing.assert_close(out, bare)
+
+
+# ---- Path-A step 2: label_source config + breakdown ----
+
+
+def test_label_source_validation_rejects_unknown_value() -> None:
+    model = _bare_mlp()
+    store = ColdStorage(collection_name="ls_validation")
+    with pytest.raises(ValueError, match="label_source must be one of"):
+        RetrievalEnsemble.from_model_and_storage(
+            model, store, label_source="banana",
+        )
+
+
+def test_label_source_auto_uses_stored_when_all_present() -> None:
+    """Path-A pure case: every entry has true_label, auto consumes
+    them all, breakdown reports 100% coverage."""
+    model = _bare_mlp(hidden_dim=4, num_classes=3)
+    store = ColdStorage(collection_name="ls_auto_all_stored")
+    embeddings = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ]
+    _populate_store(store, embeddings, n_neurons=4, true_labels=[2, 0, 1])
+    ens = RetrievalEnsemble.from_model_and_storage(
+        model, store, label_source="auto",
+    )
+    assert ens.labels.tolist() == [2, 0, 1]
+    assert ens.label_source_breakdown == {
+        "true_label": 3, "derived": 0, "total": 3,
+    }
+
+
+def test_label_source_auto_falls_back_to_derived_on_mixed_store() -> None:
+    """Mixed-vintage store: auto reads stored where present and derives
+    the rest. Breakdown reports the per-source counts."""
+    model = _bare_mlp(hidden_dim=4, num_classes=3)
+    store = ColdStorage(collection_name="ls_auto_mixed")
+    embeddings = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+    # Entries 0 and 2 carry stored labels; 1 and 3 are pre-path-A.
+    _populate_store(
+        store, embeddings, n_neurons=4,
+        true_labels=[2, None, 1, None],
+    )
+    ens = RetrievalEnsemble.from_model_and_storage(
+        model, store, label_source="auto",
+    )
+    assert ens.label_source_breakdown == {
+        "true_label": 2, "derived": 2, "total": 4,
+    }
+    # Stored entries override; derived entries match what the bare
+    # head produces on the same embeddings (the same path-B logic
+    # the original ensemble used).
+    derived_full = RetrievalEnsemble._derive_labels(
+        model, ens.embeddings,
+    )
+    assert ens.labels[0].item() == 2
+    assert ens.labels[2].item() == 1
+    assert ens.labels[1].item() == derived_full[1].item()
+    assert ens.labels[3].item() == derived_full[3].item()
+
+
+def test_label_source_auto_on_pre_path_a_store_matches_derived() -> None:
+    """Back-compat: 100% old store with label_source='auto' must yield
+    bit-identical labels to label_source='derived' (the original path-B
+    behaviour) — proves auto introduces zero behavioural change on
+    legacy checkpoints."""
+    model = _bare_mlp(hidden_dim=4, num_classes=3)
+    embeddings = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ]
+    store_a = ColdStorage(collection_name="ls_legacy_auto")
+    store_b = ColdStorage(collection_name="ls_legacy_derived")
+    _populate_store(store_a, embeddings, n_neurons=4)  # no true_labels
+    _populate_store(store_b, embeddings, n_neurons=4)
+
+    ens_auto = RetrievalEnsemble.from_model_and_storage(
+        model, store_a, label_source="auto",
+    )
+    ens_derived = RetrievalEnsemble.from_model_and_storage(
+        model, store_b, label_source="derived",
+    )
+    assert torch.equal(ens_auto.labels, ens_derived.labels)
+    assert ens_auto.label_source_breakdown == {
+        "true_label": 0, "derived": 3, "total": 3,
+    }
+
+
+def test_label_source_true_label_strict_raises_on_missing() -> None:
+    """Strict mode must refuse any store where even one entry lacks
+    a true_label — no silent fallback."""
+    model = _bare_mlp(hidden_dim=4, num_classes=3)
+    store = ColdStorage(collection_name="ls_strict_missing")
+    embeddings = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ]
+    _populate_store(
+        store, embeddings, n_neurons=4,
+        true_labels=[2, None, 1],  # entry 1 has no label
+    )
+    with pytest.raises(ValueError, match="requires every entry"):
+        RetrievalEnsemble.from_model_and_storage(
+            model, store, label_source="true_label",
+        )
+
+
+def test_label_source_derived_ignores_stored_true_labels() -> None:
+    """Path-B mode for ablations: even when entries carry true_labels,
+    they must not affect the resulting label tensor."""
+    model = _bare_mlp(hidden_dim=4, num_classes=3)
+    embeddings = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ]
+    store_with = ColdStorage(collection_name="ls_derived_with_stored")
+    store_without = ColdStorage(collection_name="ls_derived_without_stored")
+    # Intentionally seed stored labels that differ from what the head
+    # would derive, so a leak would be detectable.
+    _populate_store(
+        store_with, embeddings, n_neurons=4, true_labels=[2, 2, 2],
+    )
+    _populate_store(store_without, embeddings, n_neurons=4)
+
+    ens_with = RetrievalEnsemble.from_model_and_storage(
+        model, store_with, label_source="derived",
+    )
+    ens_without = RetrievalEnsemble.from_model_and_storage(
+        model, store_without, label_source="derived",
+    )
+    # Derived must depend only on the model's head + embeddings,
+    # not on what was stored alongside.
+    assert torch.equal(ens_with.labels, ens_without.labels)
+    assert ens_with.label_source_breakdown == {
+        "true_label": 0, "derived": 3, "total": 3,
+    }
+
+
+def test_label_source_breakdown_none_for_direct_init() -> None:
+    """The breakdown is only meaningful when the classmethod assigned
+    each label; raw __init__ gets None so callers can detect the
+    'I don't know the provenance' case."""
+    model = _bare_mlp()
+    ens = RetrievalEnsemble(
+        model,
+        cold_storage_embeddings=torch.zeros(0, 8),
+        cold_storage_labels=torch.zeros(0, dtype=torch.long),
+    )
+    assert ens.label_source_breakdown is None
 
 
 def test_old_checkpoint_metadata_coexists_with_new() -> None:

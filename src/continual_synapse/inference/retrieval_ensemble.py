@@ -131,6 +131,28 @@ class RetrievalEnsemble:
         self.tau = float(tau)
         self.lambda_blend = float(lambda_blend)
         self.eps = float(eps)
+        # Populated by from_model_and_storage; None for direct __init__
+        # because the constructor can't introspect where the labels
+        # came from when handed a raw tensor.
+        self._label_source_breakdown: dict[str, int] | None = None
+
+    @property
+    def label_source_breakdown(self) -> dict[str, int] | None:
+        """Per-entry tally of where the labels came from at construction.
+
+        Returns a dict with keys ``true_label``, ``derived``, and
+        ``total`` (summing to ``total``). ``None`` for ensembles built
+        through ``__init__`` directly — only populated when constructed
+        via :meth:`from_model_and_storage`, which is the path that
+        actually knows the provenance of each label.
+
+        Useful for logging path-A coverage in experiment summaries,
+        e.g. ``487 true_label, 153 derived (76% coverage)`` on a
+        mixed-vintage store.
+        """
+        if self._label_source_breakdown is None:
+            return None
+        return dict(self._label_source_breakdown)
 
     # ---- construction from training artifacts ----
 
@@ -143,14 +165,43 @@ class RetrievalEnsemble:
         tau: float = 0.7,
         lambda_blend: float = 0.3,
         device: torch.device | str | None = None,
+        label_source: str = "auto",
     ) -> "RetrievalEnsemble":
-        """Pull every embedding from ``cold_storage``, derive its label
-        via the model's classifier head, and return a ready ensemble.
+        """Pull every embedding from ``cold_storage`` and build a ready
+        ensemble.
 
-        ``device``: where to keep the stored embeddings and the derived
-        labels. Defaults to whichever device the model's first
-        parameter lives on, so cosine sim doesn't cross device.
+        Args:
+            label_source: How to assign a label to each stored entry.
+
+                - ``"auto"`` (default): use ``metadata["true_label"]``
+                  when present, fall back to deriving via the current
+                  model's classifier head otherwise. Path-A entries
+                  use their ground-truth label; path-B / pre-path-A
+                  entries fall through to the original derivation.
+                  Mixed-vintage stores work seamlessly.
+                - ``"true_label"``: strict path-A. Every entry must
+                  carry ``metadata["true_label"]``; raises
+                  :class:`ValueError` otherwise. Use this on stores
+                  trained with label storage enabled when you want a
+                  hard guarantee that no derived labels leak in.
+                - ``"derived"``: ignore any stored ``true_label`` and
+                  derive every label via the current model's head.
+                  This is the path-B behaviour, kept available for
+                  A/B ablations against path A.
+
+        ``device``: where to keep the stored embeddings and labels.
+        Defaults to whichever device the model's first parameter lives
+        on, so cosine sim doesn't cross device.
+
+        On return, :attr:`label_source_breakdown` reports how many
+        labels came from each source.
         """
+        if label_source not in ("auto", "true_label", "derived"):
+            raise ValueError(
+                f"label_source must be one of "
+                f"'auto', 'true_label', 'derived'; got {label_source!r}"
+            )
+
         if device is None:
             try:
                 device = next(model.parameters()).device
@@ -161,24 +212,74 @@ class RetrievalEnsemble:
         entries = cold_storage.all_entries() if cold_storage.count() > 0 else []
         if not entries:
             n_neurons = _infer_n_neurons(model)
-            return cls(
+            ens = cls(
                 model=model,
                 cold_storage_embeddings=torch.zeros(0, n_neurons, device=device),
                 cold_storage_labels=torch.zeros(0, dtype=torch.long, device=device),
                 k=k, tau=tau, lambda_blend=lambda_blend,
             )
+            ens._label_source_breakdown = {
+                "true_label": 0, "derived": 0, "total": 0,
+            }
+            return ens
 
         embeddings = torch.tensor(
             [list(e.embedding) for e in entries],
             dtype=torch.float32, device=device,
         )
-        labels = cls._derive_labels(model, embeddings)
-        return cls(
+        n = len(entries)
+        stored = [e.metadata.get("true_label") for e in entries]
+        n_stored = sum(1 for v in stored if v is not None)
+
+        if label_source == "true_label":
+            if n_stored != n:
+                missing_idx = next(i for i, v in enumerate(stored) if v is None)
+                raise ValueError(
+                    f"label_source='true_label' requires every entry to "
+                    f"carry metadata['true_label']; {n - n_stored} of "
+                    f"{n} entries are missing it (e.g. id="
+                    f"{entries[missing_idx].id!r}). Use label_source="
+                    f"'auto' to mix derived labels in as a fallback."
+                )
+            labels = torch.tensor(
+                [int(v) for v in stored], dtype=torch.long, device=device,
+            )
+            breakdown = {"true_label": n, "derived": 0, "total": n}
+        elif label_source == "derived":
+            labels = cls._derive_labels(model, embeddings)
+            breakdown = {"true_label": 0, "derived": n, "total": n}
+        else:  # "auto"
+            if n_stored == 0:
+                labels = cls._derive_labels(model, embeddings)
+                breakdown = {"true_label": 0, "derived": n, "total": n}
+            elif n_stored == n:
+                labels = torch.tensor(
+                    [int(v) for v in stored],
+                    dtype=torch.long, device=device,
+                )
+                breakdown = {"true_label": n, "derived": 0, "total": n}
+            else:
+                # Mixed-vintage: derive everything (one batched head
+                # call), then overlay stored labels where present.
+                derived = cls._derive_labels(model, embeddings)
+                labels = derived.clone()
+                for i, v in enumerate(stored):
+                    if v is not None:
+                        labels[i] = int(v)
+                breakdown = {
+                    "true_label": n_stored,
+                    "derived": n - n_stored,
+                    "total": n,
+                }
+
+        ens = cls(
             model=model,
             cold_storage_embeddings=embeddings,
             cold_storage_labels=labels,
             k=k, tau=tau, lambda_blend=lambda_blend,
         )
+        ens._label_source_breakdown = breakdown
+        return ens
 
     @staticmethod
     def _derive_labels(
