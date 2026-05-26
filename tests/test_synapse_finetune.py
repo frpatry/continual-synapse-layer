@@ -236,11 +236,14 @@ def _build_with_cold_storage(
     threshold: float = 0.0,
     quantile: float = 0.25,
     collection: str = "aug_cold_test",
+    num_classes: int = 2,
+    consolidation_mode: str = "aggregate",
+    min_samples_per_class: int = 5,
 ):
     from continual_synapse.cold_storage.store import ColdStorage
     from continual_synapse.consolidation.trigger import ConsolidationTrigger
 
-    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=2)
+    cfg = MLPConfig(input_dim=4, hidden_dim=8, num_classes=num_classes)
     set_seed(0)
     base = MLPClassifier(cfg)
     synapse = SynapseLayer(n_neurons=8, learning_rate=0.1)
@@ -257,6 +260,8 @@ def _build_with_cold_storage(
         cold_storage=store,
         consolidation_trigger=trigger,
         retrieval_k=2,
+        consolidation_mode=consolidation_mode,
+        min_samples_per_class=min_samples_per_class,
     )
     return aug, store, trigger
 
@@ -2138,3 +2143,154 @@ def test_maturity_integration_with_cosine_mode() -> None:
     assert aug.last_maturity == pytest.approx(0.5)
     # effective_alpha = 0.9 * 0.5 = 0.45 ⇒ scale = 1 - 0.45 * 1 = 0.55
     assert scale == pytest.approx(0.55, abs=1e-5)
+
+
+# ---- Path-C: per-class consolidation ----
+
+
+def _prime_for_consolidation(aug: SynapseAugmentedMLP) -> None:
+    """Put the synapse into a state where the trigger fires and a real
+    candidate mask exists. Shared by the per-class tests so they can
+    focus on what changes between aggregate and per_class."""
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(2.0)
+        aug.synapse.evidence.fill_(2.0)
+        aug.synapse.global_step.fill_(50)
+
+
+def test_per_class_consolidation_creates_k_entries() -> None:
+    """A batch with 3 distinct classes (≥ threshold samples each) must
+    produce exactly 3 cold-storage entries, one per class, with means
+    that match the per-class slices of the batch's features."""
+    aug, store, _ = _build_with_cold_storage(
+        threshold=0.0, num_classes=3,
+        consolidation_mode="per_class", min_samples_per_class=5,
+        collection="per_class_3_classes",
+    )
+    _prime_for_consolidation(aug)
+
+    aug.train()
+    # 15 samples, 5 per class — every class meets threshold=5.
+    x = torch.randn(15, 4)
+    y = torch.tensor([0]*5 + [1]*5 + [2]*5, dtype=torch.int64)
+    aug(x)
+    # Snapshot the features the model will consolidate on so we can
+    # verify the per-class means downstream.
+    features = aug._last_features.clone()
+    aug.apply_hebbian_update(training_target=y)
+
+    assert store.count() == 3
+    entries = store.all_entries()
+    by_label = {e.metadata["true_label"]: e for e in entries}
+    assert sorted(by_label) == [0, 1, 2]
+    for c in (0, 1, 2):
+        expected = features[y == c].mean(dim=0)
+        stored = torch.tensor(by_label[c].embedding, dtype=torch.float32)
+        torch.testing.assert_close(stored, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_per_class_min_samples_threshold() -> None:
+    """A class with fewer than min_samples_per_class samples must be
+    silently dropped — no entry for it, no error."""
+    aug, store, _ = _build_with_cold_storage(
+        threshold=0.0, num_classes=3,
+        consolidation_mode="per_class", min_samples_per_class=5,
+        collection="per_class_threshold_skip",
+    )
+    _prime_for_consolidation(aug)
+
+    aug.train()
+    # Class 0: 5 samples (just meets threshold).
+    # Class 1: 6 samples (meets).
+    # Class 2: 2 samples (below threshold → skipped).
+    y = torch.tensor([0]*5 + [1]*6 + [2]*2, dtype=torch.int64)
+    aug(torch.randn(y.numel(), 4))
+    aug.apply_hebbian_update(training_target=y)
+
+    assert store.count() == 2
+    labels = {e.metadata["true_label"] for e in store.all_entries()}
+    assert labels == {0, 1}
+
+
+def test_per_class_no_histogram_written() -> None:
+    """In per_class mode, each entry is class-pure so the histogram is
+    one-hot and uninformative. We deliberately skip writing it; new
+    entries must have neither label_histogram_json nor label_histogram
+    metadata."""
+    aug, store, _ = _build_with_cold_storage(
+        threshold=0.0, num_classes=2,
+        consolidation_mode="per_class", min_samples_per_class=5,
+        collection="per_class_no_histogram",
+    )
+    _prime_for_consolidation(aug)
+
+    aug.train()
+    y = torch.tensor([0]*8 + [1]*8, dtype=torch.int64)
+    aug(torch.randn(y.numel(), 4))
+    aug.apply_hebbian_update(training_target=y)
+
+    assert store.count() == 2
+    for entry in store.all_entries():
+        assert "label_histogram_json" not in entry.metadata
+        assert "label_histogram" not in entry.metadata
+        # true_label must still be present.
+        assert "true_label" in entry.metadata
+
+
+def test_aggregate_mode_unchanged() -> None:
+    """consolidation_mode='aggregate' (the default) must preserve the
+    pre-refactor behaviour: one entry per consolidation event whose
+    embedding is the batch-wide mean, with both true_label (dominant
+    class) and label_histogram_json (full per-class counts) written."""
+    import json
+
+    aug, store, _ = _build_with_cold_storage(
+        threshold=0.0, num_classes=2,
+        # Defaults: consolidation_mode='aggregate', min_samples_per_class=5.
+        collection="aggregate_unchanged",
+    )
+    _prime_for_consolidation(aug)
+
+    aug.train()
+    y = torch.tensor([0]*3 + [1]*5, dtype=torch.int64)
+    aug(torch.randn(y.numel(), 4))
+    features = aug._last_features.clone()
+    aug.apply_hebbian_update(training_target=y)
+
+    assert store.count() == 1
+    entry = store.all_entries()[0]
+    # Embedding = batch-wide mean (NOT per-class).
+    expected = features.mean(dim=0)
+    stored = torch.tensor(entry.embedding, dtype=torch.float32)
+    torch.testing.assert_close(stored, expected, rtol=1e-5, atol=1e-6)
+    # Dominant class is 1 (5 samples vs 3), and the histogram captures
+    # the full distribution — confirms aggregate metadata is preserved.
+    assert entry.metadata["true_label"] == 1
+    hist = json.loads(entry.metadata["label_histogram_json"])
+    assert hist == [3, 5]
+
+
+def test_per_class_strengths_shared_across_class_entries() -> None:
+    """Sibling per-class entries from one consolidation event share the
+    same quantised strengths matrix — verified by the identical
+    base-64 document string. This is what makes per-class cheap:
+    one quantise call, N store calls."""
+    aug, store, _ = _build_with_cold_storage(
+        threshold=0.0, num_classes=3,
+        consolidation_mode="per_class", min_samples_per_class=5,
+        collection="per_class_shared_strengths",
+    )
+    _prime_for_consolidation(aug)
+
+    aug.train()
+    y = torch.tensor([0]*5 + [1]*5 + [2]*5, dtype=torch.int64)
+    aug(torch.randn(y.numel(), 4))
+    aug.apply_hebbian_update(training_target=y)
+
+    entries = store.all_entries()
+    assert len(entries) == 3
+    docs = {e.document for e in entries}
+    assert len(docs) == 1, (
+        f"siblings must share the same strengths document; "
+        f"got {len(docs)} distinct documents"
+    )

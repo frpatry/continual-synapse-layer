@@ -46,7 +46,10 @@ from torch import nn
 from continual_synapse.baselines.naive_finetune import MLPClassifier
 from continual_synapse.cold_storage.compression import CompressionSchedule
 from continual_synapse.cold_storage.store import ColdStorage
-from continual_synapse.consolidation.pipeline import consolidate_to_storage
+from continual_synapse.consolidation.pipeline import (
+    _drain_candidates,
+    consolidate_to_storage,
+)
 from continual_synapse.consolidation.reconstruction import reconstruct_strengths
 from continual_synapse.consolidation.trigger import ConsolidationTrigger
 from continual_synapse.reward.external import ExternalReward
@@ -128,6 +131,9 @@ class SynapseAugmentedMLP(nn.Module):
         familiarity_mode: str = "magnitude",
         # ---- Developmental maturity (experiment 19) ----
         maturity_target_consolidations: int = 0,
+        # ---- Path-C: per-class consolidation ----
+        consolidation_mode: str = "aggregate",
+        min_samples_per_class: int = 5,
     ) -> None:
         super().__init__()
         if synapse.n_neurons != base.config.hidden_dim:
@@ -200,6 +206,18 @@ class SynapseAugmentedMLP(nn.Module):
                 f"maturity_target_consolidations must be >= 0, got "
                 f"{maturity_target_consolidations}"
             )
+        if consolidation_mode not in ("aggregate", "per_class"):
+            raise ValueError(
+                f"consolidation_mode must be 'aggregate' or 'per_class', "
+                f"got {consolidation_mode!r}"
+            )
+        if min_samples_per_class <= 0:
+            raise ValueError(
+                f"min_samples_per_class must be positive, got "
+                f"{min_samples_per_class}"
+            )
+        self.consolidation_mode = str(consolidation_mode)
+        self.min_samples_per_class = int(min_samples_per_class)
         self.base = base
         self.synapse = synapse
         self.modulator = modulator if modulator is not None else SynapseModulation()
@@ -606,35 +624,54 @@ class SynapseAugmentedMLP(nn.Module):
             self.cold_storage is not None
             and self.consolidation_trigger is not None
         ):
-            embedding = features.mean(dim=0).to(torch.float32)
-            true_label: int | None = None
-            label_histogram: list[int] | None = None
-            if training_target is not None and training_target.numel() > 0:
-                targets_long = training_target.detach().to(torch.long).cpu()
-                true_label = int(torch.mode(targets_long).values.item())
-                if self._last_logits is not None:
-                    num_classes = int(self._last_logits.shape[-1])
-                    label_histogram = torch.bincount(
-                        targets_long, minlength=num_classes
-                    ).tolist()
-            outcome = consolidate_to_storage(
-                self.synapse,
-                self.cold_storage,
-                self.consolidation_trigger,
-                activation_embedding=embedding,
-                drain=not self.no_drain_on_consolidate,
-                merge_threshold=self.repeat_consolidation_threshold,
-                task_id=self._current_task_id,
-                true_label=true_label,
-                label_histogram=label_histogram,
+            # Path-C divergence: in per_class mode we group this batch's
+            # (features, training_target) pairs by class and create one
+            # cold-storage entry per class meeting the
+            # min_samples_per_class threshold. Sibling entries created in
+            # the same event share the same trigger-fire gate, the same
+            # candidate mask, and the same quantised strengths/document
+            # (synapse state doesn't change between sibling calls because
+            # we pass drain=False; we drain once explicitly afterwards).
+            # When training_target is None or no class meets the
+            # threshold, per_class silently falls back to aggregate so
+            # existing eval pipelines keep working.
+            use_per_class = (
+                self.consolidation_mode == "per_class"
+                and training_target is not None
+                and training_target.numel() > 0
             )
-            if outcome.fired:
-                self._consolidation_count += 1
-                if outcome.was_merged:
-                    self._merge_count += 1
-                # Mark the retrieval cache as stale so the next
-                # forward picks up the just-archived pattern.
-                self._cache_invalidated = True
+            if use_per_class:
+                self._consolidate_per_class(features, training_target)
+            else:
+                embedding = features.mean(dim=0).to(torch.float32)
+                true_label: int | None = None
+                label_histogram: list[int] | None = None
+                if training_target is not None and training_target.numel() > 0:
+                    targets_long = training_target.detach().to(torch.long).cpu()
+                    true_label = int(torch.mode(targets_long).values.item())
+                    if self._last_logits is not None:
+                        num_classes = int(self._last_logits.shape[-1])
+                        label_histogram = torch.bincount(
+                            targets_long, minlength=num_classes
+                        ).tolist()
+                outcome = consolidate_to_storage(
+                    self.synapse,
+                    self.cold_storage,
+                    self.consolidation_trigger,
+                    activation_embedding=embedding,
+                    drain=not self.no_drain_on_consolidate,
+                    merge_threshold=self.repeat_consolidation_threshold,
+                    task_id=self._current_task_id,
+                    true_label=true_label,
+                    label_histogram=label_histogram,
+                )
+                if outcome.fired:
+                    self._consolidation_count += 1
+                    if outcome.was_merged:
+                        self._merge_count += 1
+                    # Mark the retrieval cache as stale so the next
+                    # forward picks up the just-archived pattern.
+                    self._cache_invalidated = True
 
         # Periodic compression sweep (Phase 4b follow-up). Fires every
         # `compression_sweep_interval` apply_hebbian_update calls when
@@ -720,6 +757,101 @@ class SynapseAugmentedMLP(nn.Module):
         # flag, so non-modulated methods are unaffected.
         self._last_reward = float(reward)
         return reward
+
+    def _consolidate_per_class(
+        self,
+        features: torch.Tensor,
+        training_target: torch.Tensor,
+    ) -> None:
+        """Path-C: group ``features`` by ``training_target`` and create
+        one cold-storage entry per class that meets
+        ``min_samples_per_class``.
+
+        All sibling entries from one event share the same trigger gate
+        (we check ``should_fire`` once up front), the same candidate
+        mask, and the same quantised strengths/document — because
+        ``drain=False`` is passed on every internal call and the
+        synapse state is therefore unchanged across siblings. A single
+        manual drain at the end produces the same final state as one
+        ``drain=True`` consolidation in aggregate mode.
+
+        ``label_histogram_json`` is deliberately not written in
+        per-class entries: each entry is class-pure (one-hot), so the
+        histogram is redundant and only bloats metadata.
+
+        Falls through silently (no consolidation this batch) when the
+        trigger declines, when no class meets the threshold, or when
+        the candidate mask is empty.
+        """
+        if not self.consolidation_trigger.should_fire(self.synapse):
+            return
+
+        # Group this batch by class. unique returns sorted classes; we
+        # iterate in that order so the resulting entry ids/storage
+        # order are deterministic for a fixed seed (useful in tests
+        # and in any diagnostic that lists entries by creation order).
+        targets_long = training_target.detach().to(torch.long).cpu()
+        unique_classes, counts = torch.unique(targets_long, return_counts=True)
+
+        n_fired = 0
+        n_merged = 0
+        for c_val, n_val in zip(unique_classes.tolist(), counts.tolist()):
+            if n_val < self.min_samples_per_class:
+                continue
+            mask_c = training_target.to(targets_long.device) == int(c_val)
+            class_emb = (
+                features[mask_c.to(features.device)]
+                .mean(dim=0)
+                .to(torch.float32)
+            )
+            outcome = consolidate_to_storage(
+                self.synapse,
+                self.cold_storage,
+                self.consolidation_trigger,
+                activation_embedding=class_emb,
+                # force=True bypasses the per-call should_fire check
+                # (we already gated above) so the second-and-later
+                # siblings, which trip the min_steps_between
+                # refractory set by sibling #1's mark_fired, still
+                # write their entry.
+                force=True,
+                # drain=False: keep synapse state intact across
+                # siblings so they all see the same candidate mask
+                # and strengths. A single drain runs after the loop.
+                drain=False,
+                merge_threshold=self.repeat_consolidation_threshold,
+                task_id=self._current_task_id,
+                true_label=int(c_val),
+                # No label_histogram in per_class mode — each entry
+                # is class-pure, so the histogram is one-hot and
+                # carries no extra signal over true_label.
+                label_histogram=None,
+            )
+            if outcome.fired:
+                n_fired += 1
+                if outcome.was_merged:
+                    n_merged += 1
+
+        # Single drain after all siblings, mirroring the aggregate
+        # mode's drain semantics (one event = one drain). When
+        # no_drain_on_consolidate is set, skip it just like aggregate
+        # mode would.
+        if n_fired > 0 and not self.no_drain_on_consolidate:
+            mask = self.consolidation_trigger.candidate_mask(self.synapse)
+            if mask.any():
+                _drain_candidates(self.synapse, mask)
+
+        if n_fired > 0:
+            # Count one bump per sibling stored, matching aggregate
+            # mode's "one cycle = one bump" semantic extended to
+            # multi-entry cycles. Diagnostics that read
+            # consolidation_count are forward-compatible: the count
+            # grows faster in per_class mode because more entries
+            # are produced per event, which is the intended
+            # behaviour.
+            self._consolidation_count += n_fired
+            self._merge_count += n_merged
+            self._cache_invalidated = True
 
     @property
     def compression_sweep_count(self) -> int:
