@@ -9,10 +9,16 @@ from continual_synapse.reward.consistency import ConsistencyReward
 from continual_synapse.reward.external import ExternalReward
 from continual_synapse.reward.mixer import RewardMixer
 from continual_synapse.reward.surprise import SurpriseReward
+from continual_synapse.reward.training_configs import (
+    REWARD_CONFIGS,
+    RewardConfig,
+)
 
 __all__ = [
     "ConsistencyReward",
     "ExternalReward",
+    "REWARD_CONFIGS",
+    "RewardConfig",
     "RewardMixer",
     "SurpriseReward",
     "compute_reward_signal",
