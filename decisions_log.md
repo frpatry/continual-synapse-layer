@@ -6,6 +6,140 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-26] Pivot to dual-substrate episodic architecture
+
+The reward-as-confidence pilot (path D) shipped clean infrastructure
+and a clear empirical result at T=15, n=3. Headline numbers from
+``results/logs/reward_confidence/1779815135_27_T15_path_d.json``:
+
+| config                              | ACC    | Task-0 | Task-N |
+|-------------------------------------|-------:|-------:|-------:|
+| cs_gated_cosine_developmental (baseline) | 0.8143 | 0.8047 | 0.9063 |
+| cs_reward_developmental             | 0.6683 | 0.2004 | 0.9317 |
+| cosine_reward_developmental         | 0.8291 | **0.7317** | 0.8985 |
+| reward_only_static                  | 0.6683 | 0.2004 | 0.9317 |
+
+Two findings, two implications:
+
+1. **The reward signal IS structured.** ``cosine_reward_developmental``
+   beats the baseline on aggregate ACC by +1.5 pp and matches
+   on Task-N (the diagnostic for plasticity preservation), so the
+   per-sample R + count-trigger fix from ``5d525d3`` works as
+   designed. The signal carries usable information about which
+   samples deserve more synapse update.
+2. **But it costs Task-0 retention.** ``cosine_reward_developmental``
+   drops Task-0 by **−7.3 pp** (0.8047 → 0.7317). The reward signal
+   biases the synapse layer toward learning new things — more weight
+   on uncertain/wrong samples — at the cost of holding what's
+   already known. The two gating-disabled variants (``cs_reward``,
+   ``reward_only_static``) collapse Task-0 to ~0.20 because they
+   have no protection mechanism at all; per-sample R alone is not
+   enough to substitute for gating.
+
+So path D doesn't dissolve the plasticity-stability trade-off —
+it just lets us trade more sharply along it. ``cosine_reward`` is a
+new Pareto-frontier point (best aggregate ACC seen so far) but Task-0
+retention still loses to EWC λ=10 (0.834 at T=50 reference), and the
+−7.3 pp Task-0 hit makes it strictly worse than the unchanged
+baseline on the catastrophic-forgetting dimension.
+
+### Architectural diagnosis
+
+Three of our pivots (path A true labels, path C per-class
+consolidation, path D per-sample reward) have iterated on
+**different ways of producing or consuming a signal that influences
+weight updates and a passive cold-storage record**. None has closed
+the EWC Task-0 gap. The recurring failure mode is the same: any
+change that helps the model learn faster bleeds into Task-0
+forgetting; any change that protects Task-0 starves plasticity.
+
+The architectural reading: the current design **conflates two
+responsibilities in the same substrate (the network weights)** —
+the responsibility to compute the right answer for the current
+sample, and the responsibility to remember previous distributions.
+Cosine gating tries to negotiate the trade-off by selectively
+freezing weights; EWC does it via a Fisher-weighted penalty; path D
+tries to shift the negotiation per sample via R. All three are
+trying to make ONE substrate carry both jobs, and the trade-off
+seems to be an artefact of that conflation.
+
+### The pivot
+
+Hypothesis: **separate the substrates**.
+
+- **Compute substrate**: the network weights. Free to learn, no
+  protection mechanisms. Standard backprop on the task loss.
+- **Memory substrate**: an active episodic memory. Stores
+  (embedding, label, task_id) tuples. Grows dynamically when a
+  novel input arrives (gradient-free allocation; cosine distance
+  to existing entries thresholds the decision). At inference,
+  contributes a label distribution that's blended with the
+  model's softmax, with the blend weight scaled by retrieval
+  confidence.
+
+If the plasticity-stability trade-off is an artefact of substrate
+conflation, this separation should dissolve it: the model is free
+to over-write its representation of an old task (catastrophic at
+the weights level), but the cold-storage entries from that task
+remain queryable and contribute at inference whenever a similar
+input arrives. The memory substrate isn't trying to learn from
+gradient signal at all — it just records and retrieves.
+
+### What this pivot is NOT
+
+- It is not just "make cold storage bigger" — that's path C and we
+  showed inflated storage hurts because cosine gating couples
+  storage size to gating saturation.
+- It is not just "use the existing retrieval ensemble" — that one
+  was passive (labels-as-of-now or path-A's true_label) and only
+  consulted at inference; the new memory ACTIVELY GROWS during
+  training based on novelty detection, with no gradient signal.
+- It is not just "abandon the synapse layer" — the synapse layer's
+  Hebbian + cosine-gating + maturity machinery has been the
+  dominant architectural commitment for the whole project; this
+  pivot bets that the entire stack can be replaced by a clean
+  memory substrate.
+
+### What stays from the existing storage line
+
+- The cold-storage backend (Chroma collection wrapped by
+  ``ColdStorage``) and the compression schedule are reusable
+  infrastructure if the new memory needs disk-backing later.
+  Phase 1's first implementation will use in-memory Python lists
+  for simplicity; promoting to ``ColdStorage`` is a follow-up.
+- The retrieval blending math (softmax + cosine-weighted vote,
+  log-back to logit shape) is borrowed directly from
+  ``RetrievalEnsemble``; no need to re-derive.
+- The exp-23 JSON schema stays so the new pilot reads cleanly into
+  ``experiments/24_retention_analysis.py``.
+
+### What gets disabled in the new config
+
+- ``gradient_gating_enabled = False`` (no cosine gating)
+- ``gate_modulation_enabled = False`` (no Hebbian modulator
+  correction at the forward)
+- ``reward_mode = 'constant'`` (no per-sample R)
+- No EWC, no synapse layer at all — base ``MLPClassifier`` only
+
+### Decision criteria for the new pilot (T=15, n=2 first)
+
+- **Strong win**: ACC ≥ baseline AND Task-0 ≥ baseline +5 pp AND
+  memory grows to a reasonable size (50–500 entries for T=15) →
+  green-light T=50, n=5 in a later session.
+- **Moderate**: ACC roughly matches baseline AND Task-0 ≥ baseline
+  by any positive margin. Counts as a win because the base model
+  has zero protection mechanisms — any non-collapse on Task-0
+  proves the memory substrate is doing the retention work.
+- **Concerning**: Task-N collapses (means retrieval is dominating
+  poorly on new tasks). The blend logic or the novelty threshold
+  needs tuning.
+- **Null**: Both ACC and Task-0 worse than baseline → the dual-
+  substrate hypothesis is wrong; retrieval over a free-running
+  model doesn't help and the trade-off is intrinsic to the
+  function we're learning, not to the substrate that holds it.
+
+---
+
 ## [2026-05-26] Path-C pilot — per-class consolidation not the right pivot
 
 Hypothesis from the path-A post-mortem: hard-label retrieval was neutral
