@@ -6,6 +6,103 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-26] Pivot to functional regularization (LwF-style)
+
+After exhaustive testing of the dual-substrate hypothesis — path-A
+(true-label retrieval), path-B (labels-as-of-now retrieval), path-C
+(per-class consolidation), and the episodic dual-substrate line in
+all three of its variants (trainable encoder, trainable encoder +
+re-encoding at task boundaries, frozen contrastive encoder) — all
+post-hoc memory-based approaches fail to preserve Task-0. The best
+achieved across this entire line of work is Task-0 ≈ **0.39**, far
+below the unchanged baseline ``cs_gated_cosine_developmental`` at
+**0.798**.
+
+The pattern across every experiment in this project is now
+unambiguous:
+
+- **Interventions during training preserve knowledge.** Cosine
+  gating (``cs_gated_cosine_developmental``) and EWC are the only
+  two mechanisms that hold Task-0 in the 0.8 range. Both
+  intervene during the gradient step itself — gating scales
+  ``base.parameters()`` gradients down on familiar inputs; EWC
+  adds a Fisher-weighted penalty to the loss. The model's
+  *weight trajectory* is constrained while it learns the current
+  task.
+- **Post-hoc retrieval-based corrections do not.** Path-A's true-
+  label store, path-C's per-class prototypes, the dual-substrate
+  episodic memory (with and without re-encoding), and the frozen
+  contrastive encoder all attempt to recover lost knowledge *at
+  inference time*. The base model's weights are free to drift
+  during training; the recovery mechanism then tries to blend in
+  a corrective signal from stored data. Across every variant, the
+  best Task-0 we've seen is ~0.4. The model has already moved too
+  far in weight space by inference time for an inference-time
+  blend to undo it.
+
+The episodic line surfaced one more piece of the puzzle: a
+**frozen** contrastive encoder produces consistent feature-space
+keys (no drift across continual training), but full-pixel
+permutation as the contrastive augmentation collapses the
+encoder to a near-constant function (Task-0 = 0.251 in the latest
+pilot ``results/logs/episodic/1779821036_28_T15_dual_substrate.json``,
+with memory stuck at 64 entries from task 0 across all 15 tasks).
+The encoder route is empirically dead in the form we tried it.
+
+### The new direction: functional regularization
+
+Learning Without Forgetting (Li & Hoiem, 2017), adapted to the
+continual setting: at the end of each task, sample a fixed number
+of inputs from that task and record the model's **soft output
+predictions** (softmax probabilities) on those inputs. During
+subsequent task training, sample from this functional memory and
+add a knowledge-distillation loss term:
+
+    loss = task_loss(model(x), y)
+         + λ * KL( softmax(model(x_old) / T) || soft_old )
+
+The model's weights are free to move; what's anchored is its
+**function on selected past inputs**. The teacher signal is the
+model itself, frozen at the moment those inputs were last seen.
+
+This is structurally different from every approach we've tried:
+
+- Unlike EWC, it doesn't penalise weight movement per se — only
+  movement that *changes the function* on stored inputs.
+- Unlike cosine gating, it doesn't scale gradients globally; it
+  adds an explicit loss term whose gradient flows through the
+  full model.
+- Unlike the retrieval-ensemble line, it intervenes during
+  training, not at inference. The pattern this session has
+  pounded into the data is that *only training-time
+  interventions hold Task-0*.
+- Unlike the dual-substrate line, the memory isn't keyed against
+  a feature space that might drift; it's keyed against raw
+  inputs and uses the current model to compute the loss. No
+  feature-space alignment problem.
+
+### Hypothesis under test
+
+If "constrain the function, not the weights" is the right abstraction,
+the model should be free to adapt its representation to new tasks
+while preserving its predictive behaviour on past inputs — potentially
+escaping the rigid plasticity-stability trade-off of EWC. The
+composition with cosine gating (``cs_gated_cosine_functional``) is
+the most interesting cell in the comparison: both mechanisms
+intervene during training but on different axes (weight scaling vs
+function anchoring); they may be additive.
+
+If the pilot succeeds at T=15, the next step is a T=50 + λ / temp /
+samples_per_task sweep to characterise the trade-off and compare
+against EWC's Pareto frontier from the Phase B verdict.
+
+If it fails — Task-0 < 0.6 across all functional variants — the
+honest read is that the plasticity-stability trade-off as captured
+in our experiments is intrinsic to the problem as we've defined
+it, not to any specific architectural choice we've made.
+
+---
+
 ## [2026-05-26] Pivot to dual-substrate episodic architecture
 
 The reward-as-confidence pilot (path D) shipped clean infrastructure
