@@ -22,20 +22,62 @@ drifted too far from the consolidation-time state.
 time) or move to a different mechanism entirely. Do not invest more
 seeds in the current path-B pilot — the diagnostic has settled it.
 
-If pivoting to path A, the first concrete steps are:
+### Path A sketch — concrete steps
 
-1. Modify `src/continual_synapse/baselines/synapse_finetune.py`
-   `apply_hebbian_update` to accept a `training_labels` kwarg (already
-   has `training_target`; we'd repurpose or add) and compute the
-   majority class in the batch as the dominant true label.
-2. Modify `src/continual_synapse/consolidation/pipeline.py`
-   `consolidate_to_storage` to accept and store `dominant_label`
-   in entry metadata.
-3. Rebuild scout_a095 checkpoints with the new instrumentation
-   (~70 min for n=3 × T=15, ~5 h for n=3 × T=50).
-4. Re-run exp 25 with a flag that uses `metadata["dominant_label"]`
-   for the ensemble's label vector instead of deriving via
-   `argmax(head(stored))`.
+Path B failed at T=15 with label-derivation accuracy = 18.7%.
+The premise was that the current model head still classifies old
+activations coherently; on a forgotten head it doesn't. Path A
+removes the dependency on the current head by anchoring labels in
+ground truth, captured at consolidation time when the labels are
+still trustworthy.
+
+1. **Capture true_label at consolidation.** Modify the cold-storage
+   consolidation path to take the dominant true label from the
+   batch that triggered the consolidation (majority class across
+   the batch's `y` tensor) and write it into entry metadata.
+   Add the field to `StoredEntry`-equivalent metadata schema with
+   a `None` (or `-1`) default so existing checkpoints stay
+   loadable. Backward-compatible: any code that doesn't pass a
+   label gets the old behaviour.
+2. **Teach `RetrievalEnsemble` to prefer true_label when present.**
+   Add a `label_source` config flag with two values:
+   - `"true_label"` (path A): read each entry's
+     `metadata["true_label"]`, fall back to derived label only when
+     missing (so we can still load older path-B checkpoints).
+   - `"derived"` (path B, current default): existing behaviour
+     — `argmax(model.base.classify(stored_embedding))`.
+3. **Retrain scout_a095 with label storage enabled.** T=15, n=3
+   seeds, ~1.5 h. Save fresh checkpoints alongside the path-B
+   ones (different filename pattern or directory so we don't
+   clobber the existing artifacts).
+4. **Re-run exp 25 evaluation with the new checkpoints.** Same
+   three retrieval configs (`v2_mild`, `v2_moderate`,
+   `v2_aggressive`) + `scout_a095_baseline` anchor. Use
+   `--label-source true_label` (or whatever flag we add).
+5. **Decision gate (same threshold as path B):**
+   - If at least one config shows `Task-0 ≥ baseline + 5 pp`
+     AND aggregate ACC drops `≤ 2 pp`: proceed to T=50 with n=5.
+   - Else: design revision needed (e.g. different blending rule,
+     different similarity metric, per-class normalisation, etc.).
+6. **Re-run exp 24 retention analysis on the new JSON.**
+   Same command as path B, just pointed at the new log file —
+   generates the retention curve and prints the summary table.
+
+**Expected outcome:** with true labels stored at consolidation,
+label quality is anchored in ground truth (100% accuracy at store
+time, doesn't drift with subsequent task training). If the
+embedding space remains semantically meaningful — which the
+gradient-gating system already relies on for its familiarity
+signal — retrieval should now help Task-0 retention measurably
+rather than voting near-random as it did in path B.
+
+If path A also fails the decision gate, the failure mode is
+informative: it would mean the embedding space itself has
+drifted enough that even ground-truth-labelled neighbours no
+longer match query semantics. That points away from
+retrieval-ensemble entirely and toward methods that constrain
+the embedding space directly (e.g. embedding-space regulariser
+during training, parametric memory à la GEM).
 
 ## What completed this session
 
