@@ -69,6 +69,7 @@ from typing import Any, Callable
 
 import chromadb
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -334,6 +335,13 @@ def _train_scout_a095_and_save(
     def on_after_batch(i, task, m, x, y):
         m.apply_hebbian_update()
 
+    def on_task_change(j, task, m):
+        # Critical for the path-B label-derivation diagnostic: tags
+        # every consolidation produced during task j with task_id=j.
+        # Without this, all entries default to task_id=-1 and the
+        # diagnostic can't filter test samples per source task.
+        m.notify_task_change(int(j))
+
     runner = ContinualRunner(
         seed=seed,
         optimizer_factory=lambda p: torch.optim.SGD(
@@ -346,6 +354,7 @@ def _train_scout_a095_and_save(
         record_zero_shot=False,  # we don't need the full upper-triangular eval
         on_after_batch=on_after_batch,
         on_pre_optimizer_step=on_pre_step,
+        on_task_change=on_task_change,
     )
     print(
         f"    training scout_a095_validated  T={T}  seed={seed}  "
@@ -411,6 +420,104 @@ def _bare_model_predict(model: SynapseAugmentedMLP, x: torch.Tensor) -> torch.Te
     with torch.no_grad():
         h = model.base.features(x)
         return model.base.classify(h)
+
+
+# ---------- path-B label-derivation accuracy diagnostic ----------
+
+
+@dataclass
+class LabelDerivationResult:
+    seed: int
+    matches: int
+    total: int
+
+    @property
+    def accuracy(self) -> float:
+        return self.matches / self.total if self.total else float("nan")
+
+
+@torch.no_grad()
+def _compute_label_derivation_accuracy(
+    model: SynapseAugmentedMLP, bench, T: int, batch_size: int,
+    device: str, n_test_samples_per_task: int = 500,
+) -> LabelDerivationResult:
+    """For each stored cold-storage entry, derive its label via
+    ``argmax(model.base.classify(stored_embedding))`` and compare
+    against the true label of the most-similar test sample drawn
+    from the same task.
+
+    Cold storage doesn't carry per-entry true labels (entries are
+    means over batches with mixed classes), so we approximate via:
+      1. ``task_id`` from entry metadata when present;
+         otherwise infer from ``created_at_step // batches_per_task``.
+      2. Pre-compute model features for a sample of test data per
+         task (capped at ``n_test_samples_per_task`` for speed).
+      3. For each entry, cosine-similarity its embedding against the
+         pre-computed test features for its task and take the
+         most-similar sample's true label as the "true label".
+
+    The fraction of entries whose derived label matches the proxy
+    true label tells us whether path B (use the current model's
+    classifier head to label old activation patterns) is viable
+    BEFORE we interpret retrieval-ensemble results. <50% means
+    the head has drifted far enough that path B is unrecoverable.
+    """
+    model.eval()
+
+    cold_storage = model.cold_storage
+    if cold_storage is None or cold_storage.count() == 0:
+        return LabelDerivationResult(seed=-1, matches=0, total=0)
+
+    # Pre-compute per-task test features + labels (capped sample).
+    per_task: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for t, task in enumerate(bench.tasks()):
+        if t >= T:
+            break
+        xs_full, ys_full = task.test.tensors
+        n = min(len(xs_full), n_test_samples_per_task)
+        xs = xs_full[:n].to(device)
+        ys = ys_full[:n].to(device)
+        # Batch the forward so we don't OOM on big test sets.
+        features_chunks: list[torch.Tensor] = []
+        for start in range(0, n, batch_size):
+            stop = min(start + batch_size, n)
+            features_chunks.append(model.base.features(xs[start:stop]))
+        per_task[t] = (torch.cat(features_chunks, dim=0), ys)
+
+    # Approximate "task this entry came from" when task_id isn't tagged.
+    train_set = bench.tasks()[0].train
+    batches_per_task = max(1, math.ceil(len(train_set) / batch_size))
+
+    entries = cold_storage.all_entries()
+    matches = 0
+    total = 0
+    for e in entries:
+        task_id = int(e.metadata.get("task_id", -1))
+        if task_id < 0:
+            created_at = int(e.metadata.get("created_at_step", 0))
+            task_id = max(0, min(created_at // batches_per_task, T - 1))
+        if task_id not in per_task:
+            # Entry tagged with a task outside our T window; skip.
+            continue
+        features_t, labels_t = per_task[task_id]
+        stored = torch.tensor(
+            list(e.embedding), dtype=torch.float32, device=device,
+        )
+        # Cosine similarity vs every test feature for this task.
+        s_norm = F.normalize(stored.unsqueeze(0), dim=-1, eps=1e-12)
+        f_norm = F.normalize(features_t, dim=-1, eps=1e-12)
+        sim = (f_norm @ s_norm.T).squeeze(-1)  # (N,)
+        nearest_idx = int(sim.argmax().item())
+        true_label = int(labels_t[nearest_idx].item())
+        derived = int(
+            model.base.classify(stored.unsqueeze(0))
+            .argmax(dim=-1).item()
+        )
+        total += 1
+        if derived == true_label:
+            matches += 1
+
+    return LabelDerivationResult(seed=-1, matches=matches, total=total)
 
 
 # ---------- JSON output (exp 23 schema) ----------
@@ -523,6 +630,7 @@ class PilotSummary:
     baseline_acc: float
     baseline_task0: float
     rows: list[dict[str, Any]] = field(default_factory=list)
+    label_derivation: list[LabelDerivationResult] = field(default_factory=list)
 
 
 def _format_pilot_summary(summary: PilotSummary) -> str:
@@ -597,6 +705,7 @@ def _run_one_T(
         cfg.name: [] for cfg in _RETRIEVAL_CONFIGS
     }
     successfully_evaluated_seeds: list[int] = []
+    label_derivation_results: list[LabelDerivationResult] = []
 
     for seed in args.seeds:
         print(f"\n  --- seed {seed} ---", flush=True)
@@ -655,6 +764,23 @@ def _run_one_T(
                 f"ACC={cfg_avg:.3f}  Task-0={cfg_row[0]:.3f}",
                 flush=True,
             )
+
+        # ---- Label-derivation accuracy (path-B sanity check) ----
+        t2 = time.time()
+        label_acc = _compute_label_derivation_accuracy(
+            model, bench, T=T,
+            batch_size=args.eval_batch_size, device=args.device,
+        )
+        label_acc.seed = seed
+        label_derivation_results.append(label_acc)
+        print(
+            f"    label derivation (path B) computed in "
+            f"{time.time() - t2:.1f}s   "
+            f"{label_acc.matches}/{label_acc.total} = "
+            f"{label_acc.accuracy * 100:.1f}%",
+            flush=True,
+        )
+
         successfully_evaluated_seeds.append(seed)
 
     # ---- Aggregate + write JSON ----
@@ -704,6 +830,23 @@ def _run_one_T(
         "methods": method_blocks,
         "summaries": summary_blocks,
         "retrieval_configs": [asdict(c) for c in _RETRIEVAL_CONFIGS],
+        "label_derivation_accuracy": {
+            "per_seed": [
+                {
+                    "seed": r.seed,
+                    "matches": r.matches,
+                    "total": r.total,
+                    "accuracy": r.accuracy,
+                }
+                for r in label_derivation_results
+            ],
+            "average_accuracy": (
+                sum(r.accuracy for r in label_derivation_results if r.total > 0)
+                / max(1, sum(1 for r in label_derivation_results if r.total > 0))
+                if any(r.total > 0 for r in label_derivation_results)
+                else float("nan")
+            ),
+        },
     }
     _atomic_write_json(out_path, payload)
     print(f"\n  Wrote results JSON to {out_path}", flush=True)
@@ -734,6 +877,7 @@ def _run_one_T(
         baseline_acc=baseline_acc_mean,
         baseline_task0=baseline_task0_mean,
         rows=summary_rows,
+        label_derivation=label_derivation_results,
     ), out_path
 
 
@@ -757,6 +901,34 @@ def main() -> None:
         summary, out_path = _run_one_T(T, args)
         summaries.append(summary)
         output_paths.append(out_path)
+
+    # ---- Path-B sanity check: label-derivation accuracy ----
+    for s in summaries:
+        if not s.label_derivation:
+            continue
+        print()
+        print("=" * 78)
+        print(f"=== Label derivation accuracy (path B sanity check)  T={s.T} ===")
+        print("=" * 78)
+        finite_results = [r for r in s.label_derivation if r.total > 0]
+        for r in s.label_derivation:
+            if r.total == 0:
+                print(f"seed {r.seed}: N/A (no stored entries)")
+            else:
+                print(
+                    f"seed {r.seed}: {r.accuracy * 100:.1f}% "
+                    f"({r.matches}/{r.total} correctly relabeled)"
+                )
+        if finite_results:
+            avg = sum(r.accuracy for r in finite_results) / len(finite_results)
+            print(f"average: {avg * 100:.1f}%")
+            if avg < 0.50:
+                print(
+                    "  ⚠ average < 50% — path B (use the current head to "
+                    "label old stored embeddings) is unrecoverable. The "
+                    "retrieval-ensemble numbers below are likely uninformative; "
+                    "the approach needs path-A retraining."
+                )
 
     # ---- Headline pilot summary ----
     print()
