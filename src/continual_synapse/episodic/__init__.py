@@ -18,6 +18,12 @@ trade-off may dissolve.
 """
 
 from continual_synapse.episodic.active_memory import ActiveEpisodicMemory
+from continual_synapse.episodic.contrastive_encoder import (
+    ContrastiveEncoder,
+    apply_permutation,
+    info_nce_loss,
+    random_permutation,
+)
 from continual_synapse.episodic.episodic_predictor import EpisodicPredictor
 from continual_synapse.episodic.training_configs import (
     EPISODIC_CONFIGS,
@@ -26,7 +32,11 @@ from continual_synapse.episodic.training_configs import (
 
 __all__ = [
     "ActiveEpisodicMemory",
+    "ContrastiveEncoder",
     "EPISODIC_CONFIGS",
     "EpisodicConfig",
     "EpisodicPredictor",
+    "apply_permutation",
+    "info_nce_loss",
+    "random_permutation",
 ]
