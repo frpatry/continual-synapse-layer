@@ -62,6 +62,7 @@ from continual_synapse.episodic import (  # noqa: E402
     ActiveEpisodicMemory,
     EpisodicConfig,
     EpisodicPredictor,
+    PretrainedContrastiveEncoder,
 )
 from continual_synapse.evaluation.benchmarks import PermutedMNIST  # noqa: E402
 from continual_synapse.evaluation.runner import ContinualRunner, set_seed  # noqa: E402
@@ -130,6 +131,35 @@ def parse_args() -> argparse.Namespace:
         help="Skip the baseline comparison entirely. Useful when "
              "iterating on the episodic config alone.",
     )
+    # ---- Option B: frozen keying encoder ----
+    p.add_argument(
+        "--keying-encoder", choices=["none", "pretrained_contrastive"],
+        default="none",
+        help=(
+            "Keying function the episodic memory uses for "
+            "storage + retrieval. 'none' (default) uses "
+            "base_model.features — bit-identical to pre-Option-B "
+            "behaviour, but the feature space drifts as the base "
+            "model trains. 'pretrained_contrastive' loads a frozen "
+            "encoder from --pretrained-encoder-path (saved by exp "
+            "29) and uses that instead, decoupling the memory's "
+            "feature space from the base model's. Implies "
+            "re-encoding is disabled (frozen encoder ⇒ embeddings "
+            "don't drift)."
+        ),
+    )
+    p.add_argument(
+        "--pretrained-encoder-path", type=Path,
+        default=(
+            _REPO_ROOT / "results" / "pretrained"
+            / "contrastive_encoder.pt"
+        ),
+        help=(
+            "Path to the encoder checkpoint produced by "
+            "experiments/29_pretrain_contrastive_encoder.py. Only "
+            "consulted when --keying-encoder=pretrained_contrastive."
+        ),
+    )
     # ---- Training hyperparameters (mirror scout_a095 / exp 27) ----
     p.add_argument("--epochs-per-task", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=64)
@@ -170,6 +200,32 @@ def parse_args() -> argparse.Namespace:
 # ---------- episodic model builder ----------
 
 
+def _build_keying_encoder(
+    args: argparse.Namespace,
+) -> PretrainedContrastiveEncoder | None:
+    """Return the configured keying encoder, or ``None`` for the
+    default single-substrate behaviour.
+
+    Loads from ``--pretrained-encoder-path`` when
+    ``--keying-encoder=pretrained_contrastive``. Caches the loaded
+    encoder on the args namespace so repeated calls within one run
+    don't re-read the checkpoint from disk.
+    """
+    if args.keying_encoder == "none":
+        return None
+    if args.keying_encoder == "pretrained_contrastive":
+        cached = getattr(args, "_keying_encoder_cache", None)
+        if cached is not None:
+            return cached
+        encoder = PretrainedContrastiveEncoder(args.pretrained_encoder_path)
+        encoder = encoder.to(args.device)
+        args._keying_encoder_cache = encoder
+        return encoder
+    raise ValueError(
+        f"Unknown keying_encoder value: {args.keying_encoder!r}"
+    )
+
+
 def _build_episodic_predictor(
     cfg: EpisodicConfig, args: argparse.Namespace, *,
     num_classes: int, seed: int,
@@ -180,6 +236,11 @@ def _build_episodic_predictor(
     layer, NO modulator, NO reward computer. That's the architectural
     bet: free-running weights paired with an external memory
     substrate.
+
+    When ``args.keying_encoder == "pretrained_contrastive"``, a
+    frozen :class:`PretrainedContrastiveEncoder` is loaded and the
+    memory's feature_dim is taken from that encoder (NOT from
+    args.hidden_dim — the two are conceptually independent now).
     """
     set_seed(seed)
     base = MLPClassifier(
@@ -190,10 +251,17 @@ def _build_episodic_predictor(
             dropout=args.dropout,
         )
     )
+    keying_encoder = _build_keying_encoder(args)
+    if keying_encoder is not None:
+        feature_dim = keying_encoder.feature_dim
+    else:
+        feature_dim = args.hidden_dim
     memory = cfg.build_memory(
-        feature_dim=args.hidden_dim, n_classes=num_classes,
+        feature_dim=feature_dim, n_classes=num_classes,
     )
-    predictor = cfg.build_predictor(base, memory)
+    predictor = cfg.build_predictor(
+        base, memory, keying_encoder=keying_encoder,
+    )
     return base, predictor
 
 
@@ -447,11 +515,18 @@ def _train_episodic_one_seed(
                 "n_entries": int(n_reenc),
                 "wall_time_s": float(elapsed),
             })
-            print(
-                f"    re-encoded {n_reenc} entries after task "
-                f"{task_index} ({elapsed:.1f}s)",
-                flush=True,
-            )
+            # Only emit the per-task log line when re-encoding
+            # actually ran. With a frozen keying_encoder,
+            # re_encode_memory short-circuits to 0 — the banner at
+            # startup already told the operator re-encoding is
+            # disabled in that mode; printing "re-encoded 0
+            # entries" 15 times would just be noise.
+            if n_reenc > 0:
+                print(
+                    f"    re-encoded {n_reenc} entries after task "
+                    f"{task_index} ({elapsed:.1f}s)",
+                    flush=True,
+                )
 
     runner = ContinualRunner(
         seed=seed,
@@ -586,6 +661,22 @@ def main() -> None:
     args.episodic_checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     seeds = list(range(args.seed_base, args.seed_base + args.n_seeds))
+    # Keying-encoder header: choose between "base_model.features"
+    # (default, single substrate) or "pretrained_contrastive" (frozen
+    # encoder from disk). The re-encoding-mode line below mirrors
+    # this — frozen encoder ⇒ re-encoding is a structural no-op.
+    if args.keying_encoder == "pretrained_contrastive":
+        keying_line = (
+            f"Keying encoder: pretrained_contrastive "
+            f"(loaded from {args.pretrained_encoder_path})"
+        )
+        reencode_line = (
+            "Re-encoding mode: DISABLED (frozen keying encoder — "
+            "re_encode_memory short-circuits)"
+        )
+    else:
+        keying_line = "Keying encoder: none (uses base_model.features)"
+        reencode_line = "Re-encoding mode: ENABLED (at task boundaries)"
     print(
         f"Dual-substrate episodic pilot:\n"
         f"  T={args.T}\n"
@@ -596,7 +687,8 @@ def main() -> None:
         f"  baseline ckpt dir={args.baseline_checkpoint_dir}\n"
         f"  episodic ckpt dir={args.episodic_checkpoint_dir}\n"
         f"  output dir={args.output_dir}\n"
-        f"Re-encoding mode: ENABLED (at task boundaries)",
+        f"{keying_line}\n"
+        f"{reencode_line}",
         flush=True,
     )
 

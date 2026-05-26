@@ -73,6 +73,7 @@ class EpisodicPredictor:
         blend_threshold: float = 0.5,
         blend_max: float = 0.5,
         eps: float = 1e-8,
+        keying_encoder: nn.Module | None = None,
     ) -> None:
         if not 0.0 <= blend_threshold <= 1.0:
             raise ValueError(
@@ -87,13 +88,38 @@ class EpisodicPredictor:
         self.blend_threshold = float(blend_threshold)
         self.blend_max = float(blend_max)
         self.eps = float(eps)
+        # Optional frozen keying encoder for memory storage/retrieval.
+        # When None (default), the predictor uses base_model.features
+        # for both classification AND memory query — the original
+        # behaviour. When set (e.g. a PretrainedContrastiveEncoder),
+        # the memory uses the keying encoder's stable feature space
+        # while the base model's own features still drive
+        # classification. This is the Option-B dual-substrate fix
+        # for feature drift: separate the "compute" feature space
+        # (base_model, trainable) from the "memory" feature space
+        # (keying_encoder, frozen).
+        self.keying_encoder = keying_encoder
 
     # ---- feature extraction / classification (small adapters) ----
 
     def feature_extract(self, x: torch.Tensor) -> torch.Tensor:
-        """Penultimate-layer features. Uses the MLP's ``features(x)``
-        method directly so the synapse-augmented variant's modulator-
-        corrected features can't sneak in by mistake."""
+        """Memory-query features.
+
+        When ``keying_encoder`` is set, returns its output — this is
+        the stable feature space that memory storage and retrieval
+        both live in. When ``keying_encoder`` is ``None`` (default),
+        falls back to ``base_model.features(x)`` (the original
+        behaviour, bit-identical to pre-Option-B).
+
+        Note: this is **not** the same as ``base_model.features(x)``
+        when a keying encoder is configured. The classification
+        path inside :meth:`predict` still uses
+        ``base_model.features`` directly — the base model's head was
+        trained on its own features, so feeding it the keying
+        encoder's outputs would break the classifier.
+        """
+        if self.keying_encoder is not None:
+            return self.keying_encoder(x)
         return self.base_model.features(x)
 
     def classify(self, features: torch.Tensor) -> torch.Tensor:
@@ -108,18 +134,44 @@ class EpisodicPredictor:
         """Return blended logits (technically log-probabilities) for
         the input batch. See module docstring for the blend formula.
 
+        Two feature spaces flow through this method when a frozen
+        ``keying_encoder`` is configured:
+
+        - **Classification path**: ``base_model.features(x)`` →
+          ``base_model.classify(...)``. The base classifier was
+          trained on its own features; feeding it anything else
+          breaks the head.
+        - **Memory query path**: ``self.feature_extract(x)``, which
+          routes to ``keying_encoder(x)`` when set, otherwise the
+          base features. Memory storage and retrieval must share
+          this space.
+
+        When no keying encoder is set, both paths happen to use the
+        same base features — that's the original (bit-identical-
+        to-pre-Option-B) behaviour.
+
         The base model is forced into ``eval()`` for the duration so
-        dropout / batchnorm don't contaminate the retrieval features;
-        the prior ``training`` flag is restored on exit.
+        dropout / batchnorm don't contaminate the classification or
+        retrieval features; the prior ``training`` flag is restored
+        on exit.
         """
         was_training = self.base_model.training
         self.base_model.eval()
         try:
-            features = self.feature_extract(x)
-            logits_model = self.classify(features)
+            # Classification path — always uses base_model.
+            base_features = self.base_model.features(x)
+            logits_model = self.base_model.classify(base_features)
             model_probs = F.softmax(logits_model, dim=-1)
 
-            retrieval_probs, confidence = self.memory.retrieve(features)
+            # Memory query path — uses keying_encoder when set, else
+            # reuses the base features we just computed (no double
+            # forward).
+            if self.keying_encoder is not None:
+                query_features = self.keying_encoder(x)
+            else:
+                query_features = base_features
+
+            retrieval_probs, confidence = self.memory.retrieve(query_features)
             # Make sure retrieval output lives on the same device as
             # the model's outputs (the memory keeps embeddings on CPU
             # by default).
@@ -201,8 +253,19 @@ class EpisodicPredictor:
         dropout. The previous training flag is restored on exit so a
         re-encode in the middle of a training loop doesn't leak.
 
-        Returns the number of entries re-encoded.
+        Short-circuits to ``0`` when a frozen ``keying_encoder`` is
+        configured: by construction, a frozen encoder produces the
+        same output for the same raw input on every call, so
+        re-encoding can't change the stored embeddings. The caller
+        is welcome to invoke this unconditionally — the no-op fast
+        path is cheaper than gating in callers.
+
+        Returns the number of entries re-encoded (0 when nothing
+        was done, either because the memory is empty or because
+        the encoder is frozen).
         """
+        if self.keying_encoder is not None:
+            return 0
         n = len(self.memory)
         if n == 0:
             return 0

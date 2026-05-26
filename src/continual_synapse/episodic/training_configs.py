@@ -66,13 +66,27 @@ class EpisodicConfig:
         )
 
     def build_predictor(
-        self, base_model, memory: ActiveEpisodicMemory
+        self,
+        base_model,
+        memory: ActiveEpisodicMemory,
+        keying_encoder=None,
     ) -> EpisodicPredictor:
+        """Build the predictor wrapping ``base_model`` and ``memory``.
+
+        ``keying_encoder`` (optional) is a frozen
+        :class:`PretrainedContrastiveEncoder` (or any Module with
+        the same ``forward(x) -> features`` contract). When passed,
+        the memory's query feature space is the encoder's output;
+        the base model's own features still drive classification.
+        ``None`` (default) keeps the pre-Option-B single-substrate
+        behaviour.
+        """
         return EpisodicPredictor(
             base_model=base_model,
             memory=memory,
             blend_threshold=self.blend_threshold,
             blend_max=self.blend_max,
+            keying_encoder=keying_encoder,
         )
 
     def make_after_batch(
