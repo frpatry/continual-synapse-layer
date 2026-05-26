@@ -1,4 +1,4 @@
-# Session handoff — 2026-05-26 (path-C verdict + reward-as-confidence pivot)
+# Session handoff — 2026-05-26 (reward-as-confidence infrastructure ready)
 
 ## Where we are
 
@@ -30,8 +30,7 @@ quality dead end.
 
 ## What ships in this session (incremental, all committed)
 
-Three commits land the architecture work and one ships the
-verdict:
+Storage-line work:
 
 - `78f514c` — path-A step 1: ``true_label`` + ``label_histogram``
   captured at consolidation time; backward-compatible.
@@ -41,8 +40,42 @@ verdict:
   retrieval neutral, decision-criterion fail.
 - `1885443` — path-C step 1: ``consolidation_mode="per_class"``
   refactor + 5 tests; aggregate mode bit-identical.
-- (this commit) — path-C verdict documented; SESSION_HANDOFF
-  pivots to reward-as-confidence.
+- `a5e6b54` — exp 25 wiring for ``--consolidation-mode`` +
+  storage diagnostics (used by the partial path-C pilot).
+- `90702c0` — path-C verdict documented; pivot to reward
+  direction.
+
+Reward-as-confidence infrastructure (Phases 1–4 of the new line):
+
+- `b9fcc26` — utility module
+  ``src/continual_synapse/reward/confidence_reward.py``:
+  ``compute_reward_signal``, ``normalize_reward_batch``,
+  ``developmental_alpha``. 8 unit tests.
+- `5665e5c` — ``apply_hebbian_update`` integration:
+  ``reward_signal`` + ``reward_mode`` kwargs. Constant mode
+  bit-identical to pre-path-D. Sqrt-pre-weighting gives the
+  exact ``Σ_i R_i a_i a_i.T / B`` math without a synapse-layer
+  API change. Adds ``current_maturity`` property (live
+  recompute, independent of ``apply_gradient_gating``'s cache —
+  required for gating-disabled configs). 4 new tests.
+- `bf18661` — registry
+  ``src/continual_synapse/reward/training_configs.py``:
+  ``REWARD_CONFIGS`` dict with four named entries (baseline +
+  three reward variants). Each ``RewardConfig.make_callbacks()``
+  returns ready ``on_pre_optimizer_step / on_after_batch /
+  on_task_change`` closures. Smoke-tested at T=2 n=1 on a
+  synthetic 4-class blob benchmark: all four configs reach
+  ACC = 1.000.
+- `5cf0030` — driver script
+  ``experiments/27_reward_as_confidence_eval.py``. Exp-23-
+  compatible output JSON (consumable by
+  ``experiments/24_retention_analysis.py`` unchanged). Adds the
+  Task-N final ACC plasticity diagnostic and the per-event
+  reward variance recorder (early / mid / late summaries +
+  late-collapse warning). Script is **not run** in this session
+  — manual command below.
+- (this commit) — final handoff update with running state and
+  decision criteria.
 
 ## Immediate next direction — reward-as-confidence
 
@@ -71,10 +104,10 @@ baseline):
 3. ``reward_only_static``: reward signal ON with α = 0.5 constant
    — ablates the developmental component
 
-The infrastructure for this lands in subsequent commits in this
-same session. The experiment itself is **not run** in-session —
-you trigger it manually in a terminal (see "Running the pilot"
-below).
+The infrastructure has now landed (commits `b9fcc26`, `5665e5c`,
+`bf18661`, `5cf0030` above). The experiment itself is **not run**
+in-session — you trigger it manually in a terminal (see "Running
+the pilot" below).
 
 ## What's been kept from the dead-end paths
 
@@ -191,19 +224,34 @@ closes the +21.5 pp gap.
 ## Files of interest
 
 - ``src/continual_synapse/baselines/synapse_finetune.py`` —
-  ``apply_hebbian_update``, ``SynapseAugmentedMLP``, where the
-  reward signal integrates next.
-- ``src/continual_synapse/reward/confidence_reward.py`` (new this
-  session, Phase 1) — the per-sample R utility.
+  ``apply_hebbian_update`` (now with ``reward_signal`` +
+  ``reward_mode`` kwargs), ``SynapseAugmentedMLP`` (now exposing
+  ``current_maturity``).
+- ``src/continual_synapse/reward/confidence_reward.py`` (new
+  this session) — the per-sample R utility:
+  ``compute_reward_signal``, ``normalize_reward_batch``,
+  ``developmental_alpha``.
+- ``src/continual_synapse/reward/training_configs.py`` (new this
+  session) — ``REWARD_CONFIGS`` registry + ``RewardConfig``
+  dataclass with ``.make_callbacks()`` factory.
 - ``experiments/27_reward_as_confidence_eval.py`` (new this
-  session, Phase 4) — the training + eval driver.
+  session) — the training + eval driver. Exp-23-compatible
+  output JSON; sidecar carrying per-consolidation reward
+  variance.
 - ``src/continual_synapse/inference/retrieval_ensemble.py`` —
-  unchanged; the retrieval line is closed but the code stays.
+  unchanged; retrieval line is closed but code stays.
 - ``decisions_log.md`` — full narrative for paths A / B / C
   and the rationale for the reward pivot.
 
 ## Suite status
 
-Will be 407+ tests passing after this session (399 before phase
-1; +8 reward-utility tests; +3 reward-integration tests; +0
-exp-27 tests since the script is not run). No new dependencies.
+**411 tests passing** at the end of this session:
+
+| baseline | + Phase 1 reward utility | + Phase 2 integration | total |
+|---:|---:|---:|---:|
+| 399 | +8 | +4 | 411 |
+
+(Phase 3 added one module + smoke test, no unit tests. Phase 4
+added the eval script; per the user's spec it is not exercised
+by the test suite — manual run only.) No new dependencies
+introduced this session.
