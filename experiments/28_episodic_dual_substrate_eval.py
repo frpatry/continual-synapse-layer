@@ -420,6 +420,33 @@ def _load_episodic_checkpoint(
     base.load_state_dict(ckpt["model_state_dict"])
     base.eval()
     mem_state = ckpt["memory"]
+    # Refuse to load a memory whose stored embeddings were keyed in
+    # a different feature space than the predictor is currently
+    # configured for. Without this guard, the mismatch only surfaces
+    # at the first ``memory.retrieve`` call as a cryptic matmul
+    # shape error. Common cause: the operator switched
+    # ``--keying-encoder`` between runs but didn't clear stale
+    # checkpoints in ``--episodic-checkpoint-dir``.
+    stored_feature_dim = int(
+        mem_state.get("feature_dim", predictor.memory.feature_dim)
+    )
+    if stored_feature_dim != predictor.memory.feature_dim:
+        raise RuntimeError(
+            f"Episodic checkpoint at {path} stores {stored_feature_dim}-dim "
+            f"embeddings, but the current predictor's memory is configured "
+            f"for {predictor.memory.feature_dim}-dim "
+            f"(keying_encoder={args.keying_encoder!r}). The two are "
+            f"incompatible. Either:\n"
+            f"  - delete the stale checkpoint:\n"
+            f"      rm {path}\n"
+            f"    and re-run (the script will retrain under the new "
+            f"keying encoder), or\n"
+            f"  - pass --keying-encoder matching the checkpoint's "
+            f"original config (the dimension hints at the encoder: "
+            f"{stored_feature_dim} usually means a trainable encoder "
+            f"with hidden_dim={stored_feature_dim}; smaller dims like "
+            f"128/64 are typical pretrained-encoder feature_dims)."
+        )
     # raw_inputs absent on pre-Phase-1 episodic checkpoints; an
     # empty default lets older artifacts still load (the memory's
     # embeddings work for retrieval; re_encode_all would no-op
