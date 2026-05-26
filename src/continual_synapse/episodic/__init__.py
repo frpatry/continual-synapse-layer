@@ -18,6 +18,6 @@ trade-off may dissolve.
 """
 
 from continual_synapse.episodic.active_memory import ActiveEpisodicMemory
+from continual_synapse.episodic.episodic_predictor import EpisodicPredictor
 
-__all__ = ["ActiveEpisodicMemory"]
-# ``EpisodicPredictor`` is added by Phase 2.
+__all__ = ["ActiveEpisodicMemory", "EpisodicPredictor"]
