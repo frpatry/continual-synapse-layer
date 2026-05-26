@@ -1,253 +1,240 @@
-# Session handoff — 2026-05-26 (frozen-encoder pretraining ready)
+# Session handoff — 2026-05-26 (functional regularization, Phase F infrastructure ready)
 
 ## Where we are
 
-The dual-substrate architecture is implemented and partially tested.
-What we've learned, in order:
+The dual-substrate / retrieval-ensemble line is closed. Across path-A
+(true labels), path-B (labels-as-of-now), path-C (per-class
+prototypes), and the episodic dual-substrate line in three variants
+(trainable encoder, trainable + re-encoding, frozen contrastive
+encoder), every post-hoc memory approach failed to preserve Task-0.
+The best across the entire line is **Task-0 ≈ 0.39**, vs the
+unchanged baseline ``cs_gated_cosine_developmental`` at **0.798**.
 
-1. **Substrate separation makes the system viable** but doesn't
-   automatically dissolve the plasticity-stability trade-off. The
-   first pilot (`results/logs/episodic/1779817131_28_T15_dual_substrate.json`,
-   `blend_max=0.5`, no re-encoding) showed Task-0 = 0.218 — much
-   worse than baseline 0.798.
-2. **Feature drift in the trainable encoder is real.** Adding
-   re-encoding at task boundaries
-   (`results/logs/episodic/1779818599_28_T15_dual_substrate.json`,
-   `blend_max=1.0`, re-encoding ON) lifted Task-0 a bit (0.389) but
-   killed Task-N (0.755, down from 0.928). Diagnostic from the run:
-   ```
-   per-task memory size: t0=92, t1=92, t2=92, ..., t11=92, t12=101, t13=101, t14=103
-   ```
-   The trainable encoder's feature space drifts so heavily that
-   tasks 1-11 register as ≤ novelty_threshold against the existing
-   memory — so the store is dominated by task-0 prototypes, and
-   high `blend_max` then over-weights stale task-0 retrieval on
-   every input.
-3. **Pivot diagnosis**: the keying function for the memory must be
-   stable across continual training. A trainable encoder will
-   always drift; we need a frozen one.
+The pattern across the whole project is now unambiguous:
 
-The new direction (Option B): pretrain a **permutation-invariant**
-encoder via self-supervised contrastive learning on raw MNIST, then
-freeze it and use it as the keying function for the episodic
-memory. The base classifier still trains freely; the memory's
-feature space is locked in by construction.
+- **Interventions during training preserve knowledge.** Cosine
+  gating (``cs_gated_cosine_developmental``) and EWC hold Task-0
+  in the 0.8 range. Both intervene in the gradient step itself —
+  gating scales ``base.parameters()`` gradients down on familiar
+  inputs; EWC adds a Fisher-weighted penalty to the loss.
+- **Post-hoc retrieval-based corrections do not.** Every variant
+  that tried to recover lost knowledge at inference time, with the
+  base model's weights free to drift during training, capped at
+  ~0.4 Task-0.
 
-## Why permutation-invariant pretraining?
+The new pivot, codified in the latest decisions_log entry: **Learning
+Without Forgetting (Li & Hoiem 2017)**, adapted to the continual
+setting. Store ``(input, soft_target)`` pairs at the end of each
+task; during subsequent task training, add a knowledge-distillation
+loss against the stored soft targets. The model's weights are free
+to move; what's anchored is its **function on selected past inputs**.
 
-Permuted-MNIST defines every task as a different random permutation
-of the 784 input pixels. If the encoder is **invariant to those
-permutations** by design, then "same digit under different
-permutations" maps to nearby points in feature space — which is
-exactly the inter-task geometry the memory needs to preserve. The
-pretraining objective makes this invariance the explicit loss:
-two random perms of the same image are positive pairs in a SimCLR
-InfoNCE loss.
-
-This is methodologically clean: no future-task leakage (we only
-use raw MNIST, which we've always had access to as prior
-knowledge), no peeking at the continual benchmark's labels, no
-synthetic data hacks.
+This is structurally a training-time intervention — the regulariser's
+gradient flows through the loss into all the model's weights at the
+same step the task gradient does. But its restoring force acts on
+function rather than weights, which is the part EWC arguably gets
+wrong. The composition ``cs_gated_cosine_functional`` is the most
+interesting cell: both mechanisms intervene during training but on
+different axes (weight scaling vs function anchoring); they may be
+additive.
 
 ## What ships in this session (incremental, all committed)
 
-Six prior commits + four new ones land the frozen-encoder line:
+Three commits land the functional-reg line:
 
-- `96244cb` — Phase 0: dual-substrate pivot doc + decisions_log
-- `342b3c4` — Phase 1: ActiveEpisodicMemory + 8 tests
-- `7057d6f` — Phase 2: EpisodicPredictor + 6 tests
-- `56fe242` — Phase 3: cs_episodic_dual_substrate config
-- `118ddba` — Phase 4: exp 28 driver (not run in-session)
-- `864d773` — Phase 5: handoff update
-- `65ca031` — feature-drift fix Phase 1: raw_inputs + re_encode_all + 5 tests
-- `4841649` — feature-drift fix Phase 2: re-encode wired into exp 28
-- (new) `646c845` — Option B Phase 1: ContrastiveEncoder + InfoNCE
-  + experiments/29 pretraining script + 6 tests
-- (new) `34ed2ef` — Option B Phase 2: PretrainedContrastiveEncoder
-  wrapper + 3 tests
-- (new) `fab71d4` — Option B Phase 3: keying_encoder wired into
-  EpisodicPredictor + exp 28 (smoke-tested at T=2)
-- (this commit) — Option B Phase 4: handoff update
+- `1399b4a` — Phase 0: pivot rationale + decisions_log entry
+  consolidating the "interventions during training work" /
+  "post-hoc don't" pattern across all the prior architectures.
+- `6abbcfc` — Phase 1: ``FunctionalMemory`` + ``distillation_loss``
+  utility module with the Hinton T² rebalancing. 7 unit tests.
+- `fb7b3ee` — Phase 2: ``experiments/30_functional_regularization_eval.py``
+  driver. Three configs (baseline reload, ``cs_functional_only``,
+  ``cs_gated_cosine_functional``). Custom training loop with the
+  per-batch ``task_loss + λ·reg_loss`` composition. Smoke-tested
+  at T=2 n=1.
 
-## Running the pilot (two commands, in order)
+The earlier dual-substrate / episodic infrastructure (commits
+through `90dbd78`) all stay in the codebase — `src/continual_synapse/episodic/`
+is intact, exp 28 + exp 29 still work, the contrastive encoder
+checkpoint at ``results/pretrained/contrastive_encoder.pt`` is left
+on disk. The new functional-reg line is purely additive and lives
+under ``src/continual_synapse/functional/``.
+
+## Running the pilot
 
 ```bash
 source .venv/bin/activate
-
-# Step 1 — pretrain the frozen encoder. Run once.
-python experiments/29_pretrain_contrastive_encoder.py --epochs 50
-
-# Step 2 — continual eval with the frozen encoder as the memory's
-# keying function.
-python experiments/28_episodic_dual_substrate_eval.py \
-    --T 15 --n_seeds 2 --keying-encoder pretrained_contrastive
+python experiments/30_functional_regularization_eval.py --T 15 --n_seeds 2
 ```
 
-**Important:** the venv must be activated first — the system has
-no ``python`` on PATH outside the venv.
+(The venv must be activated first — the system has no ``python`` on
+PATH outside the venv.)
 
-### Step 1 — what to expect from `experiments/29`
+ETA: at T=2 n=1, ``cs_functional_only`` took 3.4s, ``cs_gated_cosine_functional``
+took 40s. Extrapolating to T=15 n=2 and adding the baseline reload:
 
-At the end of pretraining the script runs three sanity-check
-assertions:
+- cs_gated_cosine_developmental (reload from disk + eval): ~5s × 2 seeds
+- cs_functional_only (train + eval): ~30s × 2 seeds
+- cs_gated_cosine_functional (train + eval, synapse + LwF overhead): ~5 min × 2 seeds
 
-```
-linear-probe MNIST test accuracy: 0.XX  (floor 0.90)
-same-digit cross-perm sim:       0.XX  (floor 0.50)
-gap (same − different):           0.XX  (floor 0.20)
-```
+**Total ETA: ~12 minutes.**
 
-If any of these fail, the script raises ``AssertionError`` but
-**still saves the checkpoint** so you can inspect it. Expected
-ballpark on CPU at 50 epochs:
+## What to watch in the printed output
 
-- linear-probe ≥ 0.95 (MNIST is easy enough that a frozen
-  contrastive encoder with a single linear head should clear it)
-- same-digit similarity ≥ 0.70 (the contrastive objective directly
-  optimises this)
-- gap ≥ 0.30 (different-digit pairs are negatives in the loss; if
-  the encoder collapsed all classes to one cluster, the gap would
-  be near 0 — the assertion catches that failure mode)
-
-ETA on CPU: 10–15 minutes at default `--epochs 50`. Outputs:
-``results/pretrained/contrastive_encoder.pt`` (~few MB).
-
-### Step 2 — what to expect from `experiments/28`
-
-The startup banner should now show:
+The headline summary looks like:
 
 ```
-Keying encoder: pretrained_contrastive (loaded from ...)
-Re-encoding mode: DISABLED (frozen keying encoder — re_encode_memory short-circuits)
+=== Functional regularization pilot — T=15, n=2 ===
+config                              ACC     Task-0    Task-N    FGT     memory
+cs_gated_cosine_developmental      0.815    0.798     0.906    +0.11   N/A (ref)
+cs_functional_only                 X.XXX    X.XXX     X.XXX    X.XX    1500 avg
+cs_gated_cosine_functional         X.XXX    X.XXX     X.XXX    X.XX    1500 avg
 ```
 
-The per-task ``re-encoded N entries`` lines won't appear (frozen
-encoder ⇒ structural no-op; the print is suppressed in this mode).
-The memory growth pattern is the key diagnostic — at the end you
-should see something like:
+Per-seed diagnostics also print:
 
-```
-per-task memory size: t0=N0, t1=N1, ..., t14=N14
-```
+- **per-task memory growth**: ``t0=+100(100), t1=+100(200), ..., t14=+100(1500)``.
+  Exactly 100 entries should be added at every task end — confirms
+  ``record_task_end`` fires correctly.
+- **avg reg_loss per task**: should be 0 on task 0 (empty memory)
+  and strictly positive on tasks 1..N (distillation active against
+  stored soft targets). The first non-zero value lands at task 1.
+- **per-task avg task loss**: should track the usual MNIST training
+  curve.
 
-**Uniform growth across all 15 tasks** is the dual-substrate
-hypothesis confirmed: the frozen encoder maps different-perm
-inputs to different feature regions, so the novelty gate fires
-correctly on every task. If memory grows only on task 0 (like the
-trainable-encoder runs), the encoder isn't permutation-invariant
-enough and we'd need to retrain it.
+The smoke at T=2 n=1 produced exactly this pattern (memory grew
+t0=+100, t1=+100; reg_loss=0 on task 0, ~0.006-0.008 on task 1).
 
-ETA: similar to the previous pilot (~12 min at T=15, n=2 on CPU).
-Maybe slightly faster because re-encoding is disabled.
+## Decision criteria
 
-## Decision criteria for the Option B pilot
+- **Strong win**: Either functional variant gives Task-0 ≥ baseline
+  (0.798) AND ACC ≥ 0.78 → functional regularisation works in
+  isolation or composition. Proceed to a T=50 + hyperparameter
+  sweep in a later session.
+- **Composition bonus**: if ``cs_gated_cosine_functional`` beats
+  **both** ``cs_gated_cosine_developmental`` and ``cs_functional_only``,
+  the two mechanisms are additive. That's a publishable composition
+  finding on its own.
+- **Moderate**: Task-0 in [0.75, 0.79] AND ACC ≥ 0.78 → roughly
+  matches baseline; tuning needed (sweep ``--lambda-reg``,
+  ``--samples-per-task``, ``--temperature``).
+- **Null**: Task-0 < 0.60 for both functional variants → functional
+  regularisation is insufficient at this scale on this benchmark.
+  Document the negative result.
 
-- **Strong win**: ACC ≥ 0.78 AND Task-0 ≥ 0.70 AND memory grows
-  uniformly across all 15 tasks → the dual-substrate hypothesis is
-  confirmed with rigorous methodology. Worth investing in T=50
-  n=5 in a later session.
-- **Moderate**: Task-0 ≥ 0.55 with uniform memory growth → the
-  architecture works but needs tuning (sweep `--blend-max`,
-  `--novelty-threshold`).
-- **Null**: Task-0 ≤ 0.40 OR memory still concentrates in Task 0
-  → the encoder isn't permutation-invariant enough. First check
-  the exp-29 sanity numbers (linear probe accuracy, same-digit
-  similarity, gap). If those passed, the issue is downstream —
-  maybe the encoder is permutation-invariant on raw MNIST but the
-  retrieval threshold needs lowering, or the InfoNCE temperature
-  needs tuning.
+## Hyperparameters to sweep if the pilot is positive
 
-## Reference numbers to compare against
+The three knobs most likely to matter:
 
-| pilot | ACC | Task-0 | Task-N | memory growth pattern |
-|---|---:|---:|---:|---|
-| baseline (cs_gated_cosine_developmental) | 0.816 | 0.798 | 0.906 | n/a |
-| dual-substrate, blend_max=0.5, **trainable encoder, no re-encoding** | 0.666 | 0.218 | 0.931 | unknown |
-| dual-substrate, blend_max=0.5, **trainable encoder, no re-encoding** (rerun) | 0.692 | 0.341 | 0.928 | unknown |
-| dual-substrate, blend_max=1.0, **trainable encoder, re-encoding ON** | 0.589 | 0.389 | 0.755 | task-0-dominated (92 entries through task 11) |
-| **dual-substrate, blend_max=0.5 (default), pretrained_contrastive keying** | **TBD** | **TBD** | **TBD** | **TBD — operator runs** |
+- ``--lambda-reg`` ∈ {0.5, 1.0, 2.0}: balance between task loss
+  and distillation. Higher → more retention, less plasticity. The
+  default 1.0 weights them equally.
+- ``--samples-per-task`` ∈ {50, 100, 300}: how much of each task
+  to remember. Bigger memory = more rehearsal coverage but more
+  compute per training step. The default 100 → 1500 entries at
+  T=15, manageable on CPU.
+- ``--temperature`` ∈ {1.0, 2.0, 4.0}: distillation softness.
+  Higher temperature exposes more inter-class similarity structure
+  in the teacher signal. The default 2.0 matches Hinton's
+  original paper. ``T=1`` reduces to plain KL between
+  unsoftened distributions; ``T=4`` flattens substantially.
 
-The operator's question to answer: does the pretrained_contrastive
-row push Task-0 from ~0.3-0.4 toward ≥ 0.55 (moderate) or ≥ 0.70
-(strong)? AND does the memory grow on every task?
+The composition config ``cs_gated_cosine_functional`` has more
+hyperparameter interaction (gating's ``α``, maturity target, all
+the scout_a095 knobs). The sensible v1 sweep keeps those at the
+scout_a095 defaults and varies only the LwF hyperparameters.
 
-## What's been kept across the storage-line work
+## Two integration bugs surfaced + fixed during smoke
 
-The path-A / path-B / path-C / path-D / reward / re-encoding
-infrastructure all remains in the codebase. None of the new files
-shadow the old; the new line lives entirely under
-``src/continual_synapse/episodic/`` and
-``experiments/28_*``, ``experiments/29_*``. All test changes are
-additive.
+These are listed in the Phase 2 commit message but worth flagging
+here too in case anyone hits a related issue:
 
-## What's explicitly NOT done in this pilot
+1. **``_last_features`` cache pollution** — ``SynapseAugmentedMLP.forward``
+   updates ``_last_features`` and ``_last_logits`` on every call.
+   The composition config's memory forward (``model(x_old)``) would
+   overwrite the task batch's cached values, so the subsequent
+   ``apply_gradient_gating`` + ``apply_hebbian_update`` would
+   scale gradients on the *memory* batch's features rather than
+   the *current task*'s. Fixed by snapshotting + restoring the
+   caches around the memory forward.
+2. **Multi-pass observation buffer pollution** — every training-mode
+   forward on a ``SynapseAugmentedMLP`` pushes ``n_passes`` (=5)
+   activation observations into the synapse's buffer. The buffer's
+   batched stack+mean step requires all observations to share a
+   shape. The memory forward (and ``record_task_end``'s 100-sample
+   snapshot) would leave differently-shaped observations in the
+   buffer that crashed the next task's training forward. Fixed by
+   forcing ``model.eval()`` around both the per-batch memory
+   forward and the end-of-task snapshot — eval mode gates the
+   observation hook on ``self.training``, so the buffer stays
+   clean. Gradients still flow through the memory forward.
 
-- The frozen encoder uses raw MNIST. The continual benchmark uses
-  permuted MNIST. They share the digit-class label space but no
-  permutation info — the encoder doesn't see the benchmark's
-  specific permutations. This is the methodological discipline
-  the user called out: no future-task leakage.
-- No fine-tuning of the encoder during continual training. The
-  frozen contract is structural (`PretrainedContrastiveEncoder.train()`
-  is overridden to no-op), so even a stray `predictor.train()`
-  call can't accidentally re-enable gradients on the encoder.
-- Re-encoding is disabled in this mode. A frozen encoder produces
-  identical output every call, so the round-trip is a no-op by
-  construction. `predictor.re_encode_memory()` short-circuits to
-  return 0 immediately when `keying_encoder` is set.
+## Reference numbers for the comparison
+
+Baseline ``cs_gated_cosine_developmental`` from the path-D pilot at
+T=15 n=3: **ACC=0.8143, Task-0=0.8047, Task-N=0.9063**. Exp 30
+reloads the same checkpoints (under
+``results/checkpoints/phase_d/``) so the baseline row in the new
+JSON should reproduce these numbers within rounding.
+
+Across the path-A/B/C/D and dual-substrate lines, no variant ever
+broke Task-0 ≥ 0.5 on T=15. The functional regularisation pivot is
+the first principled attempt at a training-time intervention on
+function. If it falls in the strong-or-moderate band, that's a
+genuine result.
+
+## What's still in flight from prior sessions
+
+- T=50 n=5 validation on the existing Phase B configs (deferred).
+- Decay-subsystem honesty note in the README (deferred).
+- The contrastive encoder pretraining script (exp 29) and its
+  T=15 dual-substrate pilot (exp 28 with the frozen keying
+  encoder) are committed and runnable but conclusively negative;
+  see ``results/logs/episodic/1779821036_28_T15_dual_substrate.json``
+  for the diagnostic that closes that line.
 
 ## Files of interest (new this session)
 
-- ``src/continual_synapse/episodic/contrastive_encoder.py``:
-  ``ContrastiveEncoder``, ``info_nce_loss``, ``random_permutation``,
-  ``apply_permutation``.
-- ``src/continual_synapse/episodic/frozen_encoder.py``:
-  ``PretrainedContrastiveEncoder`` (loads + freezes + eval-locks).
-- ``experiments/29_pretrain_contrastive_encoder.py``: the
-  pretraining script with three sanity-check assertions.
-- ``experiments/28_episodic_dual_substrate_eval.py``: now accepts
-  ``--keying-encoder`` and ``--pretrained-encoder-path``.
+- ``src/continual_synapse/functional/functional_memory.py`` — the
+  ``FunctionalMemory`` class + ``distillation_loss`` function.
+- ``src/continual_synapse/functional/__init__.py`` — package
+  exports.
+- ``experiments/30_functional_regularization_eval.py`` — the
+  pilot driver with three configs.
+- ``tests/test_functional_memory.py`` — 7 unit tests.
 
 ## Suite status
 
-**444 tests passing** at the end of this session:
+**451 tests passing** at end of session.
 
-| pre-session (re-encode fix) | + contrastive_encoder | + frozen_encoder | total |
-|---:|---:|---:|---:|
-| 435 | +6 | +3 | 444 |
+| pre-session (frozen encoder) | + Phase 1 functional memory | total |
+|---:|---:|---:|
+| 444 | +7 | 451 |
 
-No new dependencies introduced (the linear probe in exp 29 uses a
-single ``torch.nn.Linear`` rather than sklearn).
+(Phase 2 added the driver script — manual run only, not exercised
+by pytest. The Phase 2 commit message documents the smoke at T=2
+that validated the training loop end-to-end.) No new dependencies
+introduced.
 
-## If Option B works at T=15
+## If functional regularization works at T=15
 
-The next session would:
-1. Run T=50 n=5 with the same `--keying-encoder pretrained_contrastive`
-   to validate at scale (expected ~few hours wall-clock).
-2. Run exp 24 retention analysis on the T=50 JSON for the retention
-   curve + heatmap + Wilcoxon Bonferroni comparison vs the existing
-   T=50 baseline data.
-3. Consider promoting `ActiveEpisodicMemory` to ChromaDB-backed
-   storage if entry counts get into the thousands.
+Next session would:
+1. Validate at T=50 n=5 with the best-performing config and
+   default hyperparameters.
+2. Sweep ``--lambda-reg`` × ``--samples-per-task`` × ``--temperature``
+   at T=15 n=5 to characterise the trade-off and identify any
+   particularly strong cell.
+3. Run exp 24 retention analysis on the T=50 JSON for the
+   retention curve + Wilcoxon Bonferroni vs the existing T=50
+   reference data.
 
-## If Option B fails
+## If it fails
 
-Three diagnostic branches, in order of cost:
-
-1. **Tune the InfoNCE temperature / projection_dim / epochs** in
-   exp 29 and re-pretrain (cheap, ~30 min).
-2. **Try a different frozen encoder** — random projection
-   (`nn.Linear(784, feature_dim)` with no training) as an extreme
-   ablation. If random projection beats trainable encoder, the
-   issue is drift, not representation quality.
-3. **Pivot away from the dual-substrate story entirely** — the
-   Pareto-frontier framing from the Phase B verdict remains the
-   fallback story for the article.
-
-## Open todos (deferred, not blocking)
-
-- n=10 validation on Phase B configs at T=50 (unchanged).
-- Decay-subsystem honesty note in README (unchanged).
-- Promote ``ActiveEpisodicMemory`` to disk-backed storage if T=50
-  pilot needs it (deferred until we know whether the architecture
-  works at T=15).
+If both functional variants land below Task-0 = 0.60, the honest
+read is that the plasticity-stability trade-off as captured in
+our experiments is **intrinsic** to the problem as we've defined
+it — not to any specific architectural choice we've made. The
+Pareto-frontier framing from the Phase B verdict (``decisions_log``
+2026-05-26) is the publishable story in that case: a thorough
+characterisation of why every reasonable architectural attempt
+fails to close the EWC Task-0 gap is itself a contribution.
