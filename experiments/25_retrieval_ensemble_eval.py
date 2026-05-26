@@ -164,6 +164,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--cache-dir", default=str(_REPO_ROOT / "data" / "hf_cache")
     )
+    # ---- Path-A flags (step 2 + step 3) ----
+    p.add_argument(
+        "--label-source",
+        choices=["auto", "true_label", "derived"],
+        default="auto",
+        help=(
+            "How RetrievalEnsemble assigns labels to stored entries. "
+            "'auto' (default) reads metadata['true_label'] when present "
+            "and falls back to deriving via the model's classifier head. "
+            "'true_label' is strict path-A — raises if any entry lacks "
+            "the field; use after a fresh path-A retraining. 'derived' "
+            "ignores stored true_labels and re-derives every label "
+            "(path-B baseline; kept for A/B ablations)."
+        ),
+    )
+    p.add_argument(
+        "--run-tag",
+        default="",
+        help=(
+            "Optional suffix appended to the output JSON filename "
+            "(e.g. --run-tag path_a → {ts}_25_T{T}_path_a.json). "
+            "Lets concurrent pilots write distinguishable files "
+            "without overwriting prior runs."
+        ),
+    )
     return p.parse_args()
 
 
@@ -636,6 +661,8 @@ class PilotSummary:
     baseline_task0: float
     rows: list[dict[str, Any]] = field(default_factory=list)
     label_derivation: list[LabelDerivationResult] = field(default_factory=list)
+    label_source: str = "auto"
+    label_source_breakdowns: list[dict[str, int]] = field(default_factory=list)
 
 
 def _format_pilot_summary(summary: PilotSummary) -> str:
@@ -711,6 +738,10 @@ def _run_one_T(
     }
     successfully_evaluated_seeds: list[int] = []
     label_derivation_results: list[LabelDerivationResult] = []
+    # Per-seed snapshot of where the ensemble's labels came from. Same
+    # for all retrieval configs in a seed (they share the store), so we
+    # only record it once per seed.
+    label_source_breakdowns: list[dict[str, int]] = []
 
     for seed in args.seeds:
         print(f"\n  --- seed {seed} ---", flush=True)
@@ -748,12 +779,29 @@ def _run_one_T(
         )
 
         # ---- Each retrieval config ----
+        seed_breakdown_recorded = False
         for cfg in _RETRIEVAL_CONFIGS:
             ensemble = RetrievalEnsemble.from_model_and_storage(
                 model, model.cold_storage,
                 k=cfg.k, tau=cfg.tau, lambda_blend=cfg.lambda_blend,
                 device=args.device,
+                label_source=args.label_source,
             )
+            if not seed_breakdown_recorded:
+                bd = ensemble.label_source_breakdown
+                if bd is not None:
+                    label_source_breakdowns.append({"seed": seed, **bd})
+                    coverage = (
+                        bd["true_label"] / bd["total"] * 100
+                        if bd["total"] > 0 else float("nan")
+                    )
+                    print(
+                        f"    label source: {bd['true_label']} true_label, "
+                        f"{bd['derived']} derived "
+                        f"({coverage:.0f}% true_label coverage)",
+                        flush=True,
+                    )
+                seed_breakdown_recorded = True
             t1 = time.time()
             cfg_row = _eval_predictor_on_all_tasks(
                 lambda x: ensemble.predict(x),
@@ -817,7 +865,8 @@ def _run_one_T(
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
-    out_path = output_dir / f"{ts}_25_T{T}.json"
+    tag_suffix = f"_{args.run_tag}" if args.run_tag else ""
+    out_path = output_dir / f"{ts}_25_T{T}{tag_suffix}.json"
     payload = {
         "experiment": "25_retrieval_ensemble_eval",
         "num_tasks": int(T),
@@ -852,6 +901,8 @@ def _run_one_T(
                 else float("nan")
             ),
         },
+        "label_source": args.label_source,
+        "label_source_breakdowns": label_source_breakdowns,
     }
     _atomic_write_json(out_path, payload)
     print(f"\n  Wrote results JSON to {out_path}", flush=True)
@@ -883,6 +934,8 @@ def _run_one_T(
         baseline_task0=baseline_task0_mean,
         rows=summary_rows,
         label_derivation=label_derivation_results,
+        label_source=args.label_source,
+        label_source_breakdowns=label_source_breakdowns,
     ), out_path
 
 
@@ -934,6 +987,28 @@ def main() -> None:
                     "retrieval-ensemble numbers below are likely uninformative; "
                     "the approach needs path-A retraining."
                 )
+
+    # ---- Label-source breakdown (path-A coverage diagnostic) ----
+    for s in summaries:
+        if not s.label_source_breakdowns:
+            continue
+        print()
+        print("=" * 78)
+        print(
+            f"=== Label source breakdown (label_source={s.label_source!r})"
+            f"  T={s.T} ==="
+        )
+        print("=" * 78)
+        for bd in s.label_source_breakdowns:
+            total = bd["total"]
+            coverage = (
+                bd["true_label"] / total * 100 if total > 0 else float("nan")
+            )
+            print(
+                f"seed {bd['seed']}: {bd['true_label']} true_label, "
+                f"{bd['derived']} derived "
+                f"(total={total}, {coverage:.0f}% true_label coverage)"
+            )
 
     # ---- Headline pilot summary ----
     print()

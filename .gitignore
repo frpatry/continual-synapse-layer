@@ -230,6 +230,7 @@ results/tables/*
 !results/figures/extended_sequence/
 !results/figures/architectural_completion/
 !results/figures/phase_b/
+!results/figures/retrieval_ensemble/
 
 # Local-only session-handoff notes. Never commit.
 HANDOFF.md

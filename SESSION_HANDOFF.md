@@ -1,124 +1,116 @@
-# Session handoff — 2026-05-26
+# Session handoff — 2026-05-26 (path-A pilot complete)
 
 ## Where we are
 
-Phase B closed (decisions_log 2026-05-26 entry). Cold Storage v2
-inference-time retrieval ensemble built and **smoke-tested through to
-data**: the exp 25 T=15 n=3 pilot completed in this session and the
-result is unambiguous — **path B is dead**. Label-derivation accuracy
-averaged **18.7%** across 3 seeds (well below the 50% viability
-threshold), and all three retrieval configurations degraded baseline
-ACC by between −0.7 and −10.0 pp.
+Cold Storage v2 path-A pilot at T=15 (n=3) is **complete and clean**.
+The mechanism works exactly as designed — every consolidated entry on
+the new checkpoints carries a ground-truth ``true_label`` (100%
+coverage across all 3 seeds), and ``label_source="true_label"``
+succeeded without falling back to derived labels even once.
 
-The infrastructure (RetrievalEnsemble class, checkpoint persistence,
-label-accuracy diagnostic, exp 25 train-and-eval pipeline) is solid
-and re-usable. What needs replacing is the **labels-as-of-now**
-derivation — it doesn't work because the model's classifier head has
-drifted too far from the consolidation-time state.
+**But the decision criterion failed.** None of the three retrieval
+configurations improved Task-0 retention by ≥ +5 pp over the
+no-retrieval baseline. Δ Task-0 was essentially neutral
+(−0.03 / −0.72 / −0.85 pp). Wilcoxon pairwise on Task-0 is saturated
+at p_bonf = 1.00.
+
+The qualitative win is that path A removed path B's catastrophic
+collapse entirely: v2_aggressive recovered ~8 pp of aggregate ACC
+(from 0.713 path-B to 0.796 path-A). Mechanism real; gain in the
+headline metric absent at T=15.
+
+See decisions_log entry "2026-05-26 Cold Storage v2 path-A pilot —
+mechanism works, criterion fails" for the long-form narrative.
 
 ## Immediate next decision
 
-**Pivot to path A** (retrain with true-label storage at consolidation
-time) or move to a different mechanism entirely. Do not invest more
-seeds in the current path-B pilot — the diagnostic has settled it.
+**Three options on the table** for whoever picks this up next:
 
-### Path A sketch — concrete steps
+1. **Step 4 — soft voting via ``label_histogram_json``.** Path-A
+   checkpoints already store the per-class histogram from each
+   consolidation batch (step 1 wrote it; step 2 deliberately ignored
+   it). Replace the hard argmax vote in ``RetrievalEnsemble`` with a
+   soft distribution-weighted vote. **No retraining required** —
+   re-runs eval on the existing path-A checkpoints. If "hard labels
+   collapse useful within-batch ambiguity" is the failure mode, this
+   recovers the lost signal. ~30 min eval per seed.
+2. **T=50 path-A pilot.** Headroom is much bigger at T=50
+   (baseline Task-0 ~0.46–0.62 vs ~0.80 at T=15), so the same
+   mechanism could potentially produce a measurable Task-0 lift
+   where T=15 didn't have room. Cost: ~3 h per seed × n=5 = ~15 h
+   training plus a few minutes of eval. Risk: if soft voting (option
+   1) wins, this gets rerun anyway with the better mechanism.
+3. **Abandon Cold Storage v2 retrieval-ensemble entirely** and move
+   to a different direction (embedding-space regulariser, parametric
+   memory à la GEM, or treat the Phase B Pareto frontier as the
+   final story for the article). The Wilcoxon p-values say there's
+   no rescue hiding in the current variant.
 
-Path B failed at T=15 with label-derivation accuracy = 18.7%.
-The premise was that the current model head still classifies old
-activations coherently; on a forgotten head it doesn't. Path A
-removes the dependency on the current head by anchoring labels in
-ground truth, captured at consolidation time when the labels are
-still trustworthy.
-
-1. **Capture true_label at consolidation.** Modify the cold-storage
-   consolidation path to take the dominant true label from the
-   batch that triggered the consolidation (majority class across
-   the batch's `y` tensor) and write it into entry metadata.
-   Add the field to `StoredEntry`-equivalent metadata schema with
-   a `None` (or `-1`) default so existing checkpoints stay
-   loadable. Backward-compatible: any code that doesn't pass a
-   label gets the old behaviour.
-2. **Teach `RetrievalEnsemble` to prefer true_label when present.**
-   Add a `label_source` config flag with two values:
-   - `"true_label"` (path A): read each entry's
-     `metadata["true_label"]`, fall back to derived label only when
-     missing (so we can still load older path-B checkpoints).
-   - `"derived"` (path B, current default): existing behaviour
-     — `argmax(model.base.classify(stored_embedding))`.
-3. **Retrain scout_a095 with label storage enabled.** T=15, n=3
-   seeds, ~1.5 h. Save fresh checkpoints alongside the path-B
-   ones (different filename pattern or directory so we don't
-   clobber the existing artifacts).
-4. **Re-run exp 25 evaluation with the new checkpoints.** Same
-   three retrieval configs (`v2_mild`, `v2_moderate`,
-   `v2_aggressive`) + `scout_a095_baseline` anchor. Use
-   `--label-source true_label` (or whatever flag we add).
-5. **Decision gate (same threshold as path B):**
-   - If at least one config shows `Task-0 ≥ baseline + 5 pp`
-     AND aggregate ACC drops `≤ 2 pp`: proceed to T=50 with n=5.
-   - Else: design revision needed (e.g. different blending rule,
-     different similarity metric, per-class normalisation, etc.).
-6. **Re-run exp 24 retention analysis on the new JSON.**
-   Same command as path B, just pointed at the new log file —
-   generates the retention curve and prints the summary table.
-
-**Expected outcome:** with true labels stored at consolidation,
-label quality is anchored in ground truth (100% accuracy at store
-time, doesn't drift with subsequent task training). If the
-embedding space remains semantically meaningful — which the
-gradient-gating system already relies on for its familiarity
-signal — retrieval should now help Task-0 retention measurably
-rather than voting near-random as it did in path B.
-
-If path A also fails the decision gate, the failure mode is
-informative: it would mean the embedding space itself has
-drifted enough that even ground-truth-labelled neighbours no
-longer match query semantics. That points away from
-retrieval-ensemble entirely and toward methods that constrain
-the embedding space directly (e.g. embedding-space regulariser
-during training, parametric memory à la GEM).
+Suggested ordering: try option 1 first (cheap), use its result to
+decide between option 2 and option 3.
 
 ## What completed this session
 
-- `2c55c2a` — `src/continual_synapse/inference/retrieval_ensemble.py`
-  + 10 unit tests
-- `9ecaa1d` — `experiments/25_retrieval_ensemble_eval.py`
-  (combined train-and-evaluate)
-- `f5bb465` — exp 25 gains path-B label-derivation accuracy
-  diagnostic + `on_task_change` task_id tagging in training
-- T=15 pilot ran end-to-end:
-  - 3 checkpoints at `results/checkpoints/phase_b/scout_a095_T15_seed{0,1,2}.pt`
-  - results JSON at `results/logs/retrieval_ensemble/1779790326_25_T15.json`
-  - log at `/tmp/exp25_pilot.log`
+Three commits ship the path-A line of work:
 
-## Pilot result reference
+- `78f514c` — step 1: ``consolidate_to_storage`` + ``apply_hebbian_update``
+  capture ``true_label`` and ``label_histogram`` per consolidation batch.
+  Backward-compatible; 7 new tests.
+- `a5cbd90` — step 2: ``RetrievalEnsemble.from_model_and_storage``
+  gains ``label_source ∈ {auto, true_label, derived}`` and exposes
+  ``label_source_breakdown``. 7 new tests.
+- (this commit) — step 3: exp 25 plumbed with ``--label-source`` and
+  ``--run-tag``; pilot run; comparison vs path B; exp 24 retention
+  analysis on the new JSON.
 
+T=15 path-A pilot artifacts:
+
+- 3 fresh checkpoints at ``results/checkpoints/phase_a/scout_a095_T15_seed{0,1,2}.pt``
+  (15 MB each — local only, not committed; regenerable with the exp
+  25 command below)
+- Results JSON: ``results/logs/retrieval_ensemble/1779796716_25_T15_path_a.json``
+- Retention analysis: ``results/analysis/retrieval_ensemble_retention_path_a.json``
+- Figures: ``results/figures/retrieval_ensemble/path_a/{retention_curve,retention_heatmap}_T15.png``
+- Pilot log: ``/tmp/exp25_path_a.log`` (also local only)
+
+## Path A vs Path B at T=15 — headline table
+
+| config         | path-B ACC | path-A ACC | Δ ACC      | Task-0 path-A | Δ Task-0 vs path-A baseline |
+|----------------|-----------:|-----------:|-----------:|--------------:|----------------------------:|
+| baseline       | 0.8137     | 0.8143     | +0.06 pp   | 0.8047 (ref)  | 0.00 pp                     |
+| v2_mild        | 0.8066     | 0.8124     | +0.58 pp   | 0.8044        | −0.03 pp                    |
+| v2_moderate    | 0.7663     | 0.8003     | +3.40 pp   | 0.7974        | −0.72 pp                    |
+| v2_aggressive  | 0.7134     | 0.7956     | +8.22 pp   | 0.7961        | −0.85 pp                    |
+
+Label source breakdown per seed (100% coverage on all):
+``104 / 105 / 108 true_label, 0 derived``.
+
+## Re-running the pilot from scratch
+
+```bash
+rm -rf results/checkpoints/phase_a
+python experiments/25_retrieval_ensemble_eval.py \
+    --task-lengths 15 --seeds 0 1 2 \
+    --checkpoint-dir results/checkpoints/phase_a \
+    --label-source true_label --run-tag path_a
 ```
-=== Label derivation accuracy (path B sanity check)  T=15 ===
-seed 0: 10.9% (11/101 correctly relabeled)
-seed 1: 26.2% (27/103 correctly relabeled)
-seed 2: 19.1% (21/110 correctly relabeled)
-average: 18.7%
-  ⚠ unrecoverable — needs path A retraining
 
-=== Retrieval Ensemble v2 — Pilot Results  T=15 ===
-  baseline scout_a095:                    ACC=0.814  Task-0=0.814
-  v2_mild      (k=5, τ=0.70, λ=0.30):     ACC=0.807   (Δ −0.7 pp)
-  v2_moderate  (k=5, τ=0.80, λ=0.50):     ACC=0.766   (Δ −4.7 pp)
-  v2_aggressive(k=5, τ=0.50, λ=0.50):     ACC=0.713   (Δ −10.0 pp)
-```
+Total wall-clock: ~19 minutes (3 seeds × ~5 min training + per-seed
+eval). The earlier 1.5 h estimate was conservative.
 
-To regenerate retention curves from the pilot data without re-running:
+## Re-generating the retention analysis from the existing JSON
 
 ```bash
 python experiments/24_retention_analysis.py \
-    --log-paths results/logs/retrieval_ensemble/1779790326_25_T15.json \
-    --fig-dir results/figures/retrieval_ensemble \
-    --analysis-path results/analysis/retrieval_ensemble_retention.json
+    --log-paths results/logs/retrieval_ensemble/1779796716_25_T15_path_a.json \
+    --fig-dir results/figures/retrieval_ensemble/path_a \
+    --analysis-path results/analysis/retrieval_ensemble_retention_path_a.json
 ```
 
 ## Phase B reference numbers (T=50, n=5)
+
+Unchanged from the previous handoff — kept here for the Pareto-
+frontier writeup.
 
 | Config | Aggregate ACC | Task-0 retention |
 |---|---:|---:|
@@ -131,59 +123,54 @@ python experiments/24_retention_analysis.py \
 Gap our architecture needs to close to dethrone EWC on Task-0
 retention at T=50: **+21.5 pp**.
 
-Full per-task / per-seed numbers in:
-- `results/analysis/phase_b_retention.json`
-- `results/logs/scaling/1779714283_21_scaling_T{15,30,50}.json`
-- `results/logs/phase_b_validation/1779744145_23_phase_b_T15.json`
-- (`T=30` and `T=50` Phase B JSONs may exist if your exp 23 run
-  has finished; check `ls results/logs/phase_b_validation/`)
-
 ## Open todos (deferred, not blocking)
 
+- **Step 4 (soft voting via histogram).** Re-evaluate the same path-A
+  checkpoints with a histogram-aware ``RetrievalEnsemble``. Path: add
+  a ``vote_mode ∈ {"hard", "soft"}`` flag (or a third label-source
+  value), read ``metadata.get("label_histogram_json")``, accumulate
+  per-class soft votes weighted by similarity. No retraining.
 - **Decay-subsystem honesty note** in README and the follow-up
   article: stored strengths matrices computed and discarded under
-  `cs_gated_cosine_developmental` — the decay machinery is dormant
-  Phase 4 / cs_full infrastructure. See decisions_log 2026-05-26
-  section "Honesty note".
+  ``cs_gated_cosine_developmental`` — the decay machinery is dormant
+  Phase 4 / cs_full infrastructure. (Unchanged from previous handoff.)
 - **n=10 validation** on scout_combined and scout_a095 for clean
-  Wilcoxon Bonferroni (current Phase B is n=5; statistical floor
-  hits 0.1875 with Bonferroni × 3).
-- **Path A** retraining pipeline (only if we commit to that
-  direction over an alternative mechanism).
+  Wilcoxon Bonferroni at T=50. (Unchanged.)
 
-## Key design choices in the Cold Storage v2 implementation
+## Key design choices preserved across path A
 
-1. Features extracted via `base.features(x)`, **not** the
-   modulator-augmented `model.features(x)` — same vector space the
-   stored embeddings live in. Verified by a dedicated test.
-2. Labels derived once at ensemble init via
-   `argmax(model.base.classify(stored_embedding))`. This is the
-   **path-B** assumption that the head still classifies old
-   activations coherently; the diagnostic shows it doesn't at
-   T=15 on Permuted-MNIST.
-3. Negative cosine sims are **clipped at 0** in the weighted vote
-   so anti-correlated entries don't subtract from a class's tally.
-4. Eval mode is strict — `RetrievalEnsemble.predict` puts the
-   model in `eval()` and restores the prior `training` flag.
-5. Checkpoint format = single `.pt` with `model_state_dict` +
-   serialised `cold_storage_entries` (embedding + document +
-   metadata) + `config`. Re-runs with checkpoints in place skip
-   training entirely (~20 min eval-only iteration).
-6. Training now passes `on_task_change=notify_task_change` so
-   stored entries are properly tagged with `task_id`. Required by
-   the label-accuracy diagnostic and any future path-A code that
-   wants to filter entries by source task.
+1. Features extracted via ``base.features(x)``, **not** the
+   modulator-augmented ``model.features(x)`` — same vector space the
+   stored embeddings live in.
+2. Cosine sims clipped at 0 in the weighted vote so anti-correlated
+   entries don't subtract from a class's tally.
+3. ``RetrievalEnsemble.predict`` puts the model in ``eval()`` and
+   restores the prior ``training`` flag.
+4. Checkpoint format = single ``.pt`` with ``model_state_dict`` +
+   serialised ``cold_storage_entries`` (embedding + document +
+   metadata) + ``config``. Path-A entries now carry ``true_label``
+   and ``label_histogram_json`` in metadata; backward-compatible
+   readers use ``metadata.get(...)``.
+5. Training passes ``on_task_change=notify_task_change`` (task_id
+   tagging) AND ``training_target=y`` (path-A label storage).
+6. ``label_source="auto"`` (the default) is bit-identical to the
+   pre-path-A ``"derived"`` behaviour on any store without
+   ``true_label`` metadata. Verified end-to-end against the path-B
+   ``scout_a095_T15_seed0.pt`` checkpoint.
 
 ## Files of interest
 
-- `src/continual_synapse/inference/retrieval_ensemble.py`
-- `experiments/25_retrieval_ensemble_eval.py`
-- `experiments/24_retention_analysis.py` (works on exp 25 JSON
-  unchanged via `--log-paths`)
-- `results/figures/phase_b/retention_curve_T15.png`
-- `DESIGN.md`, `PROJECT_PLAN.md`, `decisions_log.md`
-- `tests/test_retrieval_ensemble.py`
+- ``src/continual_synapse/inference/retrieval_ensemble.py`` (step 2)
+- ``src/continual_synapse/consolidation/pipeline.py`` (step 1)
+- ``src/continual_synapse/baselines/synapse_finetune.py`` (step 1)
+- ``experiments/25_retrieval_ensemble_eval.py`` (step 3)
+- ``experiments/24_retention_analysis.py`` (works on the new JSON
+  via ``--log-paths``)
+- ``tests/test_retrieval_ensemble.py``, ``tests/test_consolidation_pipeline.py``,
+  ``tests/test_synapse_finetune.py`` (14 new tests across steps 1+2)
+- ``DESIGN.md``, ``PROJECT_PLAN.md``, ``decisions_log.md``
 
 ## Suite status
 
-380 tests passing. No new dependencies introduced.
+394 tests passing (380 baseline + 7 step-1 + 7 step-2). No new
+dependencies introduced.

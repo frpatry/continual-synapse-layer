@@ -6,6 +6,181 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-26] Cold Storage v2 path-A pilot — mechanism works, criterion fails
+
+Path-A retraining at T=15 (n=3) completed cleanly. The path-B failure
+verdict (label-derivation accuracy 18.7%, all retrieval configs
+degrading baseline) was demonstrably caused by the labels-as-of-now
+derivation — once we anchor labels in ground truth captured at
+consolidation time, the catastrophic ACC collapse disappears. But
+retrieval still does not improve Task-0 retention over the
+no-retrieval baseline, so the decision criterion for proceeding to
+T=50 fails.
+
+### What path A actually changed (steps 1–2, already shipped)
+
+Two earlier commits in this session shipped the plumbing:
+
+- `78f514c` (step 1): ``consolidate_to_storage`` gains optional
+  ``true_label`` and ``label_histogram`` kwargs; ``apply_hebbian_update``
+  derives the dominant class via ``torch.mode`` and a per-class
+  bincount from ``training_target``. Backward-compatible (fields
+  omitted when ``None``).
+- `a5cbd90` (step 2): ``RetrievalEnsemble.from_model_and_storage``
+  gains ``label_source ∈ {"auto", "true_label", "derived"}`` plus a
+  ``label_source_breakdown`` diagnostic property. ``"auto"`` is
+  bit-identical to ``"derived"`` on pre-path-A stores (back-compat
+  verified end-to-end against
+  ``results/checkpoints/phase_b/scout_a095_T15_seed0.pt``).
+
+This commit (step 3) wires those into exp 25 via ``--label-source``
+and ``--run-tag`` CLI flags and runs the pilot.
+
+### Pilot setup
+
+```
+python experiments/25_retrieval_ensemble_eval.py \
+    --task-lengths 15 --seeds 0 1 2 \
+    --checkpoint-dir results/checkpoints/phase_a \
+    --label-source true_label --run-tag path_a
+```
+
+Total wall-clock: ~19 minutes (3 seeds × ~5 min training + per-seed
+eval). The earlier 1.5h estimate was conservative. Fresh checkpoints
+in ``results/checkpoints/phase_a/`` (not committed; same precedent as
+path-B's checkpoints), results JSON at
+``results/logs/retrieval_ensemble/1779796716_25_T15_path_a.json``.
+
+### Mechanism working as designed
+
+Every consolidated entry on the new checkpoints carries a stored
+``true_label``:
+
+```
+seed 0: 104 true_label, 0 derived (100% true_label coverage)
+seed 1: 105 true_label, 0 derived (100% true_label coverage)
+seed 2: 108 true_label, 0 derived (100% true_label coverage)
+```
+
+Strict ``label_source="true_label"`` succeeded on all seeds — no
+fallback to derived labels was needed. The path-B label-derivation
+accuracy diagnostic on the same new checkpoints still reports
+**28.1% mean** (26.0% / 28.6% / 29.6%), reaffirming that deriving
+labels via the current head was never going to work on a forgotten
+classifier and only path-A storage solves that.
+
+### Path A vs Path B at T=15 (n=3 each)
+
+| config         | path-B ACC | path-A ACC | Δ ACC      | Task-0 path-A | Δ Task-0 vs path-A baseline |
+|----------------|-----------:|-----------:|-----------:|--------------:|----------------------------:|
+| baseline       | 0.8137     | 0.8143     | +0.06 pp   | 0.8047 (ref)  | 0.00 pp                     |
+| v2_mild        | 0.8066     | 0.8124     | +0.58 pp   | 0.8044        | −0.03 pp                    |
+| v2_moderate    | 0.7663     | 0.8003     | +3.40 pp   | 0.7974        | −0.72 pp                    |
+| v2_aggressive  | 0.7134     | 0.7956     | +8.22 pp   | 0.7961        | −0.85 pp                    |
+
+The "Δ ACC" column is the headline rescue effect: path A removes
+path-B's catastrophic degradation entirely, and the worst-case
+v2_aggressive config recovers ~8 pp of aggregate ACC. That confirms
+the diagnosis from the previous decisions_log entry — path B's
+collapse was driven by labels-as-of-now noise, not by an unfixable
+embedding-space problem.
+
+### Decision criterion: FAIL
+
+Spec (carried over from path B): at least one retrieval config must
+satisfy ``Δ Task-0 ≥ +5 pp`` AND ``Δ ACC ≥ −2 pp`` versus the
+path-A baseline. None of the three configs clear the Task-0 bar:
+
+```
+✗ v2_mild       Δ Task-0 = −0.03 pp  (need ≥ +5)  Δ ACC = −0.19 pp  (OK)
+✗ v2_moderate   Δ Task-0 = −0.72 pp  (need ≥ +5)  Δ ACC = −1.40 pp  (OK)
+✗ v2_aggressive Δ Task-0 = −0.85 pp  (need ≥ +5)  Δ ACC = −1.87 pp  (OK)
+```
+
+Wilcoxon pairwise on Task-0 ACC (Bonferroni-corrected, exp 24):
+every retrieval-vs-baseline comparison is ``p_bonf = 1.00`` — zero
+evidence that retrieval differs from baseline. Retrieval is neither
+helping nor hurting Task-0 retention at T=15 with ground-truth
+labels.
+
+### Interpretation
+
+Two findings, two implications:
+
+1. **Path A's mechanism is real and works.** True-label storage at
+   consolidation time produces ground-truth-anchored votes (100%
+   coverage, no noise). The catastrophic ACC degradation path B
+   showed is gone. Step 1 + step 2 were correct fixes.
+2. **But the retrieval vote, with hard labels, doesn't add
+   information over the model's own softmax at T=15.** The model
+   already retains ~80% on Task 0 via gradient gating alone; the
+   retrieval blend doesn't recover the remaining gap to EWC
+   (Task-0 = 0.834 at T=50 from the Phase B reference).
+
+The headroom-vs-noise tradeoff at T=15 may simply be unfavourable:
+baseline retention is already high enough that the retrieval signal
+is mostly redundant with the softmax, while the small per-config
+ACC drops (≤ 2 pp) measure the cost of the blend on samples where
+the model would have been right on its own. Whether this verdict
+holds at T=50 (where baseline Task-0 drops to ~0.46–0.62 and the
+EWC gap is +21.5 pp) is a separate question — the T=15 result is
+not predictive either way.
+
+### What does NOT lead nowhere
+
+- **Step 4 — soft voting via ``label_histogram_json``.** Step 1 also
+  stored the per-class histogram from each batch. Step 2 deliberately
+  did not consume it (kept simple, hard labels only). A reasonable
+  next experiment is to use the histogram as a soft target for the
+  retrieval vote (each entry contributes its full class distribution,
+  not just the argmax). If the failure mode here is "hard labels
+  collapse useful within-batch ambiguity into a single class", soft
+  voting recovers it. Costs no retraining — the histograms are
+  already in the path-A checkpoints' metadata.
+- **A T=50 path-A pilot.** Headroom is much larger at T=50 (baseline
+  Task-0 ~0.46 vs ~0.80 at T=15), so the same retrieval mechanism
+  could in principle produce a measurable Task-0 lift even if it
+  can't at T=15. Cost: ~3 h per seed at n=5 = ~15 h training, then a
+  few minutes of eval. Worth it only if there's a prior reason to
+  believe the mechanism scales.
+
+### What does lead nowhere
+
+- **More seeds at T=15 on the current configs.** The Wilcoxon p-values
+  are saturated at 1.00 — there is no near-miss signal hiding in the
+  n=3 noise. Adding seeds won't change the verdict.
+- **Hyperparameter sweep over k / τ / λ in the current mechanism.**
+  The three configs already span the natural range (k=5 fixed; τ from
+  0.5 to 0.8; λ from 0.3 to 0.5). All converge on the same neutral
+  Task-0 verdict; the mechanism's ceiling is the bottleneck, not the
+  knob settings.
+
+### Headline numbers and artifacts
+
+- New pilot JSON: ``results/logs/retrieval_ensemble/1779796716_25_T15_path_a.json``
+- Retention analysis: ``results/analysis/retrieval_ensemble_retention_path_a.json``
+- Figures: ``results/figures/retrieval_ensemble/path_a/{retention_curve,retention_heatmap}_T15.png``
+- Checkpoints (local only): ``results/checkpoints/phase_a/scout_a095_T15_seed{0,1,2}.pt``
+  (15 MB each — regenerable with the exp 25 command above)
+
+### Where this leaves Cold Storage v2
+
+- **Path B (labels-as-of-now): dead.** Settled in the previous
+  decisions_log entry.
+- **Path A (true-label storage with hard-label voting): neutral at
+  T=15.** Mechanism works; criterion fails. Don't ship as-is.
+- **Step 4 (soft-label voting via histogram): untried, cheap to
+  evaluate, no retraining needed.** Reasonable next experiment.
+- **T=50 path-A pilot: untried, expensive.** Only worth doing after
+  step 4 if the soft-vote variant shows promise at T=15.
+
+The decision-criterion failure here is informative, not catastrophic:
+the headline finding is that path-A storage is necessary but not
+sufficient. A subsequent session can pivot to step 4 with no further
+training required.
+
+---
+
 ## [2026-05-26] Phase B verdict + Cold Storage v2 transition (path-B pilot null)
 
 Three connected findings closing Phase B and opening (then closing
