@@ -1,235 +1,253 @@
-# Session handoff — 2026-05-26 (dual-substrate episodic infrastructure ready)
+# Session handoff — 2026-05-26 (frozen-encoder pretraining ready)
 
 ## Where we are
 
-We've pivoted away from "make the synapse layer's reward signal /
-storage / consolidation cleverer" and toward a fundamentally
-different architecture: **separate the substrate that computes from
-the substrate that remembers**.
+The dual-substrate architecture is implemented and partially tested.
+What we've learned, in order:
 
-The empirical motivation, captured in
-``results/logs/reward_confidence/1779815135_27_T15_path_d.json``:
-the reward-as-confidence path (path D) showed the R signal IS
-structured — ``cosine_reward_developmental`` beats the baseline ACC
-by **+1.5 pp** at T=15 — but it does so by **trading −7.3 pp of
-Task-0 retention**. Three architectural iterations (path A
-true labels, path C per-class consolidation, path D per-sample
-reward) have all hit the same wall: any change that helps the model
-learn faster bleeds into Task-0 forgetting; any change that protects
-Task-0 starves plasticity. The plausible reading is that the
-trade-off is an **artefact of asking one substrate (the network
-weights) to carry two responsibilities**.
+1. **Substrate separation makes the system viable** but doesn't
+   automatically dissolve the plasticity-stability trade-off. The
+   first pilot (`results/logs/episodic/1779817131_28_T15_dual_substrate.json`,
+   `blend_max=0.5`, no re-encoding) showed Task-0 = 0.218 — much
+   worse than baseline 0.798.
+2. **Feature drift in the trainable encoder is real.** Adding
+   re-encoding at task boundaries
+   (`results/logs/episodic/1779818599_28_T15_dual_substrate.json`,
+   `blend_max=1.0`, re-encoding ON) lifted Task-0 a bit (0.389) but
+   killed Task-N (0.755, down from 0.928). Diagnostic from the run:
+   ```
+   per-task memory size: t0=92, t1=92, t2=92, ..., t11=92, t12=101, t13=101, t14=103
+   ```
+   The trainable encoder's feature space drifts so heavily that
+   tasks 1-11 register as ≤ novelty_threshold against the existing
+   memory — so the store is dominated by task-0 prototypes, and
+   high `blend_max` then over-weights stale task-0 retrieval on
+   every input.
+3. **Pivot diagnosis**: the keying function for the memory must be
+   stable across continual training. A trainable encoder will
+   always drift; we need a frozen one.
 
-The new design (Option 2 in the user's plan): the network is free
-to learn (standard backprop, no protection mechanisms), and an
-**active episodic memory** grows alongside it via gradient-free
-allocation. At inference, the model's softmax is blended with a
-retrieval-based label distribution from the memory, with the blend
-weight scaled by retrieval confidence. The memory contributes when
-something genuinely similar exists in it, and stays silent
-otherwise.
+The new direction (Option B): pretrain a **permutation-invariant**
+encoder via self-supervised contrastive learning on raw MNIST, then
+freeze it and use it as the keying function for the episodic
+memory. The base classifier still trains freely; the memory's
+feature space is locked in by construction.
 
-The bet: if the trade-off is substrate-coupling, this separation
-should dissolve it. The model can over-write its representation of
-an old task (catastrophic at the weights level), but the memory's
-entries from that task remain queryable and contribute at inference
-whenever a similar input arrives.
+## Why permutation-invariant pretraining?
+
+Permuted-MNIST defines every task as a different random permutation
+of the 784 input pixels. If the encoder is **invariant to those
+permutations** by design, then "same digit under different
+permutations" maps to nearby points in feature space — which is
+exactly the inter-task geometry the memory needs to preserve. The
+pretraining objective makes this invariance the explicit loss:
+two random perms of the same image are positive pairs in a SimCLR
+InfoNCE loss.
+
+This is methodologically clean: no future-task leakage (we only
+use raw MNIST, which we've always had access to as prior
+knowledge), no peeking at the continual benchmark's labels, no
+synthetic data hacks.
 
 ## What ships in this session (incremental, all committed)
 
-Five commits land the dual-substrate infrastructure:
+Six prior commits + four new ones land the frozen-encoder line:
 
-- `96244cb` — Phase 0: pivot documented in decisions_log; the
-  cosine_reward T=15 headline table, three-iteration retrospective,
-  and the four-tier decision criteria for the new pilot are all
-  captured in the
-  "Pivot to dual-substrate episodic architecture" entry.
-- `342b3c4` — Phase 1: ``ActiveEpisodicMemory`` — gradient-free
-  allocation via cosine novelty threshold; weighted top-k vote at
-  retrieval. 8 unit tests covering allocation, retrieval, cache
-  invalidation, and the ``max_entries`` cap.
-- `7057d6f` — Phase 2: ``EpisodicPredictor`` — blends base-model
-  softmax with retrieval distribution; ``λ_eff`` scales from 0 to
-  ``blend_max`` with retrieval confidence above
-  ``blend_threshold``. Returns log-probabilities for downstream
-  compatibility. ``training_step_observe`` runs the storage
-  decision under ``torch.no_grad``. 6 unit tests.
-- `56fe242` — Phase 3: ``cs_episodic_dual_substrate`` config in
-  ``src/continual_synapse/episodic/training_configs.py``.
-  ``EpisodicConfig`` dataclass + ``EPISODIC_CONFIGS`` registry.
-  Smoke-tested at T=2 n=1: ACC=1.000, memory grows on novelty,
-  no allocations on repeat inputs.
-- `118ddba` — Phase 4: ``experiments/28_episodic_dual_substrate_eval.py``
-  driver — manual run only (NOT executed in-session). Trains the
-  episodic config, re-evaluates the unchanged
-  ``cs_gated_cosine_developmental`` baseline from existing exp-27
-  checkpoints when available, writes exp-23-compatible JSON for
-  the exp-24 retention analyser, plus a storage-diagnostics block
-  (per-task memory growth, early-vs-late novelty mean).
-- (this commit) — Phase 5: this handoff update.
+- `96244cb` — Phase 0: dual-substrate pivot doc + decisions_log
+- `342b3c4` — Phase 1: ActiveEpisodicMemory + 8 tests
+- `7057d6f` — Phase 2: EpisodicPredictor + 6 tests
+- `56fe242` — Phase 3: cs_episodic_dual_substrate config
+- `118ddba` — Phase 4: exp 28 driver (not run in-session)
+- `864d773` — Phase 5: handoff update
+- `65ca031` — feature-drift fix Phase 1: raw_inputs + re_encode_all + 5 tests
+- `4841649` — feature-drift fix Phase 2: re-encode wired into exp 28
+- (new) `646c845` — Option B Phase 1: ContrastiveEncoder + InfoNCE
+  + experiments/29 pretraining script + 6 tests
+- (new) `34ed2ef` — Option B Phase 2: PretrainedContrastiveEncoder
+  wrapper + 3 tests
+- (new) `fab71d4` — Option B Phase 3: keying_encoder wired into
+  EpisodicPredictor + exp 28 (smoke-tested at T=2)
+- (this commit) — Option B Phase 4: handoff update
 
-## Running the pilot (manual, when ready)
+## Running the pilot (two commands, in order)
 
 ```bash
 source .venv/bin/activate
-python experiments/28_episodic_dual_substrate_eval.py --T 15 --n_seeds 2
+
+# Step 1 — pretrain the frozen encoder. Run once.
+python experiments/29_pretrain_contrastive_encoder.py --epochs 50
+
+# Step 2 — continual eval with the frozen encoder as the memory's
+# keying function.
+python experiments/28_episodic_dual_substrate_eval.py \
+    --T 15 --n_seeds 2 --keying-encoder pretrained_contrastive
 ```
 
-(Defaults: episodic config with ``novelty_threshold=0.7``,
-``retrieval_k=5``, ``blend_threshold=0.5``, ``blend_max=0.5``;
-unbounded memory; baseline auto-loaded from
-``results/checkpoints/phase_d/`` if present.)
+**Important:** the venv must be activated first — the system has
+no ``python`` on PATH outside the venv.
 
-ETA estimate: the dual-substrate training is a plain MLP forward +
-backward per batch plus a no-grad feature extract for the memory.
-Should be **faster than scout_a095** (no n_passes=5 multi-pass
-synapse buffer; no cold-storage Chroma I/O in the training loop).
-Path-A T=15 n=3 was 19 min total; expect maybe ~12 min total for
-the new pilot at n_seeds=2, plus a few seconds per baseline seed
-for the eval-only reload.
+### Step 1 — what to expect from `experiments/29`
 
-## What to read in the printed summary
-
-The script ends with:
+At the end of pretraining the script runs three sanity-check
+assertions:
 
 ```
-=== Dual-substrate episodic — T=15, n=2 ===
-config                                       ACC   Task-0   Task-N   memory
-------------------------------------------------------------------------------
-cs_gated_cosine_developmental (ref)        0.814    0.805    0.906        N/A
-cs_episodic_dual_substrate                 X.XXX    X.XXX    X.XXX     XXX avg
-  (Δ vs baseline, pp):                     +X.XX    +X.XX    +X.XX
+linear-probe MNIST test accuracy: 0.XX  (floor 0.90)
+same-digit cross-perm sim:       0.XX  (floor 0.50)
+gap (same − different):           0.XX  (floor 0.20)
 ```
 
-And per-seed, look for:
+If any of these fail, the script raises ``AssertionError`` but
+**still saves the checkpoint** so you can inspect it. Expected
+ballpark on CPU at 50 epochs:
 
-- ``final memory size = N`` after each training. The "reasonable"
-  band for T=15 is **50–500** entries; anything below 30 says the
-  novelty threshold is too high (memory isn't capturing the input
-  space), anything above ~2000 says the threshold is too low and
-  storage is overflowing.
-- ``per-task memory size: t0=…, t1=…, …``. A healthy curve grows
-  fast on the first task and slows as later-task inputs find more
-  matches; near-linear growth across all tasks means the threshold
-  isn't discriminating between novel and seen, and a near-flat
-  curve after task 0 means the threshold is too high.
-- ``novelty mean (first 100 batches): 0.XX; last 100: 0.YY``.
-  Expected: 0.YY ≪ 0.XX. The first-100 average will be near 1.0
-  (memory starts empty); the last-100 average should be much lower
-  as the memory fills.
+- linear-probe ≥ 0.95 (MNIST is easy enough that a frozen
+  contrastive encoder with a single linear head should clear it)
+- same-digit similarity ≥ 0.70 (the contrastive objective directly
+  optimises this)
+- gap ≥ 0.30 (different-digit pairs are negatives in the loss; if
+  the encoder collapsed all classes to one cluster, the gap would
+  be near 0 — the assertion catches that failure mode)
 
-## Decision criteria for the pilot
+ETA on CPU: 10–15 minutes at default `--epochs 50`. Outputs:
+``results/pretrained/contrastive_encoder.pt`` (~few MB).
 
-(Carried from the decisions_log entry, repeated here for the
-operator who reads only this file.)
+### Step 2 — what to expect from `experiments/28`
 
-- **Strong win**: ACC ≥ baseline AND Task-0 ≥ baseline + 5 pp
-  AND memory grows to a reasonable size (50–500 entries for T=15)
-  → green-light T=50, n=5 in a later session.
-- **Moderate**: ACC roughly matches baseline AND Task-0 ≥ baseline
-  by any positive margin. Counts as a win because the base model
-  has zero protection mechanisms — any non-collapse on Task-0
-  proves the memory substrate is doing the retention work, even
-  if the magnitude is small.
-- **Concerning**: Task-N collapses (means retrieval is dominating
-  poorly on new tasks). The blend logic or the novelty threshold
-  needs tuning. Sweep ``--novelty-threshold`` (try 0.5, 0.8) and
-  ``--blend-max`` (try 0.3, 0.7) before pivoting again.
-- **Null**: Both ACC and Task-0 worse than baseline → the dual-
-  substrate hypothesis is wrong; retrieval over a free-running
-  model doesn't help and the trade-off is intrinsic to the
-  function being learned, not to the substrate that holds it.
-  Pivot direction: investigate stronger memory mechanisms
-  (parametric memory à la GEM) or accept the Phase-B Pareto
-  frontier as the final story for the article.
+The startup banner should now show:
 
-## Reference numbers from the path-D T=15 pilot
+```
+Keying encoder: pretrained_contrastive (loaded from ...)
+Re-encoding mode: DISABLED (frozen keying encoder — re_encode_memory short-circuits)
+```
 
-(Mean across 3 seeds; for the comparison the new pilot prints.)
+The per-task ``re-encoded N entries`` lines won't appear (frozen
+encoder ⇒ structural no-op; the print is suppressed in this mode).
+The memory growth pattern is the key diagnostic — at the end you
+should see something like:
 
-| config                                  | ACC    | Task-0 | Task-N |
-|-----------------------------------------|-------:|-------:|-------:|
-| cs_gated_cosine_developmental           | 0.8143 | 0.8047 | 0.9063 |
-| cs_reward_developmental                 | 0.6683 | 0.2004 | 0.9317 |
-| cosine_reward_developmental             | 0.8291 | 0.7317 | 0.8985 |
-| reward_only_static                      | 0.6683 | 0.2004 | 0.9317 |
+```
+per-task memory size: t0=N0, t1=N1, ..., t14=N14
+```
 
-The new pilot should be compared against
-``cs_gated_cosine_developmental`` (the unchanged baseline).
-Anything that beats Task-0 = 0.8047 wins on retention; anything
-that holds ACC ≥ 0.8143 wins on aggregate.
+**Uniform growth across all 15 tasks** is the dual-substrate
+hypothesis confirmed: the frozen encoder maps different-perm
+inputs to different feature regions, so the novelty gate fires
+correctly on every task. If memory grows only on task 0 (like the
+trainable-encoder runs), the encoder isn't permutation-invariant
+enough and we'd need to retrain it.
 
-## What's been kept from prior lines of work
+ETA: similar to the previous pilot (~12 min at T=15, n=2 on CPU).
+Maybe slightly faster because re-encoding is disabled.
 
-The reward / path-A / path-C / path-D infrastructure is **not
-reverted**:
+## Decision criteria for the Option B pilot
 
-- ``true_label`` + ``label_histogram_json`` metadata on
-  cold-storage entries (cheap, possibly reusable).
-- ``RetrievalEnsemble.label_source`` config + breakdown.
-- ``SynapseAugmentedMLP(consolidation_mode="per_class", ...)``
-  as an opt-in mode (not recommended with current cosine gating).
-- ``apply_hebbian_update(reward_signal=..., reward_mode="per_sample")``
-  + ``current_maturity`` property.
-- ``REWARD_CONFIGS`` registry with the four named configs.
-- ``ConsolidationTrigger.mode={pressure,count}``.
-- Exp 25, 27 driver scripts.
+- **Strong win**: ACC ≥ 0.78 AND Task-0 ≥ 0.70 AND memory grows
+  uniformly across all 15 tasks → the dual-substrate hypothesis is
+  confirmed with rigorous methodology. Worth investing in T=50
+  n=5 in a later session.
+- **Moderate**: Task-0 ≥ 0.55 with uniform memory growth → the
+  architecture works but needs tuning (sweep `--blend-max`,
+  `--novelty-threshold`).
+- **Null**: Task-0 ≤ 0.40 OR memory still concentrates in Task 0
+  → the encoder isn't permutation-invariant enough. First check
+  the exp-29 sanity numbers (linear probe accuracy, same-digit
+  similarity, gap). If those passed, the issue is downstream —
+  maybe the encoder is permutation-invariant on raw MNIST but the
+  retrieval threshold needs lowering, or the InfoNCE temperature
+  needs tuning.
 
-All of those still work; the dual-substrate work just adds a parallel
-``episodic`` subpackage and a new experiment driver.
+## Reference numbers to compare against
 
-## What's explicitly DISABLED in cs_episodic_dual_substrate
+| pilot | ACC | Task-0 | Task-N | memory growth pattern |
+|---|---:|---:|---:|---|
+| baseline (cs_gated_cosine_developmental) | 0.816 | 0.798 | 0.906 | n/a |
+| dual-substrate, blend_max=0.5, **trainable encoder, no re-encoding** | 0.666 | 0.218 | 0.931 | unknown |
+| dual-substrate, blend_max=0.5, **trainable encoder, no re-encoding** (rerun) | 0.692 | 0.341 | 0.928 | unknown |
+| dual-substrate, blend_max=1.0, **trainable encoder, re-encoding ON** | 0.589 | 0.389 | 0.755 | task-0-dominated (92 entries through task 11) |
+| **dual-substrate, blend_max=0.5 (default), pretrained_contrastive keying** | **TBD** | **TBD** | **TBD** | **TBD — operator runs** |
 
-- No ``SynapseLayer``
-- No ``SynapseAugmentedMLP`` wrapper (we use plain ``MLPClassifier``)
-- No cosine gating (``apply_gradient_gating``)
-- No Hebbian state, no ``apply_hebbian_update``
-- No EWC, no parameter-protection regulariser
-- No reward computer or reward mixer
-- No cold storage (the memory is in-memory Python lists, not
-  Chroma-backed for v1)
+The operator's question to answer: does the pretrained_contrastive
+row push Task-0 from ~0.3-0.4 toward ≥ 0.55 (moderate) or ≥ 0.70
+(strong)? AND does the memory grow on every task?
 
-That's the architectural bet: the model is free.
+## What's been kept across the storage-line work
 
-## Files of interest
+The path-A / path-B / path-C / path-D / reward / re-encoding
+infrastructure all remains in the codebase. None of the new files
+shadow the old; the new line lives entirely under
+``src/continual_synapse/episodic/`` and
+``experiments/28_*``, ``experiments/29_*``. All test changes are
+additive.
 
-- ``src/continual_synapse/episodic/active_memory.py`` (new) —
-  ``ActiveEpisodicMemory`` with gradient-free allocation.
-- ``src/continual_synapse/episodic/episodic_predictor.py`` (new) —
-  blend-at-inference wrapper.
-- ``src/continual_synapse/episodic/training_configs.py`` (new) —
-  ``EpisodicConfig`` + ``EPISODIC_CONFIGS`` registry.
-- ``experiments/28_episodic_dual_substrate_eval.py`` (new) — the
-  manual driver.
-- ``decisions_log.md`` — the architectural rationale and the
-  prior-three-paths retrospective.
+## What's explicitly NOT done in this pilot
+
+- The frozen encoder uses raw MNIST. The continual benchmark uses
+  permuted MNIST. They share the digit-class label space but no
+  permutation info — the encoder doesn't see the benchmark's
+  specific permutations. This is the methodological discipline
+  the user called out: no future-task leakage.
+- No fine-tuning of the encoder during continual training. The
+  frozen contract is structural (`PretrainedContrastiveEncoder.train()`
+  is overridden to no-op), so even a stray `predictor.train()`
+  call can't accidentally re-enable gradients on the encoder.
+- Re-encoding is disabled in this mode. A frozen encoder produces
+  identical output every call, so the round-trip is a no-op by
+  construction. `predictor.re_encode_memory()` short-circuits to
+  return 0 immediately when `keying_encoder` is set.
+
+## Files of interest (new this session)
+
+- ``src/continual_synapse/episodic/contrastive_encoder.py``:
+  ``ContrastiveEncoder``, ``info_nce_loss``, ``random_permutation``,
+  ``apply_permutation``.
+- ``src/continual_synapse/episodic/frozen_encoder.py``:
+  ``PretrainedContrastiveEncoder`` (loads + freezes + eval-locks).
+- ``experiments/29_pretrain_contrastive_encoder.py``: the
+  pretraining script with three sanity-check assertions.
+- ``experiments/28_episodic_dual_substrate_eval.py``: now accepts
+  ``--keying-encoder`` and ``--pretrained-encoder-path``.
 
 ## Suite status
 
-**430 tests passing** at the end of this session:
+**444 tests passing** at the end of this session:
 
-| baseline pre-session | + Phase 1 active_memory | + Phase 2 predictor | total |
+| pre-session (re-encode fix) | + contrastive_encoder | + frozen_encoder | total |
 |---:|---:|---:|---:|
-| 416 | +8 | +6 | 430 |
+| 435 | +6 | +3 | 444 |
 
-(Phase 0 was docs only, Phase 3 added the config + a smoke test
-without unit tests, Phase 4 added the driver — manual run, not
-exercised by pytest.) No new dependencies introduced.
+No new dependencies introduced (the linear probe in exp 29 uses a
+single ``torch.nn.Linear`` rather than sklearn).
 
-## If the dual-substrate hypothesis fails
+## If Option B works at T=15
 
-The Pareto-frontier framing from the Phase B verdict
-(``decisions_log`` 2026-05-26) remains the fallback story for the
-follow-up article. The reward-as-confidence work also stands as a
-publishable finding even if it doesn't ship as the final design —
-the Chebyshev anti-correlation between R and feature magnitude
-(commit ``5d525d3``) reveals a hidden coupling worth writing up.
+The next session would:
+1. Run T=50 n=5 with the same `--keying-encoder pretrained_contrastive`
+   to validate at scale (expected ~few hours wall-clock).
+2. Run exp 24 retention analysis on the T=50 JSON for the retention
+   curve + heatmap + Wilcoxon Bonferroni comparison vs the existing
+   T=50 baseline data.
+3. Consider promoting `ActiveEpisodicMemory` to ChromaDB-backed
+   storage if entry counts get into the thousands.
+
+## If Option B fails
+
+Three diagnostic branches, in order of cost:
+
+1. **Tune the InfoNCE temperature / projection_dim / epochs** in
+   exp 29 and re-pretrain (cheap, ~30 min).
+2. **Try a different frozen encoder** — random projection
+   (`nn.Linear(784, feature_dim)` with no training) as an extreme
+   ablation. If random projection beats trainable encoder, the
+   issue is drift, not representation quality.
+3. **Pivot away from the dual-substrate story entirely** — the
+   Pareto-frontier framing from the Phase B verdict remains the
+   fallback story for the article.
 
 ## Open todos (deferred, not blocking)
 
-- **n=10 validation** on the Phase B configs for clean Wilcoxon
-  Bonferroni at T=50. (Unchanged from prior handoffs.)
-- **Decay-subsystem honesty note** in README. (Unchanged.)
-- **Promote ActiveEpisodicMemory to disk-backed storage** via
-  ``ColdStorage`` if the dual-substrate hypothesis works at T=15
-  and we need to scale to T=50 with many more entries.
+- n=10 validation on Phase B configs at T=50 (unchanged).
+- Decay-subsystem honesty note in README (unchanged).
+- Promote ``ActiveEpisodicMemory`` to disk-backed storage if T=50
+  pilot needs it (deferred until we know whether the architecture
+  works at T=15).
