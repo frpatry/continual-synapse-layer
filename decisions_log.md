@@ -6,6 +6,133 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-26] Phase B verdict + Cold Storage v2 transition (path-B pilot null)
+
+Three connected findings closing Phase B and opening (then closing
+the path-B sub-direction of) the Cold Storage v2 line of work.
+
+### 1. Phase B verdict — a Pareto frontier, not a single winner
+
+At T=50 on Permuted-MNIST (5 seeds per config), the three Phase B
+``cs_gated_cosine_developmental`` variants land at:
+
+| Config            | Aggregate ACC      | Task-0 retention (R[T-1,0]) |
+|-------------------|--------------------|------------------------------|
+| baseline (target=50, α=0.9)   | 0.516             | 0.463                       |
+| scout_mat100_validated (target=100, α=0.9) | dominated        | dominated                   |
+| **scout_combined** (target=100, α=0.95)    | **0.565** (+4.9 pp) | mid-pack                   |
+| **scout_a095_validated** (target=50, α=0.95) | mid-pack         | **0.619** (+15.6 pp)        |
+
+The two informative hyperparameters (``maturity_target_consolidations``
+and ``gradient_gating_alpha``) trade off rather than compound:
+
+- Raising ``alpha`` past 0.9 buys Task-0 retention at the cost of
+  some aggregate ACC.
+- Raising ``target`` past 50 buys aggregate ACC at the cost of
+  Task-0 retention.
+- The "combined" cell (target=100 + α=0.95, untested in Phase A)
+  picks up some of each but doesn't escape the frontier.
+
+``scout_mat100_validated`` (target=100, α=0.9) is dominated on
+both axes by the other two — no scenario where we'd ship it.
+
+### 2. EWC λ=10 still owns Task-0 retention at T=50
+
+For reference: ``ewc_lam_10`` on the same Permuted-MNIST 15→50
+benchmark scales Task-0 retention to **0.834** at T=50, well above
+every Phase B variant including scout_a095 (0.619). EWC's
+aggregate ACC at T=50 is comparable to scout_combined. So:
+
+- If the headline metric is **aggregate ACC**: scout_combined and
+  EWC are roughly tied.
+- If the headline metric is **Task-0 retention** (the
+  catastrophic-forgetting hypothesis): EWC wins outright.
+- The gap our architecture has to close at T=50 to dethrone EWC is
+  **+21.5 pp on Task-0 retention** (0.834 vs 0.619).
+
+This is the Pareto-frontier framing the follow-up writeup will use.
+
+### 3. Cold Storage v2 (CLS-style retrieval ensemble) — path B is dead
+
+To close the EWC Task-0 gap without retraining, exp 25 implemented
+``RetrievalEnsemble`` (``src/continual_synapse/inference/retrieval_ensemble.py``):
+at inference, each test sample's penultimate activation is cosine-
+similarity matched against every stored cold-storage embedding;
+the top-k entries' labels (derived once at init by passing each
+stored embedding through the *current* model's classifier head,
+then argmax) cast a similarity-weighted vote; the model's softmax
+is blended with the vote when the top-1 sim crosses ``tau``.
+
+The path-B premise: "labels-as-of-now" derivation gives useful
+proxies for what stored activations represent. The exp 25 T=15
+pilot (n=3 seeds, baseline + 3 retrieval configs) introduced a
+**label-derivation accuracy diagnostic** that, for each stored
+entry, compares the derived label against the true label of the
+nearest test sample from the same task. The diagnostic answers
+"are the labels we're voting with even right?" before we
+interpret the retrieval numbers.
+
+Result at T=15:
+
+```
+seed 0: 10.9% (11/101 correctly relabeled)
+seed 1: 26.2% (27/103 correctly relabeled)
+seed 2: 19.1% (21/110 correctly relabeled)
+average: 18.7%
+```
+
+18.7% is **well below 50%** and only marginally above the 10%
+chance level for 10 classes. The model's head has drifted so far
+from where it was at consolidation time that old activation
+patterns get classified roughly at chance. Consistent with this,
+all three retrieval configs degrade aggregate ACC at T=15 vs
+baseline scout_a095:
+
+- baseline:        ACC=0.814   Task-0=0.814
+- v2_mild:         ACC=0.807   (Δ ACC: −0.7 pp, Δ Task-0: −0.7 pp)
+- v2_moderate:     ACC=0.766   (Δ ACC: −4.7 pp, Δ Task-0: −4.3 pp)
+- v2_aggressive:   ACC=0.713   (Δ ACC: −10.0 pp, Δ Task-0: −9.1 pp)
+
+**Conclusion: path B is unrecoverable.** The infrastructure stands
+(RetrievalEnsemble + checkpoint persistence + diagnostic), but
+the labels-as-of-now derivation is too noisy on a forgotten head.
+Future work on Cold Storage v2 needs **path A**: instrument the
+consolidation pipeline to record the dominant true label per
+batch, save it in entry metadata, and use that at retrieval time.
+That requires a fresh training run with the new instrumentation —
+no shortcut around it.
+
+### 4. Honesty note for README / article: decay subsystem is inert
+
+The cold-storage decay subsystem (age-thresholded quantisation
+tier transitions at 32 → 16 → 8 → 4 bit) is fully implemented
+and exercised in unit tests, but under
+``cs_gated_cosine_developmental`` the stored strengths matrices
+never feed back into the model's output: the gating pathway only
+reads cold-storage *embeddings* (via the cosine-similarity
+familiarity signal). The decoded strengths matrices that the
+decay schedule operates on are computed and discarded.
+
+Practical consequence: changing the decay schedule has zero
+measurable effect on headline metrics under this method
+(confirmed by the Phase A scout's null finding logged on
+2026-05-25). The decay machinery is a Phase 4 / cs_full
+architectural feature that became dormant when we moved to
+gradient-gating. The followup article and the README should
+flag this explicitly to avoid suggesting we're using a piece
+of the architecture we're not actually using.
+
+### What lands in the next session
+
+- **Decision point**: pursue path A (retrain with label storage)
+  or pivot to a different mechanism entirely.
+- **Reference data**: all Phase B + Cold Storage v2 v1 numbers
+  saved under ``results/logs/`` and ``results/analysis/``;
+  ``SESSION_HANDOFF.md`` at repo root has the immediate-next-
+  command and a path-A sketch.
+
+---
+
 ## [2026-05-25] Phase A hyperparameter scout — null finding on compression schedule
 
 ### What was tested
