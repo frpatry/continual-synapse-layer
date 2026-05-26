@@ -6,6 +6,81 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-26] Path-C pilot — per-class consolidation not the right pivot
+
+Hypothesis from the path-A post-mortem: hard-label retrieval was neutral
+because mean-pooled embeddings over mixed-class batches are class-
+diluted even when the label is correct. Path C tested the fix —
+per-class aggregation within each consolidation window, so each stored
+entry is a class-pure prototype. ``consolidation_mode="per_class"`` +
+``min_samples_per_class=5`` shipped as commit ``1885443`` (refactor +
+5 unit tests; aggregate mode kept bit-identical for back-compat).
+
+The T=15 n=3 pilot started clean but the harness killed it ~10 minutes
+into seed 1 wall-clock (per-class training was ~8× slower than path-A,
+~41 minutes/seed, because each consolidation event now produces ~10
+Chroma inserts instead of 1). Seed 0 completed both training and
+evaluation before the kill, and the result is decisive enough at n=1:
+
+| metric | path-A (n=3) | path-C seed 0 |
+|---|---:|---:|
+| stored entries | 104–108 | **1577** (15×) |
+| path-B label-derivation accuracy on the stored entries | 26–29% | **85.4%** |
+| baseline scout_a095 ACC | 0.8143 | **0.766** (−4.9 pp) |
+| baseline scout_a095 Task-0 | 0.8047 | **0.768** (−4.4 pp) |
+| best retrieval Δ Task-0 vs the same-pilot baseline | −0.03 pp | −0.9 pp |
+
+Two findings:
+
+1. **Storage quality is not the bottleneck.** Path C produced exactly
+   the cleaner per-class signal the post-mortem hypothesised — the
+   label-derivation diagnostic jumped from ~28% to ~85%, confirming
+   per-class prototypes are dramatically more class-discriminative
+   under the model's head. The class-dilution hypothesis was right.
+   The retrieval mechanism is just not the operative degree of
+   freedom for closing the EWC Task-0 gap.
+2. **Inflating cold storage breaks training itself.** The baseline
+   (no-retrieval) ACC dropped ~5 pp under path C. ``scout_a095_validated``
+   uses cosine gating: gradient updates are scaled by
+   ``1 - alpha * familiarity`` where ``familiarity`` is the max cosine
+   similarity to any stored embedding. With 15× more entries — and
+   class-pure ones at that — virtually every input crosses the
+   familiarity threshold, so gradient gating clamps learning across
+   the board. New-task acquisition degrades, taking aggregate ACC
+   down with it. This is a real architectural interaction, not a
+   tuning issue; raising the threshold or quantile would just shift
+   the operating point of the same trade-off.
+
+**Conclusion: pivot away from "make stored embeddings better".**
+Storage quality has now been tested in three forms — labels-as-of-now
+(path B), true-label-aggregate (path A), class-pure-prototype
+(path C) — and none of them give retrieval a measurable Task-0
+lift on the current architecture. The bottleneck is upstream:
+the system that consumes the labels and embeddings hasn't been
+asked to behave differently across them. The next direction is
+**reward-as-confidence**: turn the dormant constant-R Hebbian update
+into a per-sample informativeness signal (error + uncertainty +
+calibration mismatch, with a developmentally-modulated weight),
+so the synapse layer actually learns more from informative samples
+than from routine ones.
+
+The per-class consolidation code stays in the repo as an opt-in
+mode (``consolidation_mode="per_class"``). It backfires with the
+current cosine gating, but the mechanism itself is sound — could
+become useful if the gating is changed or replaced. Documented
+this caveat in ``SynapseAugmentedMLP``'s constructor doc and in
+the next handoff.
+
+### Artifacts
+- Path-C seed-0 checkpoint (local only):
+  ``results/checkpoints/phase_c/scout_a095_T15_seed0.pt`` (117 MB,
+  8× larger than path-A's 15 MB due to the 15× entry count)
+- Full pilot log: ``/tmp/exp25_path_c.log`` (seed 0 complete; seed 1
+  cut off mid-training)
+- No JSON written (the script flushes after all seeds finish)
+
+---
+
 ## [2026-05-26] Cold Storage v2 path-A pilot — mechanism works, criterion fails
 
 Path-A retraining at T=15 (n=3) completed cleanly. The path-B failure

@@ -1,176 +1,209 @@
-# Session handoff — 2026-05-26 (path-A pilot complete)
+# Session handoff — 2026-05-26 (path-C verdict + reward-as-confidence pivot)
 
 ## Where we are
 
-Cold Storage v2 path-A pilot at T=15 (n=3) is **complete and clean**.
-The mechanism works exactly as designed — every consolidated entry on
-the new checkpoints carries a ground-truth ``true_label`` (100%
-coverage across all 3 seeds), and ``label_source="true_label"``
-succeeded without falling back to derived labels even once.
+The Cold Storage v2 retrieval-ensemble line of work is **closed as
+a dead end** on the current architecture. Three storage variants
+tested at T=15 — path B (labels-as-of-now), path A (true-label
+aggregate), path C (class-pure prototypes) — and none of them
+produced a measurable Task-0 lift over the no-retrieval baseline.
 
-**But the decision criterion failed.** None of the three retrieval
-configurations improved Task-0 retention by ≥ +5 pp over the
-no-retrieval baseline. Δ Task-0 was essentially neutral
-(−0.03 / −0.72 / −0.85 pp). Wilcoxon pairwise on Task-0 is saturated
-at p_bonf = 1.00.
+**Path-C added a new finding**: storage quality is not the
+bottleneck. The label-derivation diagnostic jumped from path-A's
+26-29% to path-C's 85.4% — per-class prototypes ARE dramatically
+more class-discriminative. But the retrieval ensemble's Task-0
+delta stayed neutral, AND inflating cold storage by 15× broke
+``scout_a095``'s training dynamics (baseline ACC dropped from
+0.815 to 0.766) because cosine gating saturates when too many
+familiar-looking patterns are stored.
 
-The qualitative win is that path A removed path B's catastrophic
-collapse entirely: v2_aggressive recovered ~8 pp of aggregate ACC
-(from 0.713 path-B to 0.796 path-A). Mechanism real; gain in the
-headline metric absent at T=15.
+Conclusion: the limit is upstream of storage. The Hebbian update's
+reward signal ``R`` has been a constant 1.0 throughout the entire
+project. Every sample contributes equally to synapse updates,
+whether it's a routine correct prediction or a confidently-wrong
+edge case. **The next direction is to make R per-sample.**
 
-See decisions_log entry "2026-05-26 Cold Storage v2 path-A pilot —
-mechanism works, criterion fails" for the long-form narrative.
+See decisions_log entries "Cold Storage v2 path-A pilot — mechanism
+works, criterion fails" and "Path-C pilot — per-class consolidation
+not the right pivot" for the long-form narrative on the storage-
+quality dead end.
 
-## Immediate next decision
+## What ships in this session (incremental, all committed)
 
-**Three options on the table** for whoever picks this up next:
+Three commits land the architecture work and one ships the
+verdict:
 
-1. **Step 4 — soft voting via ``label_histogram_json``.** Path-A
-   checkpoints already store the per-class histogram from each
-   consolidation batch (step 1 wrote it; step 2 deliberately ignored
-   it). Replace the hard argmax vote in ``RetrievalEnsemble`` with a
-   soft distribution-weighted vote. **No retraining required** —
-   re-runs eval on the existing path-A checkpoints. If "hard labels
-   collapse useful within-batch ambiguity" is the failure mode, this
-   recovers the lost signal. ~30 min eval per seed.
-2. **T=50 path-A pilot.** Headroom is much bigger at T=50
-   (baseline Task-0 ~0.46–0.62 vs ~0.80 at T=15), so the same
-   mechanism could potentially produce a measurable Task-0 lift
-   where T=15 didn't have room. Cost: ~3 h per seed × n=5 = ~15 h
-   training plus a few minutes of eval. Risk: if soft voting (option
-   1) wins, this gets rerun anyway with the better mechanism.
-3. **Abandon Cold Storage v2 retrieval-ensemble entirely** and move
-   to a different direction (embedding-space regulariser, parametric
-   memory à la GEM, or treat the Phase B Pareto frontier as the
-   final story for the article). The Wilcoxon p-values say there's
-   no rescue hiding in the current variant.
+- `78f514c` — path-A step 1: ``true_label`` + ``label_histogram``
+  captured at consolidation time; backward-compatible.
+- `a5cbd90` — path-A step 2: ``RetrievalEnsemble.label_source``
+  config + ``label_source_breakdown`` diagnostic.
+- `1860569` — path-A T=15 pilot: 100% true_label coverage,
+  retrieval neutral, decision-criterion fail.
+- `1885443` — path-C step 1: ``consolidation_mode="per_class"``
+  refactor + 5 tests; aggregate mode bit-identical.
+- (this commit) — path-C verdict documented; SESSION_HANDOFF
+  pivots to reward-as-confidence.
 
-Suggested ordering: try option 1 first (cheap), use its result to
-decide between option 2 and option 3.
+## Immediate next direction — reward-as-confidence
 
-## What completed this session
+Replace the constant ``R = 1.0`` in the Hebbian update with a
+per-sample informativeness signal computed from the model's own
+output:
 
-Three commits ship the path-A line of work:
-
-- `78f514c` — step 1: ``consolidate_to_storage`` + ``apply_hebbian_update``
-  capture ``true_label`` and ``label_histogram`` per consolidation batch.
-  Backward-compatible; 7 new tests.
-- `a5cbd90` — step 2: ``RetrievalEnsemble.from_model_and_storage``
-  gains ``label_source ∈ {auto, true_label, derived}`` and exposes
-  ``label_source_breakdown``. 7 new tests.
-- (this commit) — step 3: exp 25 plumbed with ``--label-source`` and
-  ``--run-tag``; pilot run; comparison vs path B; exp 24 retention
-  analysis on the new JSON.
-
-T=15 path-A pilot artifacts:
-
-- 3 fresh checkpoints at ``results/checkpoints/phase_a/scout_a095_T15_seed{0,1,2}.pt``
-  (15 MB each — local only, not committed; regenerable with the exp
-  25 command below)
-- Results JSON: ``results/logs/retrieval_ensemble/1779796716_25_T15_path_a.json``
-- Retention analysis: ``results/analysis/retrieval_ensemble_retention_path_a.json``
-- Figures: ``results/figures/retrieval_ensemble/path_a/{retention_curve,retention_heatmap}_T15.png``
-- Pilot log: ``/tmp/exp25_path_a.log`` (also local only)
-
-## Path A vs Path B at T=15 — headline table
-
-| config         | path-B ACC | path-A ACC | Δ ACC      | Task-0 path-A | Δ Task-0 vs path-A baseline |
-|----------------|-----------:|-----------:|-----------:|--------------:|----------------------------:|
-| baseline       | 0.8137     | 0.8143     | +0.06 pp   | 0.8047 (ref)  | 0.00 pp                     |
-| v2_mild        | 0.8066     | 0.8124     | +0.58 pp   | 0.8044        | −0.03 pp                    |
-| v2_moderate    | 0.7663     | 0.8003     | +3.40 pp   | 0.7974        | −0.72 pp                    |
-| v2_aggressive  | 0.7134     | 0.7956     | +8.22 pp   | 0.7961        | −0.85 pp                    |
-
-Label source breakdown per seed (100% coverage on all):
-``104 / 105 / 108 true_label, 0 derived``.
-
-## Re-running the pilot from scratch
-
-```bash
-rm -rf results/checkpoints/phase_a
-python experiments/25_retrieval_ensemble_eval.py \
-    --task-lengths 15 --seeds 0 1 2 \
-    --checkpoint-dir results/checkpoints/phase_a \
-    --label-source true_label --run-tag path_a
+```
+R_i = (1 - γ) * [α * error_i + (1 - α) * uncertainty_i]
+      + γ * |calibration_i|
 ```
 
-Total wall-clock: ~19 minutes (3 seeds × ~5 min training + per-seed
-eval). The earlier 1.5 h estimate was conservative.
+Where ``α`` is **developmental** — low (0.2) when the model is
+young (mostly weights uncertainty), rising to a capped maximum
+(0.85) as the consolidation count grows (mostly weights error).
+The cap prevents late-stage stagnation; even a "mature" system
+should keep listening to uncertainty.
 
-## Re-generating the retention analysis from the existing JSON
+Three planned configs (alongside the unchanged ``cs_gated_cosine_developmental``
+baseline):
+
+1. ``cs_reward_developmental``: reward signal ON, cosine gating OFF
+   — isolates R alone
+2. ``cosine_reward_developmental``: both ON — the composition we
+   expect to be best
+3. ``reward_only_static``: reward signal ON with α = 0.5 constant
+   — ablates the developmental component
+
+The infrastructure for this lands in subsequent commits in this
+same session. The experiment itself is **not run** in-session —
+you trigger it manually in a terminal (see "Running the pilot"
+below).
+
+## What's been kept from the dead-end paths
+
+The path-A and path-C code is **not reverted**:
+
+- ``true_label`` + ``label_histogram_json`` metadata stays on
+  cold-storage entries (cheap; useful baseline for any future
+  retrieval revival).
+- ``RetrievalEnsemble.label_source`` flag stays.
+- ``SynapseAugmentedMLP(consolidation_mode="per_class", ...)``
+  stays as an opt-in mode. **Don't use it with the current cosine
+  gating** — see the path-C decisions_log entry for the
+  interaction that breaks baseline training. Could be revisited
+  if cosine gating is replaced.
+
+All three are no-ops at their defaults (``aggregate`` mode,
+``label_source="auto"``, no ``training_target`` passed). Loading
+older checkpoints still works.
+
+## Running the pilot (manual, when ready)
 
 ```bash
-python experiments/24_retention_analysis.py \
-    --log-paths results/logs/retrieval_ensemble/1779796716_25_T15_path_a.json \
-    --fig-dir results/figures/retrieval_ensemble/path_a \
-    --analysis-path results/analysis/retrieval_ensemble_retention_path_a.json
+python experiments/27_reward_as_confidence_eval.py --T 15 --n_seeds 3
 ```
 
-## Phase B reference numbers (T=50, n=5)
+(Defaults: 4 configs — baseline + 3 reward variants, output dir
+``results/logs/reward_confidence/``, checkpoint dir
+``results/checkpoints/phase_d/``.)
 
-Unchanged from the previous handoff — kept here for the Pareto-
-frontier writeup.
+ETA: path-A took 19 minutes at T=15 n=3; the reward signal adds
+one small extra compute step per batch (softmax + entropy +
+calibration); expect ~25 minutes. Per-class consolidation mode
+should NOT be used with these configs (cosine gating still
+active in two of them).
 
-| Config | Aggregate ACC | Task-0 retention |
-|---|---:|---:|
-| baseline (target=50, α=0.9) | 0.516 | 0.463 |
-| scout_combined (target=100, α=0.95) | **0.565** | mid-pack |
-| scout_a095_validated (target=50, α=0.95) | mid-pack | **0.619** |
-| scout_mat100 (target=100, α=0.9) | dominated | dominated |
-| **ewc_lam_10** (reference, separately trained) | comparable to scout_combined | **0.834** |
+## Decision criteria for the reward-as-confidence pilot
 
-Gap our architecture needs to close to dethrone EWC on Task-0
-retention at T=50: **+21.5 pp**.
+Baseline reference is ``cs_gated_cosine_developmental`` at T=15
+n=3 (the unchanged scout_a095_validated config; numbers from path
+A's pilot, since path A's training is bit-identical to baseline
+when path A's only change — ``training_target=y`` flowing into
+``apply_hebbian_update`` — has no effect without an
+``ExternalReward``):
+
+| metric | baseline value at T=15 n=3 |
+|---|---:|
+| aggregate ACC | 0.8143 |
+| Task-0 retention | 0.8047 |
+| Task-N final (new diagnostic) | TBD — measured during the pilot |
+| Forgetting | TBD |
+
+Decision tiers:
+
+- **Strong win**: ≥1 reward config beats baseline on Task-0 by
+  ≥ +3 pp without losing more than 2 pp of aggregate ACC →
+  green-light a T=50 n=5 run in a separate session.
+- **Modest signal**: ≥1 reward config moves Task-0 by ≥ +1 pp
+  in the right direction → tune α schedule / γ / floor and
+  rerun before T=50.
+- **Null**: no reward config moves Task-0 from baseline → the
+  per-sample-R hypothesis is wrong; pivot again (see below).
+- **Catastrophic**: any reward config crashes baseline training
+  (aggregate ACC drops > 5 pp) → the per-sample weighting is
+  destabilising; investigate normalization / floor / α cap
+  before the next attempt. ``reward_only_static`` is the
+  control here — if only the developmental variant crashes,
+  α is the problem; if static also crashes, the formula itself
+  needs work.
+
+Additional diagnostic from the exp 27 script:
+``reward_statistics_per_consolidation`` records mean and variance
+of R at each consolidation event. If late-training variance
+collapses (> 50% drop from early variance), the signal has
+saturated and the developmental α cap was insufficient.
+
+## If the reward direction also fails
+
+The Pareto-frontier framing from the Phase B verdict (decisions_log,
+2026-05-26) remains the fallback story for the follow-up article.
+The architecture's two informative knobs (``maturity_target_consolidations``
+and ``gradient_gating_alpha``) trade Task-0 retention against
+aggregate ACC, with EWC λ=10 owning Task-0 retention outright
+at T=50. That's a publishable result even if no future work
+closes the +21.5 pp gap.
 
 ## Open todos (deferred, not blocking)
 
-- **Step 4 (soft voting via histogram).** Re-evaluate the same path-A
-  checkpoints with a histogram-aware ``RetrievalEnsemble``. Path: add
-  a ``vote_mode ∈ {"hard", "soft"}`` flag (or a third label-source
-  value), read ``metadata.get("label_histogram_json")``, accumulate
-  per-class soft votes weighted by similarity. No retraining.
-- **Decay-subsystem honesty note** in README and the follow-up
-  article: stored strengths matrices computed and discarded under
-  ``cs_gated_cosine_developmental`` — the decay machinery is dormant
-  Phase 4 / cs_full infrastructure. (Unchanged from previous handoff.)
 - **n=10 validation** on scout_combined and scout_a095 for clean
-  Wilcoxon Bonferroni at T=50. (Unchanged.)
+  Wilcoxon Bonferroni at T=50. (Unchanged from prior handoffs.)
+- **Decay-subsystem honesty note** in README and the follow-up
+  article: under ``cs_gated_cosine_developmental`` the stored
+  strengths matrices are computed and discarded. (Unchanged.)
+- **Soft voting via ``label_histogram_json``** (would have been
+  step 4 of the path-A line). Cheap, no retraining needed,
+  but probably moot given path C disproved the storage-quality
+  hypothesis. Document but don't pursue.
 
-## Key design choices preserved across path A
+## Key design choices preserved across the storage-line work
 
-1. Features extracted via ``base.features(x)``, **not** the
-   modulator-augmented ``model.features(x)`` — same vector space the
-   stored embeddings live in.
-2. Cosine sims clipped at 0 in the weighted vote so anti-correlated
-   entries don't subtract from a class's tally.
-3. ``RetrievalEnsemble.predict`` puts the model in ``eval()`` and
-   restores the prior ``training`` flag.
-4. Checkpoint format = single ``.pt`` with ``model_state_dict`` +
-   serialised ``cold_storage_entries`` (embedding + document +
-   metadata) + ``config``. Path-A entries now carry ``true_label``
-   and ``label_histogram_json`` in metadata; backward-compatible
-   readers use ``metadata.get(...)``.
-5. Training passes ``on_task_change=notify_task_change`` (task_id
-   tagging) AND ``training_target=y`` (path-A label storage).
-6. ``label_source="auto"`` (the default) is bit-identical to the
-   pre-path-A ``"derived"`` behaviour on any store without
-   ``true_label`` metadata. Verified end-to-end against the path-B
-   ``scout_a095_T15_seed0.pt`` checkpoint.
+1. Features extracted via ``base.features(x)`` — same vector
+   space as stored embeddings.
+2. Cosine sims clipped at 0 in retrieval weighted-vote.
+3. ``RetrievalEnsemble.predict`` puts the model in ``eval()``
+   and restores the prior ``training`` flag.
+4. Checkpoint format = single ``.pt`` with ``model_state_dict``
+   + serialised ``cold_storage_entries`` + ``config``.
+   Path-A entries carry ``true_label`` + ``label_histogram_json``;
+   path-C entries carry ``true_label`` only (one-hot histogram
+   is redundant). All loadable via ``metadata.get(...)``.
+5. ``label_source="auto"`` (default) is bit-identical to the
+   pre-path-A ``derived`` behaviour on any store without
+   ``true_label`` metadata.
 
 ## Files of interest
 
-- ``src/continual_synapse/inference/retrieval_ensemble.py`` (step 2)
-- ``src/continual_synapse/consolidation/pipeline.py`` (step 1)
-- ``src/continual_synapse/baselines/synapse_finetune.py`` (step 1)
-- ``experiments/25_retrieval_ensemble_eval.py`` (step 3)
-- ``experiments/24_retention_analysis.py`` (works on the new JSON
-  via ``--log-paths``)
-- ``tests/test_retrieval_ensemble.py``, ``tests/test_consolidation_pipeline.py``,
-  ``tests/test_synapse_finetune.py`` (14 new tests across steps 1+2)
-- ``DESIGN.md``, ``PROJECT_PLAN.md``, ``decisions_log.md``
+- ``src/continual_synapse/baselines/synapse_finetune.py`` —
+  ``apply_hebbian_update``, ``SynapseAugmentedMLP``, where the
+  reward signal integrates next.
+- ``src/continual_synapse/reward/confidence_reward.py`` (new this
+  session, Phase 1) — the per-sample R utility.
+- ``experiments/27_reward_as_confidence_eval.py`` (new this
+  session, Phase 4) — the training + eval driver.
+- ``src/continual_synapse/inference/retrieval_ensemble.py`` —
+  unchanged; the retrieval line is closed but the code stays.
+- ``decisions_log.md`` — full narrative for paths A / B / C
+  and the rationale for the reward pivot.
 
 ## Suite status
 
-394 tests passing (380 baseline + 7 step-1 + 7 step-2). No new
-dependencies introduced.
+Will be 407+ tests passing after this session (399 before phase
+1; +8 reward-utility tests; +3 reward-integration tests; +0
+exp-27 tests since the script is not run). No new dependencies.
