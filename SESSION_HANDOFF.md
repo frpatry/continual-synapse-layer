@@ -130,8 +130,15 @@ older checkpoints still works.
 ## Running the pilot (manual, when ready)
 
 ```bash
+source .venv/bin/activate
 python experiments/27_reward_as_confidence_eval.py --T 15 --n_seeds 3
 ```
+
+The ``source .venv/bin/activate`` is required — the system has
+no ``python`` on PATH outside the venv. Once active your shell
+prompt shows ``(.venv)`` and ``python`` resolves to the venv's
+interpreter. All ``python ...`` commands in this handoff and in
+``decisions_log.md`` assume the venv is active.
 
 (Defaults: 4 configs — baseline + 3 reward variants, output dir
 ``results/logs/reward_confidence/``, checkpoint dir
