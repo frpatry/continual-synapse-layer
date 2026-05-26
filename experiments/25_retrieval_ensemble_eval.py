@@ -333,7 +333,12 @@ def _train_scout_a095_and_save(
         m.apply_gradient_gating()
 
     def on_after_batch(i, task, m, x, y):
-        m.apply_hebbian_update()
+        # training_target=y triggers path-A label storage: any
+        # consolidation that fires this batch stamps metadata with
+        # the dominant true class + per-class histogram. No effect on
+        # already-cached checkpoints (training is skipped when they
+        # exist); matters only for fresh runs.
+        m.apply_hebbian_update(training_target=y)
 
     def on_task_change(j, task, m):
         # Critical for the path-B label-derivation diagnostic: tags

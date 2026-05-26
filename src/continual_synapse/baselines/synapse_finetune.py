@@ -532,6 +532,17 @@ class SynapseAugmentedMLP(nn.Module):
                 always 1.0" pathway carry a genuine signal. No-op
                 when the reward_computer is anything else or the
                 training_target is None.
+
+                Second purpose (path-A label storage): when cold
+                storage and a consolidation trigger are also
+                configured, the dominant ground-truth class of this
+                batch (``torch.mode(training_target)``) plus a per-
+                class histogram are passed through to
+                :func:`consolidate_to_storage` so any entry created
+                this cycle carries ``metadata["true_label"]`` and
+                ``metadata["label_histogram_json"]``. ``None`` keeps
+                the pre-path-A behaviour (no label written, schema
+                matches older checkpoints).
             loss: Explicit per-batch loss for retrieval-success
                 feedback (amplification variant change 5). When
                 ``retrieval_feedback_threshold > 0`` and this batch's
@@ -596,6 +607,16 @@ class SynapseAugmentedMLP(nn.Module):
             and self.consolidation_trigger is not None
         ):
             embedding = features.mean(dim=0).to(torch.float32)
+            true_label: int | None = None
+            label_histogram: list[int] | None = None
+            if training_target is not None and training_target.numel() > 0:
+                targets_long = training_target.detach().to(torch.long).cpu()
+                true_label = int(torch.mode(targets_long).values.item())
+                if self._last_logits is not None:
+                    num_classes = int(self._last_logits.shape[-1])
+                    label_histogram = torch.bincount(
+                        targets_long, minlength=num_classes
+                    ).tolist()
             outcome = consolidate_to_storage(
                 self.synapse,
                 self.cold_storage,
@@ -604,6 +625,8 @@ class SynapseAugmentedMLP(nn.Module):
                 drain=not self.no_drain_on_consolidate,
                 merge_threshold=self.repeat_consolidation_threshold,
                 task_id=self._current_task_id,
+                true_label=true_label,
+                label_histogram=label_histogram,
             )
             if outcome.fired:
                 self._consolidation_count += 1

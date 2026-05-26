@@ -887,6 +887,59 @@ def test_training_target_noop_when_reward_computer_is_not_mixer() -> None:
     assert applied == 0.42
 
 
+# ---- Path-A: training_target flows into cold-storage metadata ----
+
+
+def test_apply_hebbian_update_derives_dominant_class() -> None:
+    """When cold storage fires AND training_target is supplied, the stored
+    entry's metadata carries the batch's dominant class plus a per-class
+    histogram."""
+    import json
+
+    aug, store, _ = _build_with_cold_storage(
+        threshold=0.0, collection="aug_path_a_dominant"
+    )
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(2.0)
+        aug.synapse.evidence.fill_(2.0)
+        aug.synapse.global_step.fill_(50)
+
+    aug.train()
+    aug(torch.randn(5, 4))
+    # Five samples, mode=0 (three zeros, two ones). num_classes from the
+    # base MLP head is 2 (see _build_with_cold_storage fixture).
+    y = torch.tensor([0, 0, 0, 1, 1], dtype=torch.int64)
+    aug.apply_hebbian_update(training_target=y)
+
+    assert store.count() == 1
+    entry = store.all_entries()[0]
+    assert entry.metadata["true_label"] == 0
+    histogram = json.loads(entry.metadata["label_histogram_json"])
+    assert histogram == [3, 2]
+
+
+def test_apply_hebbian_update_no_label_when_training_target_none() -> None:
+    """Default call (no training_target) must not write true_label or
+    label_histogram into stored metadata — preserves the pre-path-A
+    schema so old checkpoints stay structurally identical."""
+    aug, store, _ = _build_with_cold_storage(
+        threshold=0.0, collection="aug_path_a_no_target"
+    )
+    with torch.no_grad():
+        aug.synapse.strengths.fill_(2.0)
+        aug.synapse.evidence.fill_(2.0)
+        aug.synapse.global_step.fill_(50)
+
+    aug.train()
+    aug(torch.randn(3, 4))
+    aug.apply_hebbian_update()
+
+    assert store.count() == 1
+    entry = store.all_entries()[0]
+    assert "true_label" not in entry.metadata
+    assert "label_histogram_json" not in entry.metadata
+
+
 def test_last_logits_cached_only_in_training_mode() -> None:
     aug, _ = _build_augmented()
     aug.eval()

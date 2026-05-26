@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import json
+
 import pytest
 import torch
 
@@ -370,3 +372,58 @@ def test_task_id_stored_in_metadata_when_supplied() -> None:
     )
     entry = store.get_by_id(outcome.entry_id)
     assert entry.metadata["task_id"] == 7
+
+
+# ---- Path-A: true_label / label_histogram metadata ----
+
+
+def test_consolidate_to_storage_writes_true_label_when_provided() -> None:
+    layer = _populated_layer()
+    store = ColdStorage(collection_name="pipe_true_label_yes")
+    outcome = consolidate_to_storage(
+        layer, store, _trigger(),
+        activation_embedding=torch.zeros(4),
+        true_label=7,
+    )
+    entry = store.get_by_id(outcome.entry_id)
+    assert entry.metadata["true_label"] == 7
+
+
+def test_consolidate_to_storage_omits_true_label_when_none() -> None:
+    layer = _populated_layer()
+    store = ColdStorage(collection_name="pipe_true_label_no")
+    outcome = consolidate_to_storage(
+        layer, store, _trigger(),
+        activation_embedding=torch.zeros(4),
+    )
+    entry = store.get_by_id(outcome.entry_id)
+    assert "true_label" not in entry.metadata
+
+
+def test_consolidate_to_storage_writes_label_histogram_when_provided() -> None:
+    layer = _populated_layer()
+    store = ColdStorage(collection_name="pipe_hist_yes")
+    # Permuted-MNIST-like: 10 classes, batch size 16.
+    histogram = [0, 2, 0, 5, 0, 3, 1, 0, 4, 1]
+    assert sum(histogram) == 16
+    outcome = consolidate_to_storage(
+        layer, store, _trigger(),
+        activation_embedding=torch.zeros(4),
+        label_histogram=histogram,
+    )
+    entry = store.get_by_id(outcome.entry_id)
+    decoded = json.loads(entry.metadata["label_histogram_json"])
+    assert decoded == histogram
+    assert len(decoded) == 10
+    assert sum(decoded) == 16
+
+
+def test_label_histogram_omitted_when_target_none() -> None:
+    layer = _populated_layer()
+    store = ColdStorage(collection_name="pipe_hist_no")
+    outcome = consolidate_to_storage(
+        layer, store, _trigger(),
+        activation_embedding=torch.zeros(4),
+    )
+    entry = store.get_by_id(outcome.entry_id)
+    assert "label_histogram_json" not in entry.metadata

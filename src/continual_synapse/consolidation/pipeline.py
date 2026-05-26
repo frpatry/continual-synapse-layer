@@ -26,8 +26,9 @@ Phase 4 v1 keeps the design intentionally simple:
 from __future__ import annotations
 
 import base64
+import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 
@@ -83,6 +84,8 @@ def consolidate_to_storage(
     merge_access_bump: float = 10.0,
     embedding_running_average_decay: float = 0.9,
     task_id: int = -1,
+    true_label: int | None = None,
+    label_histogram: Sequence[int] | None = None,
 ) -> ConsolidationOutcome:
     """Run one consolidation cycle.
 
@@ -127,6 +130,18 @@ def consolidate_to_storage(
             Default ``-1`` means "untagged" — readers treat untagged
             entries as having no task affinity and skip the recency
             adjustment for them.
+        true_label: Path-A label storage. Dominant ground-truth class
+            from the batch that triggered this consolidation. When
+            supplied, written into metadata as ``"true_label"`` (int).
+            Default ``None`` omits the field entirely so older
+            checkpoints stay schema-compatible. Readers must use
+            ``metadata.get("true_label")`` and fall back to derived
+            labels when absent.
+        label_histogram: Optional per-class count vector for the
+            batch (length = num_classes). When supplied, JSON-encoded
+            into metadata as ``"label_histogram_json"`` (Chroma
+            metadata only accepts scalar values, so the list is
+            serialised). Default ``None`` omits the field.
 
     Returns:
         A :class:`ConsolidationOutcome` describing what happened.
@@ -207,6 +222,12 @@ def consolidate_to_storage(
         "num_candidates": int(mask.sum().item()),
         "task_id": int(task_id),
     }
+    if true_label is not None:
+        metadata["true_label"] = int(true_label)
+    if label_histogram is not None:
+        metadata["label_histogram_json"] = json.dumps(
+            [int(c) for c in label_histogram]
+        )
     entry_id = store.store_cluster(
         embedding=embedding.tolist(),
         metadata=metadata,

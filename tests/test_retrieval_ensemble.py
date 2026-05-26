@@ -274,3 +274,43 @@ def test_predict_synapse_augmented_uses_base_features_only() -> None:
     with torch.no_grad():
         bare = base.classify(base.features(x))
     torch.testing.assert_close(out, bare)
+
+
+def test_old_checkpoint_metadata_coexists_with_new() -> None:
+    """A store mixing path-B entries (no true_label / label_histogram_json)
+    with path-A entries (both fields present) must construct a working
+    RetrievalEnsemble. Step 1's reader doesn't consume the new fields yet,
+    so the back-compat guarantee is: nothing crashes on absence."""
+    import json
+
+    model = _bare_mlp(hidden_dim=8, num_classes=3)
+    store = ColdStorage(collection_name="mixed_vintage_metadata")
+
+    # Path-B vintage: no true_label, no histogram.
+    blob = quantize(torch.zeros(8, 8), precision=32).hex()  # placeholder doc
+    store.store_cluster(
+        embedding=[1.0] + [0.0] * 7,
+        metadata={
+            "precision": 32, "n_neurons": 8,
+            "age": 0, "access_count": 0, "created_at_step": 0,
+        },
+        document=blob,
+        entry_id="old",
+    )
+    # Path-A vintage: both new fields present.
+    store.store_cluster(
+        embedding=[0.0] * 7 + [1.0],
+        metadata={
+            "precision": 32, "n_neurons": 8,
+            "age": 0, "access_count": 0, "created_at_step": 0,
+            "true_label": 2,
+            "label_histogram_json": json.dumps([1, 1, 5, 0, 0, 0, 0, 0, 0, 0]),
+        },
+        document=blob,
+        entry_id="new",
+    )
+
+    ens = RetrievalEnsemble.from_model_and_storage(model, store, k=2)
+    assert ens.embeddings.shape == (2, 8)
+    out = ens.predict(torch.randn(3, 4))
+    assert out.shape == (3, 3)
