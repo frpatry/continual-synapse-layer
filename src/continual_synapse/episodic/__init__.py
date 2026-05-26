@@ -19,5 +19,14 @@ trade-off may dissolve.
 
 from continual_synapse.episodic.active_memory import ActiveEpisodicMemory
 from continual_synapse.episodic.episodic_predictor import EpisodicPredictor
+from continual_synapse.episodic.training_configs import (
+    EPISODIC_CONFIGS,
+    EpisodicConfig,
+)
 
-__all__ = ["ActiveEpisodicMemory", "EpisodicPredictor"]
+__all__ = [
+    "ActiveEpisodicMemory",
+    "EPISODIC_CONFIGS",
+    "EpisodicConfig",
+    "EpisodicPredictor",
+]
