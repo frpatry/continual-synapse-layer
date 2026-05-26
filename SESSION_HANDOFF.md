@@ -1,264 +1,235 @@
-# Session handoff — 2026-05-26 (reward-as-confidence infrastructure ready)
+# Session handoff — 2026-05-26 (dual-substrate episodic infrastructure ready)
 
 ## Where we are
 
-The Cold Storage v2 retrieval-ensemble line of work is **closed as
-a dead end** on the current architecture. Three storage variants
-tested at T=15 — path B (labels-as-of-now), path A (true-label
-aggregate), path C (class-pure prototypes) — and none of them
-produced a measurable Task-0 lift over the no-retrieval baseline.
+We've pivoted away from "make the synapse layer's reward signal /
+storage / consolidation cleverer" and toward a fundamentally
+different architecture: **separate the substrate that computes from
+the substrate that remembers**.
 
-**Path-C added a new finding**: storage quality is not the
-bottleneck. The label-derivation diagnostic jumped from path-A's
-26-29% to path-C's 85.4% — per-class prototypes ARE dramatically
-more class-discriminative. But the retrieval ensemble's Task-0
-delta stayed neutral, AND inflating cold storage by 15× broke
-``scout_a095``'s training dynamics (baseline ACC dropped from
-0.815 to 0.766) because cosine gating saturates when too many
-familiar-looking patterns are stored.
+The empirical motivation, captured in
+``results/logs/reward_confidence/1779815135_27_T15_path_d.json``:
+the reward-as-confidence path (path D) showed the R signal IS
+structured — ``cosine_reward_developmental`` beats the baseline ACC
+by **+1.5 pp** at T=15 — but it does so by **trading −7.3 pp of
+Task-0 retention**. Three architectural iterations (path A
+true labels, path C per-class consolidation, path D per-sample
+reward) have all hit the same wall: any change that helps the model
+learn faster bleeds into Task-0 forgetting; any change that protects
+Task-0 starves plasticity. The plausible reading is that the
+trade-off is an **artefact of asking one substrate (the network
+weights) to carry two responsibilities**.
 
-Conclusion: the limit is upstream of storage. The Hebbian update's
-reward signal ``R`` has been a constant 1.0 throughout the entire
-project. Every sample contributes equally to synapse updates,
-whether it's a routine correct prediction or a confidently-wrong
-edge case. **The next direction is to make R per-sample.**
+The new design (Option 2 in the user's plan): the network is free
+to learn (standard backprop, no protection mechanisms), and an
+**active episodic memory** grows alongside it via gradient-free
+allocation. At inference, the model's softmax is blended with a
+retrieval-based label distribution from the memory, with the blend
+weight scaled by retrieval confidence. The memory contributes when
+something genuinely similar exists in it, and stays silent
+otherwise.
 
-See decisions_log entries "Cold Storage v2 path-A pilot — mechanism
-works, criterion fails" and "Path-C pilot — per-class consolidation
-not the right pivot" for the long-form narrative on the storage-
-quality dead end.
+The bet: if the trade-off is substrate-coupling, this separation
+should dissolve it. The model can over-write its representation of
+an old task (catastrophic at the weights level), but the memory's
+entries from that task remain queryable and contribute at inference
+whenever a similar input arrives.
 
 ## What ships in this session (incremental, all committed)
 
-Storage-line work:
+Five commits land the dual-substrate infrastructure:
 
-- `78f514c` — path-A step 1: ``true_label`` + ``label_histogram``
-  captured at consolidation time; backward-compatible.
-- `a5cbd90` — path-A step 2: ``RetrievalEnsemble.label_source``
-  config + ``label_source_breakdown`` diagnostic.
-- `1860569` — path-A T=15 pilot: 100% true_label coverage,
-  retrieval neutral, decision-criterion fail.
-- `1885443` — path-C step 1: ``consolidation_mode="per_class"``
-  refactor + 5 tests; aggregate mode bit-identical.
-- `a5e6b54` — exp 25 wiring for ``--consolidation-mode`` +
-  storage diagnostics (used by the partial path-C pilot).
-- `90702c0` — path-C verdict documented; pivot to reward
-  direction.
-
-Reward-as-confidence infrastructure (Phases 1–4 of the new line):
-
-- `b9fcc26` — utility module
-  ``src/continual_synapse/reward/confidence_reward.py``:
-  ``compute_reward_signal``, ``normalize_reward_batch``,
-  ``developmental_alpha``. 8 unit tests.
-- `5665e5c` — ``apply_hebbian_update`` integration:
-  ``reward_signal`` + ``reward_mode`` kwargs. Constant mode
-  bit-identical to pre-path-D. Sqrt-pre-weighting gives the
-  exact ``Σ_i R_i a_i a_i.T / B`` math without a synapse-layer
-  API change. Adds ``current_maturity`` property (live
-  recompute, independent of ``apply_gradient_gating``'s cache —
-  required for gating-disabled configs). 4 new tests.
-- `bf18661` — registry
-  ``src/continual_synapse/reward/training_configs.py``:
-  ``REWARD_CONFIGS`` dict with four named entries (baseline +
-  three reward variants). Each ``RewardConfig.make_callbacks()``
-  returns ready ``on_pre_optimizer_step / on_after_batch /
-  on_task_change`` closures. Smoke-tested at T=2 n=1 on a
-  synthetic 4-class blob benchmark: all four configs reach
-  ACC = 1.000.
-- `5cf0030` — driver script
-  ``experiments/27_reward_as_confidence_eval.py``. Exp-23-
-  compatible output JSON (consumable by
-  ``experiments/24_retention_analysis.py`` unchanged). Adds the
-  Task-N final ACC plasticity diagnostic and the per-event
-  reward variance recorder (early / mid / late summaries +
-  late-collapse warning). Script is **not run** in this session
-  — manual command below.
-- (this commit) — final handoff update with running state and
-  decision criteria.
-
-## Immediate next direction — reward-as-confidence
-
-Replace the constant ``R = 1.0`` in the Hebbian update with a
-per-sample informativeness signal computed from the model's own
-output:
-
-```
-R_i = (1 - γ) * [α * error_i + (1 - α) * uncertainty_i]
-      + γ * |calibration_i|
-```
-
-Where ``α`` is **developmental** — low (0.2) when the model is
-young (mostly weights uncertainty), rising to a capped maximum
-(0.85) as the consolidation count grows (mostly weights error).
-The cap prevents late-stage stagnation; even a "mature" system
-should keep listening to uncertainty.
-
-Three planned configs (alongside the unchanged ``cs_gated_cosine_developmental``
-baseline):
-
-1. ``cs_reward_developmental``: reward signal ON, cosine gating OFF
-   — isolates R alone
-2. ``cosine_reward_developmental``: both ON — the composition we
-   expect to be best
-3. ``reward_only_static``: reward signal ON with α = 0.5 constant
-   — ablates the developmental component
-
-The infrastructure has now landed (commits `b9fcc26`, `5665e5c`,
-`bf18661`, `5cf0030` above). The experiment itself is **not run**
-in-session — you trigger it manually in a terminal (see "Running
-the pilot" below).
-
-## What's been kept from the dead-end paths
-
-The path-A and path-C code is **not reverted**:
-
-- ``true_label`` + ``label_histogram_json`` metadata stays on
-  cold-storage entries (cheap; useful baseline for any future
-  retrieval revival).
-- ``RetrievalEnsemble.label_source`` flag stays.
-- ``SynapseAugmentedMLP(consolidation_mode="per_class", ...)``
-  stays as an opt-in mode. **Don't use it with the current cosine
-  gating** — see the path-C decisions_log entry for the
-  interaction that breaks baseline training. Could be revisited
-  if cosine gating is replaced.
-
-All three are no-ops at their defaults (``aggregate`` mode,
-``label_source="auto"``, no ``training_target`` passed). Loading
-older checkpoints still works.
+- `96244cb` — Phase 0: pivot documented in decisions_log; the
+  cosine_reward T=15 headline table, three-iteration retrospective,
+  and the four-tier decision criteria for the new pilot are all
+  captured in the
+  "Pivot to dual-substrate episodic architecture" entry.
+- `342b3c4` — Phase 1: ``ActiveEpisodicMemory`` — gradient-free
+  allocation via cosine novelty threshold; weighted top-k vote at
+  retrieval. 8 unit tests covering allocation, retrieval, cache
+  invalidation, and the ``max_entries`` cap.
+- `7057d6f` — Phase 2: ``EpisodicPredictor`` — blends base-model
+  softmax with retrieval distribution; ``λ_eff`` scales from 0 to
+  ``blend_max`` with retrieval confidence above
+  ``blend_threshold``. Returns log-probabilities for downstream
+  compatibility. ``training_step_observe`` runs the storage
+  decision under ``torch.no_grad``. 6 unit tests.
+- `56fe242` — Phase 3: ``cs_episodic_dual_substrate`` config in
+  ``src/continual_synapse/episodic/training_configs.py``.
+  ``EpisodicConfig`` dataclass + ``EPISODIC_CONFIGS`` registry.
+  Smoke-tested at T=2 n=1: ACC=1.000, memory grows on novelty,
+  no allocations on repeat inputs.
+- `118ddba` — Phase 4: ``experiments/28_episodic_dual_substrate_eval.py``
+  driver — manual run only (NOT executed in-session). Trains the
+  episodic config, re-evaluates the unchanged
+  ``cs_gated_cosine_developmental`` baseline from existing exp-27
+  checkpoints when available, writes exp-23-compatible JSON for
+  the exp-24 retention analyser, plus a storage-diagnostics block
+  (per-task memory growth, early-vs-late novelty mean).
+- (this commit) — Phase 5: this handoff update.
 
 ## Running the pilot (manual, when ready)
 
 ```bash
 source .venv/bin/activate
-python experiments/27_reward_as_confidence_eval.py --T 15 --n_seeds 3
+python experiments/28_episodic_dual_substrate_eval.py --T 15 --n_seeds 2
 ```
 
-The ``source .venv/bin/activate`` is required — the system has
-no ``python`` on PATH outside the venv. Once active your shell
-prompt shows ``(.venv)`` and ``python`` resolves to the venv's
-interpreter. All ``python ...`` commands in this handoff and in
-``decisions_log.md`` assume the venv is active.
+(Defaults: episodic config with ``novelty_threshold=0.7``,
+``retrieval_k=5``, ``blend_threshold=0.5``, ``blend_max=0.5``;
+unbounded memory; baseline auto-loaded from
+``results/checkpoints/phase_d/`` if present.)
 
-(Defaults: 4 configs — baseline + 3 reward variants, output dir
-``results/logs/reward_confidence/``, checkpoint dir
-``results/checkpoints/phase_d/``.)
+ETA estimate: the dual-substrate training is a plain MLP forward +
+backward per batch plus a no-grad feature extract for the memory.
+Should be **faster than scout_a095** (no n_passes=5 multi-pass
+synapse buffer; no cold-storage Chroma I/O in the training loop).
+Path-A T=15 n=3 was 19 min total; expect maybe ~12 min total for
+the new pilot at n_seeds=2, plus a few seconds per baseline seed
+for the eval-only reload.
 
-ETA: path-A took 19 minutes at T=15 n=3; the reward signal adds
-one small extra compute step per batch (softmax + entropy +
-calibration); expect ~25 minutes. Per-class consolidation mode
-should NOT be used with these configs (cosine gating still
-active in two of them).
+## What to read in the printed summary
 
-## Decision criteria for the reward-as-confidence pilot
+The script ends with:
 
-Baseline reference is ``cs_gated_cosine_developmental`` at T=15
-n=3 (the unchanged scout_a095_validated config; numbers from path
-A's pilot, since path A's training is bit-identical to baseline
-when path A's only change — ``training_target=y`` flowing into
-``apply_hebbian_update`` — has no effect without an
-``ExternalReward``):
+```
+=== Dual-substrate episodic — T=15, n=2 ===
+config                                       ACC   Task-0   Task-N   memory
+------------------------------------------------------------------------------
+cs_gated_cosine_developmental (ref)        0.814    0.805    0.906        N/A
+cs_episodic_dual_substrate                 X.XXX    X.XXX    X.XXX     XXX avg
+  (Δ vs baseline, pp):                     +X.XX    +X.XX    +X.XX
+```
 
-| metric | baseline value at T=15 n=3 |
-|---|---:|
-| aggregate ACC | 0.8143 |
-| Task-0 retention | 0.8047 |
-| Task-N final (new diagnostic) | TBD — measured during the pilot |
-| Forgetting | TBD |
+And per-seed, look for:
 
-Decision tiers:
+- ``final memory size = N`` after each training. The "reasonable"
+  band for T=15 is **50–500** entries; anything below 30 says the
+  novelty threshold is too high (memory isn't capturing the input
+  space), anything above ~2000 says the threshold is too low and
+  storage is overflowing.
+- ``per-task memory size: t0=…, t1=…, …``. A healthy curve grows
+  fast on the first task and slows as later-task inputs find more
+  matches; near-linear growth across all tasks means the threshold
+  isn't discriminating between novel and seen, and a near-flat
+  curve after task 0 means the threshold is too high.
+- ``novelty mean (first 100 batches): 0.XX; last 100: 0.YY``.
+  Expected: 0.YY ≪ 0.XX. The first-100 average will be near 1.0
+  (memory starts empty); the last-100 average should be much lower
+  as the memory fills.
 
-- **Strong win**: ≥1 reward config beats baseline on Task-0 by
-  ≥ +3 pp without losing more than 2 pp of aggregate ACC →
-  green-light a T=50 n=5 run in a separate session.
-- **Modest signal**: ≥1 reward config moves Task-0 by ≥ +1 pp
-  in the right direction → tune α schedule / γ / floor and
-  rerun before T=50.
-- **Null**: no reward config moves Task-0 from baseline → the
-  per-sample-R hypothesis is wrong; pivot again (see below).
-- **Catastrophic**: any reward config crashes baseline training
-  (aggregate ACC drops > 5 pp) → the per-sample weighting is
-  destabilising; investigate normalization / floor / α cap
-  before the next attempt. ``reward_only_static`` is the
-  control here — if only the developmental variant crashes,
-  α is the problem; if static also crashes, the formula itself
-  needs work.
+## Decision criteria for the pilot
 
-Additional diagnostic from the exp 27 script:
-``reward_statistics_per_consolidation`` records mean and variance
-of R at each consolidation event. If late-training variance
-collapses (> 50% drop from early variance), the signal has
-saturated and the developmental α cap was insufficient.
+(Carried from the decisions_log entry, repeated here for the
+operator who reads only this file.)
 
-## If the reward direction also fails
+- **Strong win**: ACC ≥ baseline AND Task-0 ≥ baseline + 5 pp
+  AND memory grows to a reasonable size (50–500 entries for T=15)
+  → green-light T=50, n=5 in a later session.
+- **Moderate**: ACC roughly matches baseline AND Task-0 ≥ baseline
+  by any positive margin. Counts as a win because the base model
+  has zero protection mechanisms — any non-collapse on Task-0
+  proves the memory substrate is doing the retention work, even
+  if the magnitude is small.
+- **Concerning**: Task-N collapses (means retrieval is dominating
+  poorly on new tasks). The blend logic or the novelty threshold
+  needs tuning. Sweep ``--novelty-threshold`` (try 0.5, 0.8) and
+  ``--blend-max`` (try 0.3, 0.7) before pivoting again.
+- **Null**: Both ACC and Task-0 worse than baseline → the dual-
+  substrate hypothesis is wrong; retrieval over a free-running
+  model doesn't help and the trade-off is intrinsic to the
+  function being learned, not to the substrate that holds it.
+  Pivot direction: investigate stronger memory mechanisms
+  (parametric memory à la GEM) or accept the Phase-B Pareto
+  frontier as the final story for the article.
 
-The Pareto-frontier framing from the Phase B verdict (decisions_log,
-2026-05-26) remains the fallback story for the follow-up article.
-The architecture's two informative knobs (``maturity_target_consolidations``
-and ``gradient_gating_alpha``) trade Task-0 retention against
-aggregate ACC, with EWC λ=10 owning Task-0 retention outright
-at T=50. That's a publishable result even if no future work
-closes the +21.5 pp gap.
+## Reference numbers from the path-D T=15 pilot
 
-## Open todos (deferred, not blocking)
+(Mean across 3 seeds; for the comparison the new pilot prints.)
 
-- **n=10 validation** on scout_combined and scout_a095 for clean
-  Wilcoxon Bonferroni at T=50. (Unchanged from prior handoffs.)
-- **Decay-subsystem honesty note** in README and the follow-up
-  article: under ``cs_gated_cosine_developmental`` the stored
-  strengths matrices are computed and discarded. (Unchanged.)
-- **Soft voting via ``label_histogram_json``** (would have been
-  step 4 of the path-A line). Cheap, no retraining needed,
-  but probably moot given path C disproved the storage-quality
-  hypothesis. Document but don't pursue.
+| config                                  | ACC    | Task-0 | Task-N |
+|-----------------------------------------|-------:|-------:|-------:|
+| cs_gated_cosine_developmental           | 0.8143 | 0.8047 | 0.9063 |
+| cs_reward_developmental                 | 0.6683 | 0.2004 | 0.9317 |
+| cosine_reward_developmental             | 0.8291 | 0.7317 | 0.8985 |
+| reward_only_static                      | 0.6683 | 0.2004 | 0.9317 |
 
-## Key design choices preserved across the storage-line work
+The new pilot should be compared against
+``cs_gated_cosine_developmental`` (the unchanged baseline).
+Anything that beats Task-0 = 0.8047 wins on retention; anything
+that holds ACC ≥ 0.8143 wins on aggregate.
 
-1. Features extracted via ``base.features(x)`` — same vector
-   space as stored embeddings.
-2. Cosine sims clipped at 0 in retrieval weighted-vote.
-3. ``RetrievalEnsemble.predict`` puts the model in ``eval()``
-   and restores the prior ``training`` flag.
-4. Checkpoint format = single ``.pt`` with ``model_state_dict``
-   + serialised ``cold_storage_entries`` + ``config``.
-   Path-A entries carry ``true_label`` + ``label_histogram_json``;
-   path-C entries carry ``true_label`` only (one-hot histogram
-   is redundant). All loadable via ``metadata.get(...)``.
-5. ``label_source="auto"`` (default) is bit-identical to the
-   pre-path-A ``derived`` behaviour on any store without
-   ``true_label`` metadata.
+## What's been kept from prior lines of work
+
+The reward / path-A / path-C / path-D infrastructure is **not
+reverted**:
+
+- ``true_label`` + ``label_histogram_json`` metadata on
+  cold-storage entries (cheap, possibly reusable).
+- ``RetrievalEnsemble.label_source`` config + breakdown.
+- ``SynapseAugmentedMLP(consolidation_mode="per_class", ...)``
+  as an opt-in mode (not recommended with current cosine gating).
+- ``apply_hebbian_update(reward_signal=..., reward_mode="per_sample")``
+  + ``current_maturity`` property.
+- ``REWARD_CONFIGS`` registry with the four named configs.
+- ``ConsolidationTrigger.mode={pressure,count}``.
+- Exp 25, 27 driver scripts.
+
+All of those still work; the dual-substrate work just adds a parallel
+``episodic`` subpackage and a new experiment driver.
+
+## What's explicitly DISABLED in cs_episodic_dual_substrate
+
+- No ``SynapseLayer``
+- No ``SynapseAugmentedMLP`` wrapper (we use plain ``MLPClassifier``)
+- No cosine gating (``apply_gradient_gating``)
+- No Hebbian state, no ``apply_hebbian_update``
+- No EWC, no parameter-protection regulariser
+- No reward computer or reward mixer
+- No cold storage (the memory is in-memory Python lists, not
+  Chroma-backed for v1)
+
+That's the architectural bet: the model is free.
 
 ## Files of interest
 
-- ``src/continual_synapse/baselines/synapse_finetune.py`` —
-  ``apply_hebbian_update`` (now with ``reward_signal`` +
-  ``reward_mode`` kwargs), ``SynapseAugmentedMLP`` (now exposing
-  ``current_maturity``).
-- ``src/continual_synapse/reward/confidence_reward.py`` (new
-  this session) — the per-sample R utility:
-  ``compute_reward_signal``, ``normalize_reward_batch``,
-  ``developmental_alpha``.
-- ``src/continual_synapse/reward/training_configs.py`` (new this
-  session) — ``REWARD_CONFIGS`` registry + ``RewardConfig``
-  dataclass with ``.make_callbacks()`` factory.
-- ``experiments/27_reward_as_confidence_eval.py`` (new this
-  session) — the training + eval driver. Exp-23-compatible
-  output JSON; sidecar carrying per-consolidation reward
-  variance.
-- ``src/continual_synapse/inference/retrieval_ensemble.py`` —
-  unchanged; retrieval line is closed but code stays.
-- ``decisions_log.md`` — full narrative for paths A / B / C
-  and the rationale for the reward pivot.
+- ``src/continual_synapse/episodic/active_memory.py`` (new) —
+  ``ActiveEpisodicMemory`` with gradient-free allocation.
+- ``src/continual_synapse/episodic/episodic_predictor.py`` (new) —
+  blend-at-inference wrapper.
+- ``src/continual_synapse/episodic/training_configs.py`` (new) —
+  ``EpisodicConfig`` + ``EPISODIC_CONFIGS`` registry.
+- ``experiments/28_episodic_dual_substrate_eval.py`` (new) — the
+  manual driver.
+- ``decisions_log.md`` — the architectural rationale and the
+  prior-three-paths retrospective.
 
 ## Suite status
 
-**411 tests passing** at the end of this session:
+**430 tests passing** at the end of this session:
 
-| baseline | + Phase 1 reward utility | + Phase 2 integration | total |
+| baseline pre-session | + Phase 1 active_memory | + Phase 2 predictor | total |
 |---:|---:|---:|---:|
-| 399 | +8 | +4 | 411 |
+| 416 | +8 | +6 | 430 |
 
-(Phase 3 added one module + smoke test, no unit tests. Phase 4
-added the eval script; per the user's spec it is not exercised
-by the test suite — manual run only.) No new dependencies
-introduced this session.
+(Phase 0 was docs only, Phase 3 added the config + a smoke test
+without unit tests, Phase 4 added the driver — manual run, not
+exercised by pytest.) No new dependencies introduced.
+
+## If the dual-substrate hypothesis fails
+
+The Pareto-frontier framing from the Phase B verdict
+(``decisions_log`` 2026-05-26) remains the fallback story for the
+follow-up article. The reward-as-confidence work also stands as a
+publishable finding even if it doesn't ship as the final design —
+the Chebyshev anti-correlation between R and feature magnitude
+(commit ``5d525d3``) reveals a hidden coupling worth writing up.
+
+## Open todos (deferred, not blocking)
+
+- **n=10 validation** on the Phase B configs for clean Wilcoxon
+  Bonferroni at T=50. (Unchanged from prior handoffs.)
+- **Decay-subsystem honesty note** in README. (Unchanged.)
+- **Promote ActiveEpisodicMemory to disk-backed storage** via
+  ``ColdStorage`` if the dual-substrate hypothesis works at T=15
+  and we need to scale to T=50 with many more entries.
