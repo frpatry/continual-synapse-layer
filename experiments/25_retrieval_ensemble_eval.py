@@ -189,6 +189,33 @@ def parse_args() -> argparse.Namespace:
             "without overwriting prior runs."
         ),
     )
+    # ---- Path-C flags (step 1) ----
+    p.add_argument(
+        "--consolidation-mode",
+        choices=["aggregate", "per_class"],
+        default="aggregate",
+        help=(
+            "How apply_hebbian_update aggregates a batch's features "
+            "into cold-storage entries. 'aggregate' (default) writes "
+            "one entry per consolidation event with the batch-wide "
+            "mean — the historical path-A/path-B behaviour. "
+            "'per_class' groups the batch by training_target and "
+            "writes one entry per class meeting "
+            "--min-samples-per-class, producing class-pure prototypes "
+            "(path C)."
+        ),
+    )
+    p.add_argument(
+        "--min-samples-per-class",
+        type=int,
+        default=5,
+        help=(
+            "In per_class mode, classes with fewer than this many "
+            "samples in the consolidating batch are silently dropped. "
+            "Default 5 matches batch_size 64 / 10 classes (~6.4 per "
+            "class on average)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -266,6 +293,8 @@ def _build_scout_a095_model(
         gradient_gating_alpha=_SCOUT_A095_ALPHA,
         familiarity_mode="cosine",
         maturity_target_consolidations=_SCOUT_A095_TARGET,
+        consolidation_mode=args.consolidation_mode,
+        min_samples_per_class=args.min_samples_per_class,
     )
 
 
@@ -663,6 +692,8 @@ class PilotSummary:
     label_derivation: list[LabelDerivationResult] = field(default_factory=list)
     label_source: str = "auto"
     label_source_breakdowns: list[dict[str, int]] = field(default_factory=list)
+    consolidation_mode: str = "aggregate"
+    storage_diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _format_pilot_summary(summary: PilotSummary) -> str:
@@ -742,6 +773,10 @@ def _run_one_T(
     # for all retrieval configs in a seed (they share the store), so we
     # only record it once per seed.
     label_source_breakdowns: list[dict[str, int]] = []
+    # Per-seed storage diagnostics (number of stored entries, breakdown
+    # by task_id and true_label). Useful for path-C where the entry
+    # count is no longer 1-per-event.
+    storage_diagnostics: list[dict[str, Any]] = []
 
     for seed in args.seeds:
         print(f"\n  --- seed {seed} ---", flush=True)
@@ -763,6 +798,52 @@ def _run_one_T(
                 args, bench, T=T, seed=seed,
                 chroma_client=chroma_client, ckpt_path=ckpt_path,
             )
+
+        # ---- Storage diagnostics (per-seed) ----
+        # Path-C produces many more entries than aggregate, so the
+        # by-task and by-class breakdowns help validate the storage
+        # behaviour matches expectations.
+        entries = model.cold_storage.all_entries()
+        n_entries = len(entries)
+        task_ids = [int(e.metadata.get("task_id", -1)) for e in entries]
+        true_labels = [
+            e.metadata.get("true_label") for e in entries
+        ]
+        true_labels_present = [
+            int(v) for v in true_labels if v is not None
+        ]
+        per_task: dict[int, int] = {}
+        for tid in task_ids:
+            per_task[tid] = per_task.get(tid, 0) + 1
+        per_class: dict[int, int] = {}
+        for lbl in true_labels_present:
+            per_class[lbl] = per_class.get(lbl, 0) + 1
+        coverage_pct = (
+            100.0 * len(true_labels_present) / n_entries
+            if n_entries > 0 else float("nan")
+        )
+        avg_per_task = (
+            n_entries / max(1, len(per_task)) if per_task else 0.0
+        )
+        avg_per_class = (
+            n_entries / max(1, len(per_class)) if per_class else 0.0
+        )
+        storage_diagnostics.append({
+            "seed": seed,
+            "n_entries": n_entries,
+            "avg_per_task": avg_per_task,
+            "avg_per_class": avg_per_class,
+            "true_label_coverage_pct": coverage_pct,
+            "per_task": per_task,
+            "per_class": per_class,
+        })
+        print(
+            f"    storage: {n_entries} entries, "
+            f"{avg_per_task:.1f} per task (avg), "
+            f"{avg_per_class:.1f} per class (avg), "
+            f"{coverage_pct:.0f}% true_label coverage",
+            flush=True,
+        )
 
         # ---- Baseline (no retrieval) ----
         t0 = time.time()
@@ -903,6 +984,9 @@ def _run_one_T(
         },
         "label_source": args.label_source,
         "label_source_breakdowns": label_source_breakdowns,
+        "consolidation_mode": args.consolidation_mode,
+        "min_samples_per_class": args.min_samples_per_class,
+        "storage_diagnostics": storage_diagnostics,
     }
     _atomic_write_json(out_path, payload)
     print(f"\n  Wrote results JSON to {out_path}", flush=True)
@@ -936,6 +1020,8 @@ def _run_one_T(
         label_derivation=label_derivation_results,
         label_source=args.label_source,
         label_source_breakdowns=label_source_breakdowns,
+        consolidation_mode=args.consolidation_mode,
+        storage_diagnostics=storage_diagnostics,
     ), out_path
 
 
@@ -987,6 +1073,25 @@ def main() -> None:
                     "retrieval-ensemble numbers below are likely uninformative; "
                     "the approach needs path-A retraining."
                 )
+
+    # ---- Storage diagnostics (path-C density check) ----
+    for s in summaries:
+        if not s.storage_diagnostics:
+            continue
+        print()
+        print("=" * 78)
+        print(
+            f"=== Storage diagnostics "
+            f"(consolidation_mode={s.consolidation_mode!r})  T={s.T} ==="
+        )
+        print("=" * 78)
+        for d in s.storage_diagnostics:
+            print(
+                f"seed {d['seed']}: {d['n_entries']} entries, "
+                f"{d['avg_per_task']:.1f} per task (avg), "
+                f"{d['avg_per_class']:.1f} per class (avg), "
+                f"{d['true_label_coverage_pct']:.0f}% true_label coverage"
+            )
 
     # ---- Label-source breakdown (path-A coverage diagnostic) ----
     for s in summaries:
