@@ -321,6 +321,10 @@ def _save_episodic_checkpoint(
         "model_state_dict": base.state_dict(),
         "memory": {
             "embeddings": [e.cpu().tolist() for e in memory.embeddings],
+            # Save raw_inputs as tensors (not nested lists) so non-flat
+            # input shapes round-trip cleanly. ``torch.save`` handles
+            # them in the same payload as the rest.
+            "raw_inputs": [r.detach().cpu() for r in memory.raw_inputs],
             "labels": list(memory.labels),
             "task_ids": list(memory.task_ids),
             "feature_dim": memory.feature_dim,
@@ -348,10 +352,26 @@ def _load_episodic_checkpoint(
     base.load_state_dict(ckpt["model_state_dict"])
     base.eval()
     mem_state = ckpt["memory"]
-    for emb, lbl, tid in zip(
-        mem_state["embeddings"], mem_state["labels"], mem_state["task_ids"]
+    # raw_inputs absent on pre-Phase-1 episodic checkpoints; an
+    # empty default lets older artifacts still load (the memory's
+    # embeddings work for retrieval; re_encode_all would no-op
+    # because raw_inputs is empty — guarded by the length check).
+    raw_inputs = mem_state.get("raw_inputs", [])
+    embeddings = mem_state["embeddings"]
+    if raw_inputs and len(raw_inputs) != len(embeddings):
+        raise RuntimeError(
+            f"checkpoint memory raw_inputs / embeddings length mismatch: "
+            f"{len(raw_inputs)} vs {len(embeddings)}"
+        )
+    for i, (emb, lbl, tid) in enumerate(
+        zip(embeddings, mem_state["labels"], mem_state["task_ids"])
     ):
         predictor.memory.embeddings.append(torch.tensor(emb, dtype=torch.float32))
+        if raw_inputs:
+            raw = raw_inputs[i]
+            if not isinstance(raw, torch.Tensor):
+                raw = torch.tensor(raw, dtype=torch.float32)
+            predictor.memory.raw_inputs.append(raw.to(torch.float32))
         predictor.memory.labels.append(int(lbl))
         predictor.memory.task_ids.append(tid)
     predictor.memory._invalidate_cache()
@@ -380,6 +400,7 @@ def _train_episodic_one_seed(
         "per_task_memory_size": [],
         "per_batch_novelty_mean": [],
         "per_batch_n_allocated": [],
+        "per_task_reencoded": [],
         "final_memory_size": 0,
         "wall_time_s": 0.0,
     }
@@ -393,7 +414,10 @@ def _train_episodic_one_seed(
             features = predictor.feature_extract(x)
             novelty = predictor.memory.compute_novelty(features)
         n_added = predictor.memory.maybe_allocate(
-            features, y, task_id=int(task_index),
+            features=features,
+            raw_inputs=x,
+            labels=y,
+            task_id=int(task_index),
         )
         diagnostics["per_batch_novelty_mean"].append(
             float(novelty.mean().item())
@@ -401,10 +425,33 @@ def _train_episodic_one_seed(
         diagnostics["per_batch_n_allocated"].append(int(n_added))
 
     def on_task_end(task_index, task, model):
+        # Refresh every stored embedding under the model's current
+        # feature space. This is the fix for the T=15 n=2 failure
+        # where Task-0 collapsed to 0.218 because Task-0 embeddings
+        # stored under early-training features stopped matching the
+        # same-distribution queries by the time we evaluated them
+        # at the end of training. predictor.re_encode_memory wraps
+        # base_model.eval() so dropout doesn't pollute the refreshed
+        # embeddings.
+        n_entries = len(predictor.memory)
         diagnostics["per_task_memory_size"].append({
             "task_index": int(task_index),
-            "memory_size": int(len(predictor.memory)),
+            "memory_size": int(n_entries),
         })
+        if n_entries > 0:
+            t_reenc = time.time()
+            n_reenc = predictor.re_encode_memory(device=args.device)
+            elapsed = time.time() - t_reenc
+            diagnostics["per_task_reencoded"].append({
+                "task_index": int(task_index),
+                "n_entries": int(n_reenc),
+                "wall_time_s": float(elapsed),
+            })
+            print(
+                f"    re-encoded {n_reenc} entries after task "
+                f"{task_index} ({elapsed:.1f}s)",
+                flush=True,
+            )
 
     runner = ContinualRunner(
         seed=seed,
@@ -548,7 +595,8 @@ def main() -> None:
         f"blend_max={args.blend_max}\n"
         f"  baseline ckpt dir={args.baseline_checkpoint_dir}\n"
         f"  episodic ckpt dir={args.episodic_checkpoint_dir}\n"
-        f"  output dir={args.output_dir}",
+        f"  output dir={args.output_dir}\n"
+        f"Re-encoding mode: ENABLED (at task boundaries)",
         flush=True,
     )
 
