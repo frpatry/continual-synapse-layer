@@ -25,6 +25,7 @@ from continual_synapse.episodic.contrastive_encoder import (
     random_permutation,
 )
 from continual_synapse.episodic.episodic_predictor import EpisodicPredictor
+from continual_synapse.episodic.frozen_encoder import PretrainedContrastiveEncoder
 from continual_synapse.episodic.training_configs import (
     EPISODIC_CONFIGS,
     EpisodicConfig,
@@ -36,6 +37,7 @@ __all__ = [
     "EPISODIC_CONFIGS",
     "EpisodicConfig",
     "EpisodicPredictor",
+    "PretrainedContrastiveEncoder",
     "apply_permutation",
     "info_nce_loss",
     "random_permutation",
