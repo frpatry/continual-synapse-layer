@@ -44,6 +44,7 @@ from continual_synapse.reward.confidence_reward import (
 )
 
 AlphaMode = Literal["constant", "developmental", "static"]
+TriggerMode = Literal["pressure", "count"]
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,17 @@ class RewardConfig:
         gamma: Weight on the calibration term in
             :func:`compute_reward_signal`. Ignored when
             ``alpha_mode == "constant"``.
+        trigger_mode: Which ``ConsolidationTrigger`` mode the
+            experiment driver should use. ``"pressure"`` (default)
+            keeps the historical magnitude-based trigger and is the
+            right choice for ``alpha_mode="constant"`` (the
+            baseline). ``"count"`` fires every
+            ``min_steps_between`` batches regardless of pressure
+            — the right choice for any reward-using config because
+            the per-sample reward weighting is anti-correlated with
+            feature magnitudes, which makes the pressure
+            accumulator grow ~quadratically slower and undercounts
+            consolidations by 3-4× empirically.
     """
 
     name: str
@@ -81,6 +93,7 @@ class RewardConfig:
     alpha_mode: AlphaMode
     static_alpha: float = 0.5
     gamma: float = 0.3
+    trigger_mode: TriggerMode = "pressure"
 
     def uses_reward_signal(self) -> bool:
         """True iff the on_after_batch callback should compute R and
@@ -157,22 +170,26 @@ REWARD_CONFIGS: dict[str, RewardConfig] = {
         name="cs_gated_cosine_developmental",
         gradient_gating_enabled=True,
         alpha_mode="constant",
+        trigger_mode="pressure",  # baseline keeps historical trigger
     ),
     "cs_reward_developmental": RewardConfig(
         name="cs_reward_developmental",
         gradient_gating_enabled=False,
         alpha_mode="developmental",
+        trigger_mode="count",
     ),
     "cosine_reward_developmental": RewardConfig(
         name="cosine_reward_developmental",
         gradient_gating_enabled=True,
         alpha_mode="developmental",
+        trigger_mode="count",
     ),
     "reward_only_static": RewardConfig(
         name="reward_only_static",
         gradient_gating_enabled=False,
         alpha_mode="static",
         static_alpha=0.5,
+        trigger_mode="count",
     ),
 }
 """Registry of named training configurations on the reward axis.

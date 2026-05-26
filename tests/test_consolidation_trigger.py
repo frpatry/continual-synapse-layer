@@ -299,3 +299,99 @@ def test_should_fire_false_when_no_active_synapses() -> None:
     # Even with threshold=0 (which would have fired pre-fix because
     # mean of zeros == 0 >= 0), the all-zero active mask short-circuits.
     assert not trigger.should_fire(layer)
+
+
+# ---- Count-based trigger mode (path D) ----
+
+
+def test_count_mode_fires_when_refractory_elapsed() -> None:
+    """In count mode, the trigger fires as soon as min_steps_between
+    has elapsed since the last fire — pressure is bypassed entirely.
+    The initial ``_last_fire_step = -10000`` lets the very first fire
+    happen immediately on a populated layer; thereafter ``mark_fired``
+    drives the cadence."""
+    layer = SynapseLayer(n_neurons=3)
+    # Tiny strengths → pressure mode would never fire at threshold=1.0.
+    _populate(
+        layer,
+        strength=torch.full((3, 3), 0.001),
+        evidence=torch.full((3, 3), 0.001),
+        access_count=torch.zeros(3, 3, dtype=torch.int64),
+    )
+    trigger = ConsolidationTrigger(
+        avg_pressure_threshold=1.0, min_steps_between=10, mode="count",
+    )
+    # First fire: cleared by the initial _last_fire_step=-10000 even
+    # though pressure (~1e-6) is well below the 1.0 threshold —
+    # the pressure check is the thing count mode bypasses.
+    with torch.no_grad():
+        layer.global_step.fill_(0)
+    assert trigger.should_fire(layer)
+    trigger.mark_fired(layer)
+    # Right after a fire, the refractory blocks: 0 - 0 < 10.
+    assert not trigger.should_fire(layer)
+    # 5 steps later: still under refractory.
+    with torch.no_grad():
+        layer.global_step.fill_(5)
+    assert not trigger.should_fire(layer)
+    # 10 steps later: cadence reached, fires.
+    with torch.no_grad():
+        layer.global_step.fill_(10)
+    assert trigger.should_fire(layer)
+    trigger.mark_fired(layer)
+    # Another 10 → fires; mid-cadence → doesn't.
+    with torch.no_grad():
+        layer.global_step.fill_(15)
+    assert not trigger.should_fire(layer)
+    with torch.no_grad():
+        layer.global_step.fill_(20)
+    assert trigger.should_fire(layer)
+
+
+def test_count_mode_still_respects_active_mask() -> None:
+    """An empty (all-zero strength) layer must not fire even in count
+    mode, mirroring pressure mode — we don't want to write a stored
+    entry with nothing in it."""
+    layer = SynapseLayer(n_neurons=3)
+    _populate(
+        layer,
+        strength=torch.zeros(3, 3),
+        evidence=torch.full((3, 3), 5.0),
+        access_count=torch.zeros(3, 3, dtype=torch.int64),
+    )
+    with torch.no_grad():
+        layer.global_step.fill_(1000)
+    trigger = ConsolidationTrigger(
+        avg_pressure_threshold=0.0, min_steps_between=0, mode="count",
+    )
+    assert not trigger.should_fire(layer)
+
+
+def test_pressure_mode_default_is_unchanged() -> None:
+    """Sanity guard: omitting the mode argument keeps the historical
+    pressure-based behaviour bit-identical to pre-path-D code."""
+    layer = SynapseLayer(n_neurons=3)
+    _populate(
+        layer,
+        strength=torch.full((3, 3), 0.5),
+        evidence=torch.full((3, 3), 2.0),
+        access_count=torch.zeros(3, 3, dtype=torch.int64),
+    )
+    with torch.no_grad():
+        layer.global_step.fill_(1000)
+    # Threshold above pressure (0.5 * 2.0 / 1 = 1.0) → no fire.
+    trigger_high = ConsolidationTrigger(
+        avg_pressure_threshold=2.0, min_steps_between=0,
+    )
+    assert trigger_high.mode == "pressure"
+    assert not trigger_high.should_fire(layer)
+    # Threshold below pressure → fires.
+    trigger_low = ConsolidationTrigger(
+        avg_pressure_threshold=0.5, min_steps_between=0,
+    )
+    assert trigger_low.should_fire(layer)
+
+
+def test_invalid_mode_rejected() -> None:
+    with pytest.raises(ValueError, match="mode must be"):
+        ConsolidationTrigger(mode="banana")

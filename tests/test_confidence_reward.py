@@ -137,3 +137,30 @@ def test_developmental_alpha_capped() -> None:
     assert developmental_alpha(-0.5) == pytest.approx(0.2)
     # Custom caps respect the same clamping.
     assert developmental_alpha(2.0, alpha_min=0.1, alpha_max=0.6) == pytest.approx(0.6)
+
+
+# ---- REWARD_CONFIGS trigger_mode wiring ----
+
+
+def test_reward_configs_have_correct_trigger_modes() -> None:
+    """The baseline must keep pressure-based triggering (so the
+    comparison cell stays bit-identical to exp 23/25), and all
+    reward-using configs must use count-based triggering (the
+    fix for the R-anti-correlation pressure-suppression cascade)."""
+    from continual_synapse.reward.training_configs import REWARD_CONFIGS
+
+    assert REWARD_CONFIGS["cs_gated_cosine_developmental"].trigger_mode == "pressure"
+    assert REWARD_CONFIGS["cs_reward_developmental"].trigger_mode == "count"
+    assert REWARD_CONFIGS["cosine_reward_developmental"].trigger_mode == "count"
+    assert REWARD_CONFIGS["reward_only_static"].trigger_mode == "count"
+    # And the invariant that all non-constant alpha_mode configs use
+    # count triggering — guards against future configs being added
+    # without flipping the flag.
+    for cfg in REWARD_CONFIGS.values():
+        if cfg.alpha_mode != "constant":
+            assert cfg.trigger_mode == "count", (
+                f"{cfg.name}: alpha_mode={cfg.alpha_mode} but "
+                f"trigger_mode={cfg.trigger_mode}; reward-using "
+                f"configs must use count to avoid the R-magnitude "
+                f"cascade."
+            )

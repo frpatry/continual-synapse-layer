@@ -19,10 +19,13 @@ outlier synapses with extreme strengths.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
 from continual_synapse.synapse_layer.layer import SynapseLayer
+
+TriggerMode = Literal["pressure", "count"]
 
 
 def compute_pressure(synapse: SynapseLayer) -> torch.Tensor:
@@ -43,22 +46,45 @@ def compute_pressure(synapse: SynapseLayer) -> torch.Tensor:
 class ConsolidationTrigger:
     """Decide when a consolidation cycle should fire.
 
+    Two firing strategies, selectable via :attr:`mode`:
+
+    - ``"pressure"`` (default, historical behaviour): fires when
+      ``compute_pressure(syn).mean()`` over active synapses reaches
+      :attr:`avg_pressure_threshold` AND at least
+      :attr:`min_steps_between` consolidate-steps have elapsed
+      since the last fire. The pressure metric depends on the
+      accumulated outer-product magnitudes of past Hebbian updates.
+    - ``"count"`` (path-D): fires as soon as
+      :attr:`min_steps_between` steps have elapsed, regardless of
+      pressure (still requires at least one active synapse so an
+      empty layer can't fire on initialisation). Use this when the
+      Hebbian update is being magnitude-modulated by an external
+      signal (e.g. the per-sample reward in path-D's
+      ``reward_mode="per_sample"``): pressure-based firing in that
+      regime undercounts because R is anti-correlated with feature
+      magnitudes, so the pressure accumulator grows slower than the
+      effective work the layer is doing. Count mode decouples the
+      consolidation cadence from update magnitude.
+
     Attributes:
-        avg_pressure_threshold: Fire when ``compute_pressure(syn).mean()``
-            exceeds this value.
-        min_steps_between: Refractory period in consolidate() steps —
-            don't fire again within this many steps of the previous
-            consolidation. Prevents repeated firings on the same
-            state when the threshold is set low.
-        candidate_quantile: When the trigger fires, this fraction of
-            synapses (those with pressure in the top quantile) are
-            the *candidates* the consolidation pipeline will archive.
-            ``0.1`` means the top 10 % by pressure.
+        avg_pressure_threshold: Pressure-mode firing threshold.
+            Ignored in count mode.
+        min_steps_between: Refractory period in consolidate-step
+            units. In count mode this also drives the firing
+            cadence — count mode fires as soon as this many steps
+            have elapsed since the last fire.
+        candidate_quantile: When the trigger fires, this fraction
+            of synapses (those with pressure in the top quantile)
+            are the *candidates* the consolidation pipeline will
+            archive. ``0.1`` means the top 10 % by pressure. Same
+            semantic in both modes.
+        mode: ``"pressure"`` (default) or ``"count"``.
     """
 
     avg_pressure_threshold: float = 0.05
     min_steps_between: int = 10
     candidate_quantile: float = 0.1
+    mode: TriggerMode = "pressure"
     _last_fire_step: int = -10_000  # initial value safely far in the past
 
     def __post_init__(self) -> None:
@@ -70,28 +96,42 @@ class ConsolidationTrigger:
             raise ValueError(
                 "candidate_quantile must be in (0, 1]"
             )
+        if self.mode not in ("pressure", "count"):
+            raise ValueError(
+                f"mode must be 'pressure' or 'count', got {self.mode!r}"
+            )
 
     def should_fire(self, synapse: SynapseLayer) -> bool:
         """Return True if it's time to consolidate ``synapse``.
 
-        The "mean pressure across the synapse state" is taken over the
-        *active* synapses — i.e. those with a non-zero strength —
-        rather than the full ``(n, n)`` buffer. Sparse top-k mode zeros
-        out most entries; including those zeros in the mean
-        artificially dilutes pressure by ``1 / density`` and was the
-        root cause of the cs_full_sparse pathology surfaced after
-        experiment 12 (consolidation barely fired in sparse mode,
-        cold storage stayed empty, modulator gate ran away negative).
-        Dense mode has an all-True active mask, so the masked mean
-        equals the unmasked mean bit-exact.
+        In pressure mode (default) the "mean pressure across the
+        synapse state" is taken over the *active* synapses — i.e.
+        those with a non-zero strength — rather than the full
+        ``(n, n)`` buffer. Sparse top-k mode zeros out most entries;
+        including those zeros in the mean artificially dilutes
+        pressure by ``1 / density`` and was the root cause of the
+        cs_full_sparse pathology surfaced after experiment 12
+        (consolidation barely fired in sparse mode, cold storage
+        stayed empty, modulator gate ran away negative). Dense mode
+        has an all-True active mask, so the masked mean equals the
+        unmasked mean bit-exact.
+
+        In count mode the pressure metric is bypassed entirely.
+        The refractory check on :attr:`min_steps_between` is the
+        only gate — plus an "at least one active synapse" check
+        that mirrors pressure mode's behaviour on an empty layer
+        (we don't want to fire a consolidation that produces an
+        empty entry).
         """
         step = int(synapse.global_step.item())
         if step - self._last_fire_step < self.min_steps_between:
             return False
-        pressures = compute_pressure(synapse)
         active_mask = synapse.strengths != 0
         if not active_mask.any():
             return False
+        if self.mode == "count":
+            return True
+        pressures = compute_pressure(synapse)
         avg = float(pressures[active_mask].mean().item())
         return avg >= self.avg_pressure_threshold
 

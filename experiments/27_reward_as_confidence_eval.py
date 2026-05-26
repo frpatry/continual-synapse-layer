@@ -133,6 +133,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w-surprise", type=float, default=0.5)
     p.add_argument("--pressure-threshold", type=float, default=0.005)
     p.add_argument("--min-steps-between-consolidations", type=int, default=60)
+    p.add_argument(
+        "--count-trigger-interval", type=int, default=133,
+        help=(
+            "When a config requests trigger_mode='count' (any of the "
+            "reward-using configs), this is the per-config "
+            "min_steps_between consolidations passed to "
+            "ConsolidationTrigger — drives the firing cadence in "
+            "count mode. Default 133 is the empirical mean steps-"
+            "between-consolidations measured on the baseline "
+            "cs_gated_cosine_developmental T=15 n=3 checkpoints: "
+            "14070 total batches / (104, 105, 108) consolidations "
+            "= (135.29, 134.00, 130.28) → mean 133.19. Calibrated "
+            "this way so count-mode and pressure-mode configs are "
+            "directly comparable on every axis except how the "
+            "trigger decides when to fire."
+        ),
+    )
     p.add_argument("--candidate-quantile", type=float, default=0.05)
     p.add_argument("--retrieval-k", type=int, default=4)
     p.add_argument("--retrieval-refresh-interval", type=int, default=20)
@@ -211,10 +228,21 @@ def _build_model_for_config(
         ),
         client=chroma_client,
     )
+    # Reward-using configs use count-based triggering because the
+    # per-sample reward weighting is anti-correlated with feature
+    # magnitudes, which makes the pressure accumulator grow
+    # ~quadratically slower and undercounts consolidations 3-4×.
+    # Baseline keeps the historical pressure-based trigger so the
+    # comparison cell is bit-identical to exp 23 / 25.
+    if config.trigger_mode == "count":
+        trigger_min_steps = args.count_trigger_interval
+    else:
+        trigger_min_steps = args.min_steps_between_consolidations
     trigger = ConsolidationTrigger(
         avg_pressure_threshold=args.pressure_threshold,
-        min_steps_between=args.min_steps_between_consolidations,
+        min_steps_between=trigger_min_steps,
         candidate_quantile=args.candidate_quantile,
+        mode=config.trigger_mode,
     )
     return SynapseAugmentedMLP(
         base, synapse, modulator,
@@ -517,11 +545,37 @@ def _train_one(
     )
     runner.run(model, bench)
     elapsed = time.time() - t0
+    # Effective consolidation frequency. synapse.global_step
+    # increments once per consolidate() call, which is once per
+    # apply_hebbian_update, which is once per training batch. So
+    # global_step.item() is the total batch count seen across
+    # training — the right denominator for "how often did the
+    # trigger actually fire?" regardless of which mode it used.
+    total_batches = int(model.synapse.global_step.item())
+    if model.consolidation_count > 0:
+        effective_interval = total_batches / model.consolidation_count
+    else:
+        effective_interval = float("nan")
+    target_interval = (
+        args.count_trigger_interval
+        if config.trigger_mode == "count"
+        else float("nan")
+    )
+    target_repr = (
+        f"{target_interval:.0f}" if not math.isnan(target_interval) else "n/a"
+    )
     print(
         f"      trained in {elapsed:.1f}s; "
         f"{model.consolidation_count} consolidations, "
         f"{model.cold_storage.count()} stored entries, "
         f"{len(recorder.events)} reward events.",
+        flush=True,
+    )
+    print(
+        f"      effective interval ≈ {effective_interval:.1f} "
+        f"batches/cons over {total_batches} batches "
+        f"(trigger_mode={config.trigger_mode}, "
+        f"target={target_repr})",
         flush=True,
     )
     _save_checkpoint(
