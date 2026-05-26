@@ -166,6 +166,12 @@ class EpisodicPredictor:
         independently of the compute substrate; that's the whole
         point of the dual-substrate design.
 
+        ``x`` flows into the memory as both the feature query (after
+        :meth:`feature_extract`) and the stored ``raw_inputs`` —
+        the latter is what :meth:`re_encode_memory` re-uses at task
+        boundaries to keep stored embeddings aligned with the
+        current model's feature space.
+
         Args:
             x: Input batch ``(B, ...)``.
             y: Long-int class targets ``(B,)``.
@@ -174,4 +180,40 @@ class EpisodicPredictor:
                 consult it.
         """
         features = self.feature_extract(x)
-        return self.memory.maybe_allocate(features, y, task_id=task_id)
+        return self.memory.maybe_allocate(
+            features=features,
+            raw_inputs=x,
+            labels=y,
+            task_id=task_id,
+        )
+
+    @torch.no_grad()
+    def re_encode_memory(
+        self,
+        device: torch.device | str | None = None,
+        batch_size: int = 256,
+    ) -> int:
+        """Refresh every stored embedding under the current model.
+
+        Convenience wrapper around
+        :meth:`ActiveEpisodicMemory.re_encode_all` that handles the
+        eval-mode boilerplate so the encoded features don't see
+        dropout. The previous training flag is restored on exit so a
+        re-encode in the middle of a training loop doesn't leak.
+
+        Returns the number of entries re-encoded.
+        """
+        n = len(self.memory)
+        if n == 0:
+            return 0
+        was_training = self.base_model.training
+        self.base_model.eval()
+        try:
+            self.memory.re_encode_all(
+                feature_extractor=self.feature_extract,
+                device=device,
+                batch_size=batch_size,
+            )
+        finally:
+            self.base_model.train(was_training)
+        return n

@@ -27,6 +27,8 @@ narrow.
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 import torch.nn.functional as F
 
@@ -82,7 +84,15 @@ class ActiveEpisodicMemory:
         # Growing storage. Lists of CPU tensors / Python ints keep the
         # data structure simple and pickle-friendly; the cache below
         # holds a normalised stacked tensor for fast retrieval.
+        #
+        # Embeddings live alongside ``raw_inputs`` (one entry per slot):
+        # the embeddings drive retrieval, the raw inputs are kept so
+        # that :meth:`re_encode_all` can recompute embeddings under a
+        # newer model at task boundaries — fixing the "stored
+        # embeddings drift out of the current feature space" failure
+        # mode the T=15 n=2 pilot exposed.
         self.embeddings: list[torch.Tensor] = []
+        self.raw_inputs: list[torch.Tensor] = []
         self.labels: list[int] = []
         self.task_ids: list[int | None] = []
         self._normalized_cache: torch.Tensor | None = None
@@ -145,6 +155,7 @@ class ActiveEpisodicMemory:
     def maybe_allocate(
         self,
         features: torch.Tensor,
+        raw_inputs: torch.Tensor,
         labels: torch.Tensor,
         task_id: int | None = None,
     ) -> int:
@@ -161,7 +172,14 @@ class ActiveEpisodicMemory:
 
         Args:
             features: ``(B, feature_dim)`` penultimate activations.
-                Detached and cloned before storage.
+                Used for novelty scoring and stored as the
+                retrieval embedding. Detached and cloned.
+            raw_inputs: ``(B, *input_shape)`` original inputs. Stored
+                alongside the embeddings so :meth:`re_encode_all`
+                can refresh them under a newer model at task
+                boundaries — the fix for stored embeddings drifting
+                out of the current feature space as the model
+                learns new tasks.
             labels: ``(B,)`` long integer class labels.
             task_id: Optional task identifier stored alongside each
                 allocated entry. Used by diagnostics; not consulted
@@ -178,6 +196,11 @@ class ActiveEpisodicMemory:
                 f"labels.shape={tuple(labels.shape)}, "
                 f"features.shape={tuple(features.shape)}"
             )
+        if raw_inputs.shape[0] != features.shape[0]:
+            raise ValueError(
+                f"raw_inputs batch {raw_inputs.shape[0]} disagrees "
+                f"with features batch {features.shape[0]}"
+            )
 
         novelty = self.compute_novelty(features)
         novel_mask = novelty > self.novelty_threshold
@@ -192,6 +215,7 @@ class ActiveEpisodicMemory:
             ):
                 break
             self.embeddings.append(features[i].detach().clone().cpu())
+            self.raw_inputs.append(raw_inputs[i].detach().clone().cpu())
             self.labels.append(int(labels_long[i].item()))
             self.task_ids.append(task_id)
             n_allocated += 1
@@ -262,3 +286,79 @@ class ActiveEpisodicMemory:
 
         confidence = top_sims.max(dim=-1).values  # (B,)
         return probs, confidence
+
+    # ---- re-encoding (feature-drift fix) ----
+
+    @torch.no_grad()
+    def re_encode_all(
+        self,
+        feature_extractor: Callable[[torch.Tensor], torch.Tensor],
+        device: torch.device | str | None = None,
+        batch_size: int = 256,
+    ) -> None:
+        """Recompute every stored embedding using ``feature_extractor``.
+
+        Called at task boundaries to keep the stored embeddings
+        aligned with the model's current feature space. Without this,
+        embeddings stored during early tasks fall out of the current
+        representation as the model adapts to later tasks, and
+        retrieval at evaluation time sees stored-Task-0 entries as
+        completely unrelated to the same-distribution Task-0 inputs
+        — the failure mode the T=15 n=2 pilot exposed.
+
+        The function processes the stored raw inputs in chunks of
+        ``batch_size`` to bound peak memory; the chunks are moved to
+        ``device`` before calling ``feature_extractor`` and the
+        results are moved back to CPU before storage (the canonical
+        location of memory entries).
+
+        Args:
+            feature_extractor: Callable mapping a batch of raw inputs
+                with shape ``(B, *input_shape)`` to features
+                ``(B, feature_dim)``. Typically
+                :meth:`EpisodicPredictor.feature_extract`. The
+                callable is responsible for any model-state
+                management (e.g. putting the underlying model in
+                ``eval()`` for dropout-free encoding); see
+                :meth:`EpisodicPredictor.re_encode_memory` which
+                wraps this with the eval-mode boilerplate.
+            device: Where to move input chunks before feeding the
+                feature extractor. ``None`` (default) uses the
+                device of the first stored raw input — typically
+                CPU.
+            batch_size: Chunk size for re-encoding. Default ``256``.
+
+        No-op when memory is empty.
+        """
+        if not self.raw_inputs:
+            return
+        if len(self.raw_inputs) != len(self.embeddings):
+            raise RuntimeError(
+                f"raw_inputs and embeddings out of sync: "
+                f"{len(self.raw_inputs)} vs {len(self.embeddings)} — "
+                f"every allocation should append to both."
+            )
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+        if device is None:
+            device = self.raw_inputs[0].device
+        device = torch.device(device)
+
+        stacked = torch.stack(self.raw_inputs)
+        new_chunks: list[torch.Tensor] = []
+        for i in range(0, stacked.shape[0], batch_size):
+            chunk = stacked[i : i + batch_size].to(device)
+            features = feature_extractor(chunk)
+            if features.ndim != 2 or features.shape[1] != self.feature_dim:
+                raise RuntimeError(
+                    f"feature_extractor returned shape {tuple(features.shape)}, "
+                    f"expected (B, {self.feature_dim})"
+                )
+            new_chunks.append(features.detach().to(torch.float32).cpu())
+        new_stack = torch.cat(new_chunks, dim=0)
+        # Rebuild the per-entry list so each slot is its own tensor
+        # (matches the contract from maybe_allocate; downstream code
+        # reads embeddings[i] expecting a standalone (D,) tensor).
+        self.embeddings = [new_stack[i].clone() for i in range(new_stack.shape[0])]
+        self._invalidate_cache()
