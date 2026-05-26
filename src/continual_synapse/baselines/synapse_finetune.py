@@ -38,7 +38,8 @@ rather than self-reinforcing its own correction.
 
 from __future__ import annotations
 
-from typing import Callable
+import warnings
+from typing import Callable, Literal
 
 import torch
 from torch import nn
@@ -52,6 +53,7 @@ from continual_synapse.consolidation.pipeline import (
 )
 from continual_synapse.consolidation.reconstruction import reconstruct_strengths
 from continual_synapse.consolidation.trigger import ConsolidationTrigger
+from continual_synapse.reward.confidence_reward import normalize_reward_batch
 from continual_synapse.reward.external import ExternalReward
 from continual_synapse.reward.mixer import RewardMixer
 from continual_synapse.synapse_layer.layer import SynapseLayer
@@ -523,6 +525,8 @@ class SynapseAugmentedMLP(nn.Module):
         reward: float | None = None,
         training_target: torch.Tensor | None = None,
         loss: float | None = None,
+        reward_signal: torch.Tensor | None = None,
+        reward_mode: Literal["constant", "per_sample"] = "constant",
     ) -> float:
         """Push the most recently observed features into the synapse layer.
 
@@ -572,6 +576,26 @@ class SynapseAugmentedMLP(nn.Module):
                 cross-entropy itself so callers don't have to pass it
                 explicitly. No-op when the threshold is zero or no
                 retrieval happened this batch.
+            reward_signal: Per-sample informativeness reward, shape
+                ``(B,)``. Produced by
+                :func:`continual_synapse.reward.confidence_reward.compute_reward_signal`.
+                Only consulted when ``reward_mode == "per_sample"``.
+                Higher values mean the sample is more informative
+                and should contribute more to the synapse update.
+            reward_mode: ``"constant"`` (default) keeps the
+                pre-path-D behaviour bit-identical — the scalar
+                ``reward`` (or whatever the reward_computer produces)
+                drives a uniform per-batch update magnitude.
+                ``"per_sample"`` switches to a per-sample weighting:
+                the batch's features are pre-multiplied by
+                ``sqrt(normalise(reward_signal))`` before being fed
+                to ``synapse.consolidate(reward=1.0)``, which makes
+                the resulting Hebbian update equivalent to
+                ``Σ_i R_i · a_i a_i.T / B``. The per-batch mean
+                update magnitude is preserved (normalisation forces
+                ``mean(R) = 1``); only the relative weighting
+                across samples differs. Falls back to constant mode
+                with a warning if ``reward_signal`` is None.
 
         When cold storage and a trigger are configured, also attempt
         a consolidation cycle. The cycle is a no-op if the trigger
@@ -614,11 +638,68 @@ class SynapseAugmentedMLP(nn.Module):
                 reward = 1.0
         self.synapse.record_access(features)
 
-        if use_buffer:
-            # Let the layer drain its own buffer.
-            self.synapse.consolidate(reward=reward)
+        # Per-sample reward integration (path D). When opted into via
+        # reward_mode='per_sample' and a reward_signal is supplied, we
+        # pre-weight the activations by sqrt(R_norm) before passing them
+        # to the synapse layer. Both the strength outer-product
+        # (raw_outer) and the evidence outer-product (abs_outer) inside
+        # synapse.consolidate become per-sample-weighted:
+        #     Σ_i (sqrt(R_i) a_i)(sqrt(R_i) a_i).T = Σ_i R_i a_i a_i.T
+        # This is the exact "samples with high R contribute more to the
+        # update" semantic, with no synapse-layer API change. The scalar
+        # reward fed to consolidate is set to 1.0 because the per-sample
+        # R is doing all the weighting.
+        use_per_sample = (
+            reward_mode == "per_sample"
+            and reward_signal is not None
+        )
+        if reward_mode == "per_sample" and reward_signal is None:
+            warnings.warn(
+                "apply_hebbian_update(reward_mode='per_sample') called "
+                "with reward_signal=None; falling back to constant mode. "
+                "Pass a (B,) tensor from compute_reward_signal(...) to "
+                "engage per-sample weighting.",
+                stacklevel=2,
+            )
+
+        if use_per_sample:
+            # Validate shape against the features we're about to weight.
+            if reward_signal.ndim != 1:
+                raise ValueError(
+                    f"reward_signal must be 1-D (B,), got shape "
+                    f"{tuple(reward_signal.shape)}"
+                )
+            if reward_signal.shape[0] != features.shape[0]:
+                raise ValueError(
+                    f"reward_signal batch {reward_signal.shape[0]} "
+                    f"disagrees with features batch {features.shape[0]}"
+                )
+            R_norm = normalize_reward_batch(
+                reward_signal.detach().to(features.dtype).to(features.device)
+            )
+            weights = R_norm.clamp_min(0.0).sqrt().unsqueeze(1)  # (B, 1)
+            # The buffer-mode path inside synapse.consolidate refuses
+            # explicit activations when its buffer is non-empty; drain
+            # the buffer manually so we can pass our pre-weighted average
+            # as activations and keep the per-sample math correct.
+            if use_buffer:
+                averaged = self.synapse.buffer_average()
+                self.synapse.clear_buffer()
+                weighted = averaged * weights
+            else:
+                weighted = features * weights
+            self.synapse.consolidate(weighted, reward=1.0)
+            # The actual scalar applied to synapse.consolidate is 1.0;
+            # _last_reward is read by the next-forward reward-modulated
+            # amplification cache, and 1.0 is the neutral "no
+            # amplification" value, matching cold-start behaviour.
+            reward = 1.0
         else:
-            self.synapse.consolidate(features, reward=reward)
+            if use_buffer:
+                # Let the layer drain its own buffer.
+                self.synapse.consolidate(reward=reward)
+            else:
+                self.synapse.consolidate(features, reward=reward)
 
         if (
             self.cold_storage is not None
@@ -956,6 +1037,29 @@ class SynapseAugmentedMLP(nn.Module):
         ramp-up trajectory.
         """
         return self._last_maturity
+
+    @property
+    def current_maturity(self) -> float:
+        """Developmental maturity computed fresh from the current
+        consolidation count.
+
+        Same formula as the cached :attr:`last_maturity`, but
+        recomputed on every read instead of being updated only when
+        :meth:`apply_gradient_gating` fires. Use this when a
+        consumer needs the live maturity but the gating callback
+        isn't guaranteed to have run — e.g. the reward-as-confidence
+        training loop with cosine gating disabled
+        (``cs_reward_developmental``). Returns ``1.0`` when
+        ``maturity_target_consolidations == 0`` (the disabled-
+        scaling default).
+        """
+        if self.maturity_target_consolidations > 0:
+            return min(
+                self._consolidation_count
+                / float(self.maturity_target_consolidations),
+                1.0,
+            )
+        return 1.0
 
     @torch.no_grad()
     def apply_gradient_gating(self) -> float:

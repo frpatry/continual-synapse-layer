@@ -2294,3 +2294,133 @@ def test_per_class_strengths_shared_across_class_entries() -> None:
         f"siblings must share the same strengths document; "
         f"got {len(docs)} distinct documents"
     )
+
+
+# ---- Path-D: per-sample reward in apply_hebbian_update ----
+
+
+def test_constant_mode_unchanged() -> None:
+    """The default reward_mode='constant' must keep apply_hebbian_update
+    bit-identical to its pre-path-D behaviour. We verify by running two
+    seeded models — one default, one with explicit reward_mode='constant'
+    and a reward_signal that should be ignored — and checking that the
+    resulting synapse strengths agree exactly."""
+    set_seed(42)
+    aug_a, _ = _build_augmented(init_gate=0.0)
+    set_seed(42)
+    aug_b, _ = _build_augmented(init_gate=0.0)
+
+    aug_a.train()
+    aug_b.train()
+    x = torch.randn(4, 4)
+    # Identical forward passes (same seed).
+    aug_a(x)
+    aug_b(x)
+    # Default call.
+    aug_a.apply_hebbian_update()
+    # Explicit constant mode with an ignored reward_signal.
+    ignored = torch.tensor([100.0, 0.0, 0.0, 0.0])
+    aug_b.apply_hebbian_update(
+        reward_signal=ignored, reward_mode="constant",
+    )
+    torch.testing.assert_close(
+        aug_a.synapse.strengths, aug_b.synapse.strengths,
+        rtol=0.0, atol=0.0,
+    )
+
+
+def test_per_sample_mode_uses_R() -> None:
+    """A sample with a high R must contribute proportionally more to
+    the synapse strength delta than a sample with a low R.
+
+    Setup: 2-neuron synapse, batch of 2 orthogonal one-hot activations
+    so each sample's outer product touches one diagonal cell. R[0]
+    dominates R[1] by ~50×; after normalisation R_norm[0] >> R_norm[1].
+    The resulting Δstrengths[0,0] should be ~50× larger than
+    Δstrengths[1,1]."""
+    syn = SynapseLayer(n_neurons=2, learning_rate=0.1)
+    base = MLPClassifier(MLPConfig(input_dim=4, hidden_dim=2, num_classes=2))
+    aug = SynapseAugmentedMLP(base, syn, SynapseModulation(init_gate=0.0))
+    aug.train()
+
+    # Bypass forward; install a known feature tensor by feeding a real
+    # forward, then overwrite _last_features.
+    aug(torch.randn(2, 4))
+    aug._last_features = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32,
+    )
+    # Reset synapse so the result is a clean delta from zero.
+    syn.strengths.zero_()
+    syn.evidence.zero_()
+    syn.global_step.zero_()
+    syn._prev_abs_outer.zero_()
+
+    R = torch.tensor([100.0, 2.0])  # ratio 50:1 before normalisation
+    aug.apply_hebbian_update(
+        reward_signal=R, reward_mode="per_sample",
+    )
+
+    delta_00 = float(syn.strengths[0, 0])
+    delta_11 = float(syn.strengths[1, 1])
+    # Both must be positive (each sample contributed something).
+    assert delta_00 > 0 and delta_11 > 0
+    # The high-R sample's contribution dominates by approximately the
+    # input ratio (50:1). Loose tolerance for the resistance/learning
+    # rate scaling, but the order of magnitude must match.
+    ratio = delta_00 / delta_11
+    assert 30.0 < ratio < 70.0, (
+        f"expected high-R/low-R contribution ratio ≈ 50, got {ratio:.2f}"
+    )
+
+
+def test_per_sample_mode_falls_back_when_R_missing() -> None:
+    """reward_mode='per_sample' with reward_signal=None must emit a
+    warning and behave identically to the constant default. Guards
+    against silent miswiring in training scripts."""
+    set_seed(7)
+    aug_a, _ = _build_augmented(init_gate=0.0)
+    set_seed(7)
+    aug_b, _ = _build_augmented(init_gate=0.0)
+
+    aug_a.train()
+    aug_b.train()
+    x = torch.randn(3, 4)
+    aug_a(x)
+    aug_b(x)
+    aug_a.apply_hebbian_update()  # constant default
+    with pytest.warns(UserWarning, match="falling back to constant"):
+        aug_b.apply_hebbian_update(
+            reward_mode="per_sample", reward_signal=None,
+        )
+    torch.testing.assert_close(
+        aug_a.synapse.strengths, aug_b.synapse.strengths,
+        rtol=0.0, atol=0.0,
+    )
+
+
+def test_current_maturity_property() -> None:
+    """current_maturity recomputes from _consolidation_count instead of
+    waiting for apply_gradient_gating to update the cache. Critical
+    for reward configs that disable cosine gating."""
+    aug, _ = _build_augmented()
+    # Disabled scaling: always 1.0.
+    aug.maturity_target_consolidations = 0
+    aug._consolidation_count = 0
+    assert aug.current_maturity == 1.0
+    aug._consolidation_count = 100
+    assert aug.current_maturity == 1.0
+
+    # Enabled scaling: ramps from 0 to 1 then clamps.
+    aug.maturity_target_consolidations = 10
+    aug._consolidation_count = 0
+    assert aug.current_maturity == 0.0
+    aug._consolidation_count = 5
+    assert aug.current_maturity == 0.5
+    aug._consolidation_count = 10
+    assert aug.current_maturity == 1.0
+    aug._consolidation_count = 100
+    assert aug.current_maturity == 1.0  # clamped above target
+
+    # And critically: current_maturity is independent of last_maturity
+    # (which only updates when apply_gradient_gating fires).
+    assert aug._last_maturity == 1.0  # untouched (we never called gating)
