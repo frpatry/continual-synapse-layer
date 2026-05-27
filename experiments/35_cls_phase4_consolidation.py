@@ -62,10 +62,37 @@ from continual_synapse.evaluation.runner import set_seed  # noqa: E402
 #
 # Captured from exp 33 T=15 n=2 epochs_per_task=1. Used as the
 # +5pp anchor for Gate 2 below. Note that this reference is at
-# T=15 while Phase 4 trains at T=5; the gate stays comparable
-# because the consolidation effect should manifest from the
-# earliest tasks onwards.
+# T=15 while Phase 4 originally trained at T=5; the gate stays
+# comparable because the consolidation effect should manifest
+# from the earliest tasks onwards.
 _PHASE2_NAIVE_TASK0 = 0.200
+
+# ---------- DER-equivalent reference (Gate 6 strong scaling) ----------
+#
+# cs_gated_cosine_functional @ T=15 n=4 hit ACC=0.904 / Task-0=0.908
+# in the original Phase D audit. This is the project's strongest
+# prior CL baseline. If the CLS architecture matches or beats it
+# at T=15, that's the headline milestone.
+_DER_EQUIV_ACC_BASELINE = 0.904
+
+# ---------- T=5 Phase 4 reference (for scaling comparison) ----------
+#
+# Captured from the T=5 n=2 run committed as 4c9d4c4 — all 4
+# original gates passed. Used to render a side-by-side delta
+# table when a longer run is invoked. Numbers are means across
+# the 2 seeds of that run.
+_T5_REF: dict[str, float] = {
+    "T":               5.0,
+    "neo_acc":         0.893,
+    "neo_task0":       0.837,
+    "neo_taskN":       0.952,
+    "hipp_acc":        0.764,
+    "hipp_task0":      0.647,
+    "hipp_taskN":      0.940,
+    "drift_low_end":   0.877,
+    "drift_mid_end":   0.795,
+    "drift_high_end":  0.795,
+}
 
 
 # ---------- models (copies from exp 32 / 33 — self-contained) ----------
@@ -588,6 +615,63 @@ def _print_retention_rows(
     return hipp_means, neo_means
 
 
+def _print_scaling_comparison(
+    per_seed: list[dict[str, Any]],
+    hipp_means: list[float], neo_means: list[float],
+    current_T: int,
+) -> dict[str, dict[str, float]]:
+    """Print a T=5-vs-current side-by-side delta table. Only
+    meaningful when ``current_T != 5``; when it IS 5 the deltas
+    are all zero and the block just renders as a sanity check.
+    """
+    last_drift_lows = [
+        s["consolidation_diagnostics"][-1]["drift_low_corr"]
+        for s in per_seed if s["consolidation_diagnostics"]
+    ]
+    last_drift_mids = [
+        s["consolidation_diagnostics"][-1]["drift_mid_corr"]
+        for s in per_seed if s["consolidation_diagnostics"]
+    ]
+    last_drift_highs = [
+        s["consolidation_diagnostics"][-1]["drift_high_corr"]
+        for s in per_seed if s["consolidation_diagnostics"]
+    ]
+    cur = {
+        "neo_acc":        statistics.fmean(neo_means),
+        "neo_task0":      neo_means[0],
+        "neo_taskN":      neo_means[-1],
+        "hipp_acc":       statistics.fmean(hipp_means),
+        "hipp_task0":     hipp_means[0],
+        "hipp_taskN":     hipp_means[-1],
+        "drift_low_end":  statistics.fmean(last_drift_lows),
+        "drift_mid_end":  statistics.fmean(last_drift_mids),
+        "drift_high_end": statistics.fmean(last_drift_highs),
+    }
+
+    print()
+    print(f"Compare to T={int(_T5_REF['T'])} baseline:")
+    print(
+        f"              T={int(_T5_REF['T']):<5d} T={current_T:<5d} Δ"
+    )
+
+    def _line(label: str, key: str) -> None:
+        ref = _T5_REF[key]
+        val = cur[key]
+        delta = val - ref
+        sign = "+" if delta >= 0 else ""
+        print(
+            f"  {label:<13} {ref:<6.3f}  {val:<6.3f}  {sign}{delta:.3f}"
+        )
+
+    _line("neo ACC:",     "neo_acc")
+    _line("neo Task-0:",  "neo_task0")
+    _line("neo Task-N:",  "neo_taskN")
+    _line("hipp Task-N:", "hipp_taskN")
+    _line("drift_low:",   "drift_low_end")
+
+    return {"T5_ref": dict(_T5_REF), "current": cur}
+
+
 def _print_gates(
     per_seed: list[dict[str, Any]],
     hipp_means: list[float], neo_means: list[float],
@@ -609,10 +693,17 @@ def _print_gates(
     neo_task0 = neo_means[0]
     neo_taskN = neo_means[-1]
     hipp_taskN = hipp_means[-1]
+    neo_acc = statistics.fmean(neo_means)
     naive_plus_5pp = _PHASE2_NAIVE_TASK0 + 0.05
     gate2_pass = neo_task0 > naive_plus_5pp
     gate3_pass = neo_taskN > 0.85
     gate4_pass = hipp_taskN > 0.85
+    # Gates 5-6: scaling-specific. Gate 5 demands strong Task-0
+    # retention (> 0.75); Gate 6 compares aggregate ACC to the
+    # DER-equivalent cs_gated_cosine_functional baseline (0.904
+    # at T=15 n=4 from Phase D's audit).
+    gate5_pass = neo_task0 > 0.75
+    gate6_pass = neo_acc > _DER_EQUIV_ACC_BASELINE
 
     print()
     print("=== Decision gates ===")
@@ -634,11 +725,45 @@ def _print_gates(
         f"[gate 4] Hippocampus still functions: hipp Task-N > 0.85?  "
         f"{'PASS' if gate4_pass else 'FAIL'}  (got {hipp_taskN:.3f})"
     )
+    print(
+        f"[gate 5] Strong scaling: neocortex Task-0 > 0.75?  "
+        f"{'PASS' if gate5_pass else 'FAIL'}  (got {neo_task0:.3f})"
+    )
+    print(
+        f"[gate 6] Matches cs_gated_cosine_functional (ACC > "
+        f"{_DER_EQUIV_ACC_BASELINE:.3f})?  "
+        f"{'PASS' if gate6_pass else 'FAIL'}  (got {neo_acc:.3f})"
+    )
 
-    all_pass = gate1_pass and gate2_pass and gate3_pass and gate4_pass
+    # All-pass means the original 4 gates AND both scaling gates.
+    # Gate 5/6 are scoped to the T=15 scaling test; Gate 6 in
+    # particular is the project-level milestone for "matches the
+    # prior best CL baseline".
+    core_pass = gate1_pass and gate2_pass and gate3_pass and gate4_pass
+    all_pass = core_pass and gate5_pass and gate6_pass
     print()
     if all_pass:
-        print("ALL GATES PASS — consolidation works, ready for Phase 5.")
+        print(
+            "ALL GATES PASS (including scaling gates 5+6) — "
+            "consolidation scales, ready for Phase 5."
+        )
+    elif core_pass:
+        print(
+            "CORE GATES (1–4) PASS but scaling gates failed:"
+        )
+        if not gate5_pass:
+            print(
+                f"  - Gate 5: neo Task-0={neo_task0:.3f} ≤ 0.75. "
+                f"Partial scaling — try lambda_anchor_low=2.0 or "
+                f"cons_epochs=2 before Phase 5."
+            )
+        if not gate6_pass:
+            print(
+                f"  - Gate 6: neo ACC={neo_acc:.3f} ≤ "
+                f"{_DER_EQUIV_ACC_BASELINE:.3f}. Doesn't yet match "
+                f"the DER-equivalent baseline. May still be a "
+                f"viable CLS contribution if gates 1–5 hold."
+            )
     else:
         # Apply the spec's suggested-fix routing.
         print("NEEDS ADJUSTMENT — failures:")
@@ -681,7 +806,14 @@ def _print_gates(
         "gate3_pass": bool(gate3_pass),
         "gate4_hipp_taskN": float(hipp_taskN),
         "gate4_pass": bool(gate4_pass),
-        "verdict": "PASS" if all_pass else "NEEDS_ADJUSTMENT",
+        "gate5_strong_scaling_neo_task0": float(neo_task0),
+        "gate5_pass": bool(gate5_pass),
+        "gate6_neo_acc_vs_der_equiv": float(neo_acc),
+        "gate6_pass": bool(gate6_pass),
+        "core_gates_pass": bool(core_pass),
+        "verdict": "PASS" if all_pass else (
+            "CORE_PASS_SCALING_FAIL" if core_pass else "NEEDS_ADJUSTMENT"
+        ),
     }
 
 
@@ -810,6 +942,9 @@ def main() -> None:
         per_seed, num_tasks=args.T,
     )
     gates = _print_gates(per_seed, hipp_means, neo_means)
+    scaling_comparison = _print_scaling_comparison(
+        per_seed, hipp_means, neo_means, current_T=args.T,
+    )
 
     # ----- persist -----
     args.output_dir.mkdir(parents=True, exist_ok=True)
