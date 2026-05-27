@@ -1,248 +1,256 @@
-# Session handoff — 2026-05-26 (memory-augmented native architecture ready)
+# Session handoff — 2026-05-27 (memory-augmented null + decision point)
 
-## Where we are
+## TL;DR — read this first
 
-The functional-regularization pivot worked but capped at
-**DER-equivalent** results: ``cs_gated_cosine_functional`` at T=15
-n=4 hits ACC=0.904, Task-0=0.908, FGT=0.003 — a clean, audited,
-strong result that ties (rather than surpasses) what Dark Experience
-Replay achieves in the literature. The six-step audit confirmed
-the result is real (no contamination, +2.23pp generalization gap,
-healthy loss magnitudes, flat per-task retention curve, exact memory
-math, tight 4-seed replication) — it's just not a breakthrough on
-the existing methodological frontier.
+**The functional-regularization result is the project's ceiling so far.**
+`cs_gated_cosine_functional` at T=15 n=4: **ACC=0.904, Task-0=0.908,
+FGT=0.003**. Audited end-to-end (six checks passed). Equivalent to
+Dark Experience Replay (DER).
 
-The pattern across **every architecture this project has tried** is
-the same: bolting memory onto a trained model — whether at inference
-(retrieval ensembles), as a distillation target (LwF / DER), or
-through gradient modulation (cosine gating) — hits a fundamental
-ceiling. Models that don't *learn to use memory* cannot leverage it
-effectively, even when the memory contains correct information.
+**Memory-augmented native (this session's pivot) hit a clean null.**
+Even with the developmental maturity floor forcing memory engagement,
+the architecture is *parasitic* relative to its own no-memory control
+across all three maturity sweep settings. Headline numbers below.
 
-The pivot for this session: an architecture where memory access is
-**part of the forward pass during training**. Inspired by DNC
-(Graves 2016), MANN (Santoro 2016), Memorizing Transformers
-(Wu 2022), and the project's original Cold Storage vision — which
-proposed queryable storage trained jointly with the network, an
-idea we never properly implemented.
+**The project has reached a decision point.** Seven architecturally
+distinct innovations have now been tried; only one (functional reg)
+ties the DER baseline; none surpasses it. Three honest paths forward
+documented at the bottom of this file.
 
-## What ships in this session (all committed)
+## Current state of the codebase
 
-- `dda0881` — Phase 0: pivot rationale + decisions_log entry
-  codifying the "bolted-on memory hits a ceiling" pattern across
-  retrieval ensembles, dual-substrate, and functional reg.
-- `f632a16` — Phase 1: ``MemoryAugmentedMLP`` + ``ExternalMemory``
-  in ``src/continual_synapse/memory_augmented/`` with 8 unit tests
-  covering empty/non-empty paths, gradient flow through every
-  access head, and the frozen-stored-entries contract.
-- `c4aef77` — Phase 2: ``experiments/31_memory_augmented_eval.py``
-  with three configs (the proposal, the architectural control,
-  and the cs_gated_cosine_functional reference) + per-task
-  diagnostics (gate trace, attention entropy). Smoke-tested at
-  T=2.
-- (this commit) — Phase 3: handoff update + run command + decision
-  tiers + the post-pilot diagnostic playbook.
+All commits clean. Last commit `89380e9` patches an exp 31 loader
+bug surfaced during this session's debugging (silent
+checkpoint-mismatch on `maturity_target` was producing meaningless
+numbers; loader now raises a clear RuntimeError on mismatch). Full
+test suite: **461 passing**.
 
-The earlier path-A/B/C/D + dual-substrate + functional infrastructure
-all stays in the codebase under its original subpackages. The new
-memory-augmented work is purely additive.
+## Headline result from this session (Phase G, memory-augmented native)
 
-## Architecture sketch
+After the fix to retrain from scratch (deleting stale Phase 2
+checkpoints), three clean T=15 n=3 runs across the maturity sweep:
 
-```
-x -> encoder -> h
-h -> query_proj -> query
-retrieved, weights = attention(query, memory.keys, memory.values)
-h, retrieved -> context_combiner -> combined
-gate = sigmoid(memory_gate(h))                  # (B, 1)
-effective_h = (1 - gate) * h + gate * combined
-logits = classifier(effective_h)
-```
+| config | maturity_target | ACC | Task-0 | Task-N | FGT |
+|---|---:|---:|---:|---:|---:|
+| **memory_augmented_no_memory (control)** | n/a | **0.469** | **0.235** | 0.961 | +0.727 |
+| memory_augmented_native | 300 (aggressive) | 0.405 | 0.165 | 0.953 | +0.788 |
+| memory_augmented_native | 750 (default) | 0.419 | 0.178 | 0.954 | +0.775 |
+| memory_augmented_native | 1200 (gentle) | 0.436 | 0.191 | 0.954 | +0.763 |
 
-The four memory-access heads — ``query_proj``, ``value_proj``,
-``context_combiner``, ``memory_gate`` — are ``nn.Linear`` parameters
-trained end-to-end via the task loss from batch 0. The stored
-``(keys, values, task_ids)`` are ``register_buffer`` snapshots
-written at task end under ``torch.no_grad``; they don't appear in
-``model.parameters()`` and don't accumulate gradients.
+JSON outputs in `results/logs/memory_augmented/`:
+- `1779875332_31_T15_memory_augmented.json` (target=750 with control)
+- `1779875759_31_T15_memory_augmented.json` (target=300)
+- `1779875842_31_T15_memory_augmented.json` (target=1200)
 
-The empty-memory regime returns zero retrieved values, and the
-forward's ``if len(memory) > 0`` guard bypasses the gate/combiner
-path entirely — so before any writes have happened the model's
-output equals ``classifier(encoder(x))`` bit-exactly. ``query_proj``
-still runs in that regime (we compute it before the read), so the
-gradient path through it warms up from batch 0; the real signal
-for the access heads kicks in once memory is non-empty (first
-batch of task 1 onward).
+Three findings stack into a clean null verdict:
 
-## Running the pilot
+1. **Memory is parasitic, not helpful.** Native is worse than the
+   no-memory control across every maturity target — ACC drops 3-6
+   pp, Task-0 drops 4-7 pp. Forcing the model to engage with
+   memory makes things worse.
+2. **Less floor pressure is monotonically better.** target=1200
+   (gentlest floor) beats target=300 (most aggressive floor) by
+   3 pp ACC. The architecture wants to *escape* the memory, not
+   embrace it. This is the opposite of what the developmental
+   hypothesis predicted.
+3. **Task-N stays at ~0.954 across all four cells.** The model
+   learns each new task fine; the damage lands entirely on
+   retention. Memory is supposed to *help* retention but is
+   *hurting* it.
+
+Per the failure-mode playbook from the prior handoff, this matches
+mode #3: the `value_proj` + `context_combiner` produces noisy
+retrieved content that the model can't usefully exploit. Forcing
+the gate open just dilutes the model's own predictions with
+garbage.
+
+## Seven architecturally distinct attempts vs DER
+
+The full picture of architectural variants tried on
+Permuted-MNIST T=15 with the small-MLP setup:
+
+| line | best Task-0 | vs cs_gated_cosine_functional (0.908) |
+|---|---:|---|
+| path-A true-label retrieval | ~0.39 | far worse |
+| path-B labels-as-of-now | ~0.20 | far worse |
+| path-C per-class consolidation | ~0.39 | far worse (broke baseline) |
+| path-D per-sample reward | 0.73 | worse |
+| episodic dual-substrate (trainable encoder) | 0.39 | far worse |
+| episodic dual-substrate (frozen contrastive encoder) | 0.25 | far worse |
+| **functional regularization (LwF)** | **0.908** | **ties** — DER-equivalent |
+| memory-augmented native (this session) | 0.19 | far worse |
+
+The pattern is unambiguous: on Permuted-MNIST with a small MLP,
+DER-equivalent appears to be the ceiling. Every architectural
+innovation either ties it or fails outright. The trade-off as
+captured in this benchmark + this model class appears to be
+intrinsic to the setup, not a function of architectural choice.
+
+## Validated mechanisms (don't lose these)
+
+The codebase still contains the working DER-equivalent pipeline
+plus seven architectural baselines. All are reproducible.
+
+### The breakthrough cell — `cs_gated_cosine_functional`
+
+Audited at T=15 n=4 with six independent checks (no train/test
+contamination, +2.23pp generalization gap, healthy loss
+magnitudes, flat per-task retention curve, exact memory math,
+tight 4-seed replication). Code in
+`src/continual_synapse/functional/` + `experiments/30_*.py`.
+Reproduce with:
 
 ```bash
 source .venv/bin/activate
-python experiments/31_memory_augmented_eval.py --T 15 --n_seeds 3
+python experiments/30_functional_regularization_eval.py --T 15 --n_seeds 3
 ```
 
-ETA: cs_gated_cosine_functional reloads from
-``results/checkpoints/phase_f/`` (~5s/seed). The two memory-augmented
-configs train fresh (plain MLP + attention head, no synapse machinery)
-— ~30s/seed each at T=15. Total: ~5 minutes for three configs × three
-seeds. Well within harness limits, no chunking needed.
+Checkpoints persist in `results/checkpoints/phase_f/`.
 
-## What to watch in the printed output
+### The memory-augmented infrastructure (works, just null)
 
-Per-seed lines for the memory-augmented configs:
-
-```
-trained in Xs; final memory size = N
-eval done in Ys   ACC=X.XXX  Task-0=X.XXX  Task-N=X.XXX
-memory: t0=N0, t1=N1, ..., t14=N14
-gate_mean: t0=0.XXX  tmid=0.XXX  tlast=0.XXX
-attention entropy (last non-zero): X.XXX  (uniform would be ln(N_mem))
-```
-
-The two single most diagnostic lines:
-
-1. **gate_mean trajectory.** At init the gate is ``sigmoid(0)=0.5``.
-   If it stays near 0.5 or rises, the model is learning to use
-   memory. If it drops toward 0, the model has learned to ignore
-   the memory path — the architecture is structurally fine but
-   not actually contributing.
-2. **Attention entropy** of the last non-zero task. Maximum entropy
-   for ``N`` stored entries is ``ln(N)``: at T=15 with 1500 entries,
-   that's ≈ 7.31. If observed entropy is close to that (within
-   ~0.5), the model is spreading attention uniformly = not finding
-   useful structure. If it's significantly lower (say < 5.0), the
-   model is focusing on specific entries = retrieval is finding
-   useful neighbours.
-
-## Decision criteria
-
-Baseline to clear is ``cs_gated_cosine_functional``:
-ACC=0.904, Task-0=0.908.
-
-- **Strong win**: ACC ≥ 0.92 AND Task-0 ≥ 0.92 → genuine surpass
-  of the DER-equivalent baseline by ≥ +1.6 pp on both axes. The
-  +5 pp goal from the decisions_log entry would be Task-0 ≥ 0.96
-  — that's the headline target. Strong-win opens a T=50 + n=10
-  validation in a later session.
-- **Moderate**: ACC and Task-0 within ±2 pp of baseline → the
-  architecture matches but doesn't surpass. Tuning candidates
-  (``gate_init``, ``key_dim``, ``samples_per_task``) before any
-  follow-up.
-- **Null**: ACC or Task-0 significantly below baseline (≥ 5 pp
-  worse) → integration issues; debug per the diagnostic playbook
-  below or pivot back.
-
-The architectural control (``memory_augmented_no_memory``) is
-essential: it uses the same model but never writes to memory. If
-it matches or beats ``memory_augmented_native``, the architecture's
-gains aren't coming from memory — they're coming from parameter
-count or shape, which would invalidate the result.
-
-## Post-pilot diagnostic playbook
-
-If the result is moderate or null, the printed diagnostics tell
-you what to try next:
-
-1. **gate_mean stuck near 0 across all tasks** → model isn't
-   learning to use memory. Try ``--gate-init 2.0`` (biases the
-   initial sigmoid output toward open ≈ 0.88). Also worth trying
-   a higher learning rate just for the gate.
-2. **attention entropy near ``ln(N_mem)`` throughout** → model
-   can't distinguish useful entries. Increase ``--key-dim`` to
-   128 or 256 — wider keys give the query more capacity to be
-   selective.
-3. **ACC degrades over tasks (per-seed eval drops across the
-   run)** → memory is hurting more than helping. Likely cause:
-   ``value_proj`` is producing noisy values that the combiner
-   can't denoise. Try increasing ``--value-dim`` or adding a
-   nonlinearity in ``value_proj``.
-4. **memory_augmented_no_memory ≈ memory_augmented_native** →
-   the memory mechanism is contributing nothing; the architecture
-   alone happens to be a reasonable continual-learning regulariser
-   (probably via the gate adding parameters in an attention-like
-   way). Memory isn't the explanation; investigate the architectural
-   inductive bias separately.
-
-The smoke at T=2 already showed a soft version of failure mode #1
-(gate trained DOWN to 0.03 with default ``gate_init=0``). At T=2
-the forgetting pressure is too weak to give the model a reason to
-use memory. The T=15 pilot is where the architectural bet actually
-gets tested — there's enough forgetting that retrieval should
-provide gradient signal toward opening the gate.
-
-## Reference numbers for the comparison
-
-| metric | cs_gated_cosine_developmental (Phase B, T=15) | cs_gated_cosine_functional (DER-equivalent, T=15 n=4) |
-|---|---:|---:|
-| ACC | 0.814 | **0.904** |
-| Task-0 | 0.798 | **0.908** |
-| Task-N | 0.906 | 0.911 |
-| FGT proxy | +0.108 | **+0.003** |
-
-``cs_gated_cosine_functional`` is the bar to clear. If
-``memory_augmented_native`` lands at e.g. ACC=0.92, Task-0=0.93,
-that's the headline result — a method that surpasses DER-equivalent
-on Permuted-MNIST without using a distillation loss.
-
-## What's explicitly excluded from `memory_augmented_native`
-
-- No synapse layer, no cosine gating, no Hebbian state, no EWC.
-- No functional regularisation / distillation loss.
-- No retrieval blend at inference (memory is consulted during
-  training too — that's the whole point).
-
-The architectural control config (`memory_augmented_no_memory`)
-uses the same model but writes zero entries; the reference
-(`cs_gated_cosine_functional`) is the existing pipeline loaded
-from disk.
-
-## Files of interest (new this session)
-
-- ``src/continual_synapse/memory_augmented/memory_augmented_model.py``
-  — ``ExternalMemory`` + ``MemoryAugmentedMLP``.
-- ``experiments/31_memory_augmented_eval.py`` — the driver with
-  three configs.
-- ``tests/test_memory_augmented.py`` — 8 unit tests.
+The MemoryAugmentedMLP architecture is correctly implemented and
+all 10 unit tests pass. The developmental maturity floor mechanism
+works as designed (verified by tests + smoke). The null is a
+*scientific* finding, not a *code* failure. Code in
+`src/continual_synapse/memory_augmented/` + `experiments/31_*.py`.
 
 ## Suite status
 
-**459 tests passing** at end of session.
+**461 tests passing** at end of session. Test breakdown across the
+project (rough categories):
 
-| pre-session (functional reg) | + Phase 1 memory-augmented | total |
-|---:|---:|---:|
-| 451 | +8 | 459 |
+- Core synapse / cold storage / consolidation: ~200
+- Path A/B/C/D functional regularization: ~50
+- Episodic dual-substrate + contrastive encoder: ~30
+- Memory-augmented native (this session, including +2 maturity
+  floor tests): 10
+- Everything else (baselines, retrieval, reward, infra): balance
 
-(Phase 2's exp 31 is exercised by the T=2 smoke, not by pytest —
-matches the pattern of every prior exp script in this repo.) No
-new dependencies introduced.
+No new dependencies introduced this session.
 
-## If the pilot is moderate or null
+## What the next session has to decide
 
-The diagnostic playbook above gives concrete sweep candidates
-(``gate_init``, ``key_dim``, ``value_dim``). If none of those
-recover a strong result at T=15, the honest read is that on this
-benchmark — Permuted-MNIST with a small MLP — native-attention
-memory doesn't structurally beat DER-equivalent distillation. The
-methodological contribution from the functional-reg pilot remains
-defensible (a clean re-derivation of DER plus the six-step audit),
-and the publishable story shifts to a thorough characterisation of
-what does and doesn't work across an unusually large set of
-continual-learning architectures.
+Three honest paths forward. The current state is publishable as-is
+(option 3); the other two extend the search before writing up.
 
-If the pilot is a strong win, the next-session work is:
+### Option 1: Change the benchmark (medium cost, clean test)
 
-1. T=50 n=5 validation to confirm scale.
-2. Sweep ``key_dim`` × ``value_dim`` × ``gate_init`` ×
-   ``samples_per_task`` at T=15 n=5 to characterise the
-   architectural Pareto frontier.
-3. Compose with cosine gating
-   (``memory_augmented_native + gated_cosine``) as a follow-on
-   experiment — same composition test that worked for
-   ``cs_gated_cosine_functional`` over ``cs_functional_only``.
+Permuted-MNIST is brutally hostile to memory mechanisms — pixel
+permutation destroys all spatial structure, leaving only
+pixel-statistics for any encoder to grab onto. The contrastive-
+encoder pretraining pilot (commit `646c845` / exp 29) collapsed
+for exactly this reason — there's no spatial information to base
+class-discriminative features on.
 
-## Open todos (deferred, not blocking)
+A spatially-structured benchmark (Split-CIFAR-10 / Split-CIFAR-100
+/ Split-MiniImageNet) would let memory-augmented architectures
+actually find useful neighbours. The headline question becomes:
+does DER-equivalent generalise as a ceiling across benchmarks, or
+is it specific to Permuted-MNIST?
 
-- T=50 n=3 pilot for functional reg (was started, hit harness
-  timeout — see prior handoff notes; can be resumed in chunks).
-- Decay-subsystem honesty note in README (still deferred).
+Cost: ~1 day of code (new dataset loader in
+`src/continual_synapse/evaluation/benchmarks.py` mirroring the
+`PermutedMNIST` / `SplitMNIST` pattern; new exp 32 or sweep flags
+in exp 30/31). Need to re-establish baseline numbers for the new
+benchmark before any architectural conclusion.
+
+Risk: changes the comparison story; existing baselines need
+re-running. Best executed with a clear research question
+(e.g. "does memory-augmented match DER on CIFAR-100?") rather
+than open exploration.
+
+### Option 2: Scale the architecture (high cost, harder to interpret)
+
+A transformer-based encoder with cross-attention to memory
+(Memorizing Transformers-style) has dramatically more parameters
+and an inductive bias that fits attention-over-tokens naturally.
+
+Cost: ~1-2 days of code + significantly longer training runs. The
+small-MLP runs in this project take seconds-to-minutes per seed;
+a transformer would be hours per seed.
+
+Risk: might just push the DER-equivalent ceiling slightly higher
+without changing the *gap* between methods. If transformer-DER hits
+0.95 and transformer-memory-augmented hits 0.95, the architectural
+finding hasn't changed.
+
+Probably not the right next step — committing more compute without
+a strong prior that the architectural class is what's limiting.
+
+### Option 3: Stop and write up (lowest cost, most defensible)
+
+The story is already publishable:
+
+- A clean, audited DER-equivalent result
+  (`cs_gated_cosine_functional`, T=15 n=4, ACC=0.904,
+  Task-0=0.908, six-step audit passed).
+- A systematic refutation of seven architectural innovations that
+  failed to surpass DER.
+- The Pareto-frontier framing from the Phase B verdict as a
+  structural finding (the two informative hyperparameters of
+  cosine gating trade Task-0 against aggregate ACC).
+- A consolidated methodological lesson: "interventions during
+  training preserve knowledge (cosine gating, EWC, functional
+  reg); post-hoc retrieval-based corrections do not (every
+  variant we tried)".
+
+This is publishable negative-results / characterization work. The
+field's publication bias toward novelty wins makes rigorous
+"these N architectural variants don't beat DER" papers rare and
+valuable.
+
+### My recommendation (logged from this session)
+
+Option 3 is the most defensible scientifically. Seven independent
+attempts is enough evidence that this benchmark + model class
+hits a real ceiling. Continuing to architect new mechanisms
+hoping the next one will break through has reached diminishing
+returns — every recent attempt has fallen into the same null
+bucket, and the post-hoc explanations are getting strained.
+
+Option 1 is the cleanest extension if you want to try one more
+thing — Permuted-MNIST is genuinely hostile to memory mechanisms,
+and testing on a spatially-structured benchmark would either
+validate that the ceiling is benchmark-specific (genuine new
+finding) or confirm it generalises (strengthens option 3's
+story).
+
+Option 2 should probably wait until after one of options 1 or 3.
+
+The user has final say. The project is in a good place either
+way.
+
+## Files of interest (final state)
+
+Existing tests + code that future sessions should not break:
+
+- `src/continual_synapse/functional/functional_memory.py` — the
+  DER-equivalent ceiling cell. Don't touch.
+- `src/continual_synapse/memory_augmented/memory_augmented_model.py`
+  — the architecture that hit null. Working; just doesn't help on
+  Permuted-MNIST.
+- `experiments/30_functional_regularization_eval.py` — reproduces
+  the breakthrough cell.
+- `experiments/31_memory_augmented_eval.py` — reproduces the
+  memory-augmented null with maturity sweep capability.
+- `decisions_log.md` — full chronological narrative. The most
+  recent entries cover the memory-augmented pivot rationale and
+  the (forthcoming, if you do it) memory-augmented null verdict.
+
+## Open todos (deferred)
+
+- **Write the memory-augmented null verdict into decisions_log.**
+  The pivot entry exists (commit `dda0881`); the verdict entry
+  doesn't yet. Should be a single entry under today's date
+  covering: (1) the three sweep numbers above, (2) the
+  parasitic-memory diagnosis, (3) the seven-attempts pattern,
+  (4) the decision point.
+- **n=10 validation on the Phase B configs at T=50** (unchanged
+  from prior handoffs — deferred indefinitely).
+- **T=50 n=3 functional regularization pilot** (started in a
+  prior session, hit harness timeout, can be resumed in chunks
+  per the prior handoff instructions). Would extend the
+  DER-equivalent result to a longer benchmark.
+- **README honesty note** about the decay subsystem (still
+  deferred).
