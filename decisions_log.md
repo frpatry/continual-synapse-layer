@@ -6,6 +6,120 @@ reverse chronological order (newest first).
 
 ---
 
+## [2026-05-26] Pivot to memory-augmented native architecture
+
+The functional-regularization pilot (commit `fb7b3ee` + the manual
+T=15 n=4 audit run) reproduced a clean DER-equivalent result:
+**ACC=0.904, Task-0=0.908, FGT=0.003** on
+``cs_gated_cosine_functional``. All six audit checks
+(no train/test contamination, +2.23 pp generalization gap,
+loss magnitudes healthy, flat per-task retention curve, exact memory
+math, n=4 replication tight) confirmed the result is real and
+robust. But "DER-equivalent" is the ceiling — Learning Without
+Forgetting plus cosine gating is essentially a re-derivation of
+Dark Experience Replay, and the cs_gated_cosine_functional cell
+ties rather than surpasses what the literature already has.
+
+### Pattern across every architecture we've tried
+
+- **Post-hoc memory ensemble** (path A: true labels at consolidation;
+  path B: labels-as-of-now; path C: per-class prototypes;
+  dual-substrate episodic with re-encoding and the frozen
+  contrastive encoder). All failed: best Task-0 ≈ 0.39 vs baseline
+  0.798. Bolted-on memory at inference cannot recover what training
+  destroyed.
+- **Training-time gradient modulation** (cosine gating alone).
+  Holds Task-0 at ~0.80 by selectively freezing weights. Good but
+  not exceptional.
+- **Functional regularization** (LwF distillation on stored
+  inputs). Equivalent to DER. ACC and Task-0 both ~0.90 at T=15,
+  but the method is well-known.
+
+The recurring failure mode is the same in all three lines:
+**models that do not learn to use memory cannot leverage it
+effectively, even when the memory contains correct information.**
+Whether memory is consulted at inference (post-hoc retrieval) or
+used as a distillation target (LwF), the model's weights are
+trained on the task alone; memory is added as a separate
+mechanism that has to compensate for what the model didn't learn.
+
+### The pivot
+
+Build a model where memory access is **architecturally native** —
+part of the forward pass during training. The model learns from
+the start to query memory, learns when to trust it, and learns
+to offload long-term retention to external storage rather than
+its parametric weights.
+
+Architecture sketch:
+
+    h = encoder(x)
+    query = query_proj(h)
+    retrieved = attention(query, memory.keys, memory.values)
+    combined = combiner([h, retrieved])
+    gate = sigmoid(memory_gate(h))
+    effective_h = (1 - gate) * h + gate * combined
+    logits = classifier(effective_h)
+
+The memory holds (key, value) pairs that the model writes at the
+end of each task (gradient-free write; stored entries are
+``register_buffer`` snapshots, not parameters). The keys, values
+are computed by the model's own ``query_proj`` and ``value_proj``
+heads, so the model writes in a representation it has *learned*
+to read. At read time, attention over the stored keys produces
+weighted retrieved values that get combined with the current
+features through a *learnable* combiner and gated by a *learnable*
+gate.
+
+Crucially, every parameter on the memory path
+(``query_proj``, ``context_combiner``, ``memory_gate``,
+``value_proj``) is trained end-to-end via the task loss. Memory
+isn't a bolt-on; it's a first-class participant in the forward
+pass from batch 0.
+
+### References
+
+- Differentiable Neural Computer (Graves et al., 2016)
+- Memory-Augmented Neural Networks (Santoro et al., 2016)
+- Memorizing Transformers (Wu et al., 2022)
+- The user's original Cold Storage vision (the project's
+  founding intuition, which we never properly implemented as
+  truly queryable storage trained jointly with the network)
+
+### Hypothesis
+
+A model trained to use memory natively can offload long-term
+retention to external storage, leaving the parametric weights
+free for current-task learning — potentially **genuinely
+dissolving** the plasticity-stability trade-off in a way that
+bolted-on memory approaches cannot. The functional-regularization
+ceiling (DER-equivalent) becomes the new floor, not the new
+target.
+
+### Goal for the T=15 n=3 pilot
+
+Surpass ``cs_gated_cosine_functional`` (the DER-equivalent
+baseline) on Permuted-MNIST T=15 by **+5 pp on Task-0 retention**
+while matching or improving aggregate ACC. The current bar is
+ACC=0.904, Task-0=0.908, so the strong-win threshold is
+ACC ≥ 0.92 AND Task-0 ≥ 0.92.
+
+### What's explicitly excluded from this architecture
+
+- No synapse layer, no cosine gating, no Hebbian state, no EWC
+  penalty. The dual-substrate / training-time-intervention machinery
+  from prior pivots is intentionally absent so the
+  memory-augmented architecture's contribution can be isolated.
+- The control config ``memory_augmented_no_memory`` uses the same
+  architecture but never writes to memory — verifies that the
+  encoder + classifier alone (with the read mechanism's
+  parameters never seeing populated memory) don't trivially
+  achieve high continual-learning performance. If they do, the
+  result isn't from memory — it's from architectural width or
+  some other artifact.
+
+---
+
 ## [2026-05-26] Pivot to functional regularization (LwF-style)
 
 After exhaustive testing of the dual-substrate hypothesis — path-A
