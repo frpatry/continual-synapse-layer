@@ -217,3 +217,74 @@ def test_write_batch_to_memory_uses_no_grad() -> None:
         assert p.grad is None, (
             f"write_batch_to_memory leaked a gradient into {name}"
         )
+
+
+# ---- 9. developmental maturity floor ----
+
+
+def test_maturity_floor_increases_with_memory() -> None:
+    """The sigmoid floor returns ~0 when memory is empty, exactly
+    0.5 at the target, and ~1 at 2× the target. This is the
+    structural intervention that breaks the "learned to ignore
+    empty memory" attractor — the model cannot learn an effective
+    gate below this floor."""
+    import math
+    model = MemoryAugmentedMLP(
+        input_dim=4, hidden_dim=8, n_classes=3,
+        key_dim=4, value_dim=4, n_encoder_layers=1,
+        maturity_target=100,
+    )
+    # Empty memory → near-zero floor.
+    assert model._memory_maturity_floor() < 0.01
+
+    # Half-target → still well below 0.5 (sigmoid centred at the
+    # target, not at half).
+    model.write_batch_to_memory(torch.randn(50, 4), task_id=0)
+    half = model._memory_maturity_floor()
+    assert 0.05 < half < 0.15, (
+        f"floor at half-target should be ~0.08, got {half:.4f}"
+    )
+
+    # At target → exactly 0.5 (sigmoid(0)).
+    model.write_batch_to_memory(torch.randn(50, 4), task_id=1)
+    assert len(model.memory) == 100
+    at_target = model._memory_maturity_floor()
+    assert math.isclose(at_target, 0.5, abs_tol=1e-3), (
+        f"floor at target should be 0.5, got {at_target:.4f}"
+    )
+
+    # 2× target → near 1.
+    model.write_batch_to_memory(torch.randn(100, 4), task_id=2)
+    assert len(model.memory) == 200
+    full = model._memory_maturity_floor()
+    assert full > 0.99, f"floor at 2× target should be ~0.99, got {full:.4f}"
+
+
+def test_forward_diagnostics_expose_learned_and_floor() -> None:
+    """The diagnostics dict returned from forward(return_diagnostics=True)
+    exposes both the learned_gate_mean (what the model wants) and
+    the maturity_floor (what the architecture imposes), so the
+    operator can tell whether the model is genuinely using memory
+    or just resigned to it."""
+    model = MemoryAugmentedMLP(
+        input_dim=4, hidden_dim=8, n_classes=3,
+        key_dim=4, value_dim=4, n_encoder_layers=1,
+        maturity_target=10,  # small so we can hit the floor easily
+    )
+    model.eval()
+    # Populate memory at 2× target so the floor is near 1.
+    model.write_batch_to_memory(torch.randn(20, 4), task_id=0)
+    _, diag = model(torch.randn(3, 4), return_diagnostics=True)
+    assert set(diag.keys()) == {
+        "learned_gate_mean", "maturity_floor",
+        "effective_gate_mean", "attention_entropy",
+    }
+    # At 2× target the floor is high, so effective_gate is dominated
+    # by the floor regardless of what the learned gate wants.
+    assert diag["maturity_floor"] > 0.99
+    assert diag["effective_gate_mean"] >= diag["maturity_floor"] - 1e-6
+    # And the floor genuinely raised the effective gate above what
+    # the model would have produced on its own: the learned gate at
+    # init is sigmoid(memory_gate(h)) which can be anywhere; the
+    # effective is at least the floor.
+    assert diag["effective_gate_mean"] >= diag["learned_gate_mean"] - 1e-6

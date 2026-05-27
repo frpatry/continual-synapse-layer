@@ -136,6 +136,21 @@ def parse_args() -> argparse.Namespace:
              "biases initial gate open (model uses memory more "
              "from the start).",
     )
+    p.add_argument(
+        "--maturity-target", type=int, default=750,
+        help=(
+            "Memory size at which the developmental maturity floor "
+            "crosses 0.5. The floor is a sigmoid of "
+            "5 * (len(memory) / target - 1), so the gate is "
+            "structurally forced toward 'use memory' as memory "
+            "fills. Default 750 is calibrated for T=15 × "
+            "samples_per_task=100 = 1500 entries: crossover lands "
+            "at half-full, so tasks 1–7 are largely free of floor "
+            "pressure and tasks 8–14 see the floor dominate. "
+            "Try 300 (early crossover, aggressive memory pressure) "
+            "or 1200 (late crossover) for sensitivity."
+        ),
+    )
     # ---- Reference-config (cs_gated_cosine_functional) hyperparameters ----
     p.add_argument("--lambda-reg", type=float, default=1.0)
     p.add_argument("--temperature", type=float, default=2.0)
@@ -211,6 +226,7 @@ def _build_memory_augmented(
         value_dim=args.value_dim,
         n_encoder_layers=args.num_hidden_layers,
         gate_init=args.gate_init,
+        maturity_target=args.maturity_target,
     )
 
 
@@ -337,11 +353,14 @@ def _train_memaug_one_seed(
 
     diagnostics: dict[str, Any] = {
         "per_task_memory_added": [],
-        "per_task_gate_mean": [],
+        "per_task_learned_gate_mean": [],
+        "per_task_effective_gate_mean": [],
+        "per_task_maturity_floor": [],
         "per_task_attention_entropy": [],
         "per_task_avg_task_loss": [],
         "final_memory_size": 0,
         "wall_time_s": 0.0,
+        "maturity_target": int(args.maturity_target),
     }
 
     set_seed(seed)
@@ -351,7 +370,9 @@ def _train_memaug_one_seed(
             task.train, batch_size=args.batch_size, shuffle=True,
         )
         task_losses: list[float] = []
-        gate_means: list[float] = []
+        learned_gates: list[float] = []
+        effective_gates: list[float] = []
+        floors: list[float] = []
         attn_entropies: list[float] = []
 
         for _ in range(args.epochs_per_task):
@@ -364,14 +385,22 @@ def _train_memaug_one_seed(
                 loss.backward()
                 optimizer.step()
                 task_losses.append(float(loss.item()))
-                gate_means.append(diag["gate_mean"])
+                learned_gates.append(diag["learned_gate_mean"])
+                effective_gates.append(diag["effective_gate_mean"])
+                floors.append(diag["maturity_floor"])
                 attn_entropies.append(diag["attention_entropy"])
 
         diagnostics["per_task_avg_task_loss"].append(
             statistics.fmean(task_losses) if task_losses else 0.0
         )
-        diagnostics["per_task_gate_mean"].append(
-            statistics.fmean(gate_means) if gate_means else 0.0
+        diagnostics["per_task_learned_gate_mean"].append(
+            statistics.fmean(learned_gates) if learned_gates else 0.0
+        )
+        diagnostics["per_task_effective_gate_mean"].append(
+            statistics.fmean(effective_gates) if effective_gates else 0.0
+        )
+        diagnostics["per_task_maturity_floor"].append(
+            statistics.fmean(floors) if floors else 0.0
         )
         diagnostics["per_task_attention_entropy"].append(
             statistics.fmean(attn_entropies) if attn_entropies else 0.0
@@ -749,22 +778,47 @@ def main() -> None:
                 f"ACC={avg:.3f}  Task-0={t0_v:.3f}  Task-N={tN_v:.3f}",
                 flush=True,
             )
-            # Memaug-specific diagnostic print: gate + attention entropy
+            # Memaug-specific diagnostic print: gate + floor + attention
             if cfg.use_memory_augmented:
-                gate_trace = diagnostics.get("per_task_gate_mean", [])
+                learned_trace = diagnostics.get("per_task_learned_gate_mean", [])
+                effective_trace = diagnostics.get(
+                    "per_task_effective_gate_mean", []
+                )
+                floor_trace = diagnostics.get("per_task_maturity_floor", [])
                 ent_trace = diagnostics.get("per_task_attention_entropy", [])
                 per_task = diagnostics.get("per_task_memory_added", [])
+                mat_target = diagnostics.get("maturity_target", 0)
                 if per_task:
                     growth_str = ", ".join(
                         f"t{e['task_index']}={e['memory_size_after']}"
                         for e in per_task
                     )
                     print(f"    memory: {growth_str}", flush=True)
-                if gate_trace:
+                # Show learned vs floor vs effective so the operator
+                # can see if the model is genuinely opening the gate
+                # above the floor, or just riding it.
+                if learned_trace:
                     print(
-                        f"    gate_mean: t0={gate_trace[0]:.3f}  "
-                        f"tmid={gate_trace[len(gate_trace)//2]:.3f}  "
-                        f"tlast={gate_trace[-1]:.3f}",
+                        f"    learned_gate (model wants):  "
+                        f"t0={learned_trace[0]:.3f}  "
+                        f"tmid={learned_trace[len(learned_trace)//2]:.3f}  "
+                        f"tlast={learned_trace[-1]:.3f}",
+                        flush=True,
+                    )
+                if floor_trace:
+                    print(
+                        f"    maturity_floor (target={mat_target}):  "
+                        f"t0={floor_trace[0]:.3f}  "
+                        f"tmid={floor_trace[len(floor_trace)//2]:.3f}  "
+                        f"tlast={floor_trace[-1]:.3f}",
+                        flush=True,
+                    )
+                if effective_trace:
+                    print(
+                        f"    effective_gate (applied):    "
+                        f"t0={effective_trace[0]:.3f}  "
+                        f"tmid={effective_trace[len(effective_trace)//2]:.3f}  "
+                        f"tlast={effective_trace[-1]:.3f}",
                         flush=True,
                     )
                 if ent_trace and any(e > 0 for e in ent_trace):

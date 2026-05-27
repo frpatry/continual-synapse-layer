@@ -189,11 +189,16 @@ class MemoryAugmentedMLP(nn.Module):
         value_dim: int = 64,
         n_encoder_layers: int = 2,
         gate_init: float = 0.0,
+        maturity_target: int = 750,
     ) -> None:
         super().__init__()
         if n_encoder_layers < 1:
             raise ValueError(
                 f"n_encoder_layers must be >= 1, got {n_encoder_layers}"
+            )
+        if maturity_target <= 0:
+            raise ValueError(
+                f"maturity_target must be positive, got {maturity_target}"
             )
         # Encoder: n_encoder_layers Linear+ReLU stack ending in a
         # plain Linear so the last layer's output isn't squashed by
@@ -229,6 +234,18 @@ class MemoryAugmentedMLP(nn.Module):
         # External memory (buffers, not parameters).
         self.memory = ExternalMemory(key_dim, value_dim)
 
+        # Developmental maturity: as memory fills, we impose a
+        # rising floor on the effective gate. The model can learn
+        # to use memory MORE than the floor (the gate is still a
+        # trainable parameter), but it cannot learn to use memory
+        # LESS than the floor. Without this, the empty-memory
+        # regime at the start of training tells the model "memory
+        # contributes nothing", and the gate trains toward 0 — a
+        # local optimum the model never escapes even when memory
+        # later contains useful content. The maturity floor is the
+        # structural intervention that breaks that attractor.
+        self.maturity_target = int(maturity_target)
+
         self._hidden_dim = int(hidden_dim)
         self._n_classes = int(n_classes)
 
@@ -254,6 +271,25 @@ class MemoryAugmentedMLP(nn.Module):
         encoder + classifier alone."""
         return self.classifier(features)
 
+    def _memory_maturity_floor(self) -> float:
+        """Return the developmental floor on the effective gate.
+
+        Sigmoid-shaped function of ``len(memory) / maturity_target``,
+        centred at the target with sharpness 5. Concretely:
+
+        - ``len(memory) = 0``        → floor ≈ 0.007  (effectively 0)
+        - ``len(memory) = target/2`` → floor ≈ 0.076
+        - ``len(memory) = target``   → floor = 0.500
+        - ``len(memory) = 2·target`` → floor ≈ 0.993  (effectively 1)
+
+        The model's learned gate can still climb above the floor
+        (memory is genuinely useful at that point) but cannot fall
+        below it (the structural intervention against the
+        learned-to-ignore-empty-memory attractor).
+        """
+        ratio = len(self.memory) / max(1, self.maturity_target)
+        return float(torch.sigmoid(torch.tensor(5.0 * (ratio - 1.0))).item())
+
     def forward(
         self,
         x: torch.Tensor,
@@ -265,12 +301,24 @@ class MemoryAugmentedMLP(nn.Module):
         Args:
             x: Input batch ``(B, input_dim)``.
             return_diagnostics: When True, additionally returns a
-                dict with ``"gate_mean"`` (mean over the batch of
-                the sigmoid gate value) and ``"attention_entropy"``
-                (mean over the batch of the attention distribution's
-                entropy, in nats). Both are zero when memory is
-                empty. The training loop uses these for the
-                per-task diagnostics tab.
+                dict with:
+
+                - ``learned_gate_mean``: mean over the batch of the
+                  *raw* sigmoid gate (what the model wants).
+                - ``maturity_floor``: scalar floor imposed by
+                  :meth:`_memory_maturity_floor` at the current
+                  memory size.
+                - ``effective_gate_mean``: mean over the batch of
+                  the gate actually applied
+                  (``max(learned, floor)``).
+                - ``attention_entropy``: mean over the batch of the
+                  attention distribution's entropy in nats.
+
+                Reading ``learned`` vs ``effective`` per task tells
+                you whether the model is genuinely opening the gate
+                beyond the floor (good — finding memory useful) or
+                whether the floor is doing all the work (the model
+                is "resigned" to memory rather than enjoying it).
 
         Returns:
             ``logits`` of shape ``(B, n_classes)``, optionally with
@@ -281,16 +329,27 @@ class MemoryAugmentedMLP(nn.Module):
         retrieved, weights = self.memory.read(query)
 
         diagnostics: dict[str, float] = {
-            "gate_mean": 0.0,
+            "learned_gate_mean": 0.0,
+            "maturity_floor": 0.0,
+            "effective_gate_mean": 0.0,
             "attention_entropy": 0.0,
         }
         if len(self.memory) > 0:
             combined_input = torch.cat([h, retrieved], dim=-1)
             combined = self.context_combiner(combined_input)
-            gate = torch.sigmoid(self.memory_gate(h))  # (B, 1)
-            effective_h = (1.0 - gate) * h + gate * combined
+            learned_gate = torch.sigmoid(self.memory_gate(h))  # (B, 1)
+            # Maturity floor: structurally-imposed lower bound on
+            # the effective gate. The model can climb above it
+            # (gradient still flows through learned_gate when
+            # learned > floor); it can't drop below it.
+            floor_value = self._memory_maturity_floor()
+            floor = torch.full_like(learned_gate, floor_value)
+            effective_gate = torch.maximum(learned_gate, floor)
+            effective_h = (1.0 - effective_gate) * h + effective_gate * combined
             if return_diagnostics:
-                diagnostics["gate_mean"] = float(gate.mean().item())
+                diagnostics["learned_gate_mean"] = float(learned_gate.mean().item())
+                diagnostics["maturity_floor"] = floor_value
+                diagnostics["effective_gate_mean"] = float(effective_gate.mean().item())
                 # Entropy of the (B, N_mem) attention rows; mean over batch.
                 entropy = -(weights * (weights.clamp_min(1e-12)).log()).sum(dim=-1)
                 diagnostics["attention_entropy"] = float(entropy.mean().item())
