@@ -982,13 +982,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-classes", type=int, default=10)
     p.add_argument("--samples-per-task", type=int, default=100)
 
-    # Consolidation knobs.
+    # Consolidation knobs. Each flag accepts both hyphen and
+    # underscore forms so sweep harnesses / shell loops can use
+    # whichever convention is more convenient.
     p.add_argument("--cons-batch-size", type=int, default=64)
-    p.add_argument("--cons-epochs", type=int, default=1)
-    p.add_argument("--lambda-distill", type=float, default=1.0)
-    p.add_argument("--lambda-anchor-low", type=float, default=1.0)
-    p.add_argument("--lambda-anchor-mid", type=float, default=0.5)
-    p.add_argument("--lambda-anchor-high", type=float, default=0.1)
+    p.add_argument(
+        "--cons-epochs", "--cons_epochs",
+        dest="cons_epochs", type=int, default=1,
+    )
+    p.add_argument(
+        "--lambda-distill", "--lambda_distill",
+        dest="lambda_distill", type=float, default=1.0,
+    )
+    p.add_argument(
+        "--lambda-anchor-low", "--lambda_anchor_low",
+        dest="lambda_anchor_low", type=float, default=1.0,
+    )
+    p.add_argument(
+        "--lambda-anchor-mid", "--lambda_anchor_mid",
+        dest="lambda_anchor_mid", type=float, default=0.5,
+    )
+    p.add_argument(
+        "--lambda-anchor-high", "--lambda_anchor_high",
+        dest="lambda_anchor_high", type=float, default=0.1,
+    )
 
     p.add_argument(
         "--device", type=str,
