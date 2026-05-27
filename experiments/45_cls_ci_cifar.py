@@ -96,6 +96,7 @@ def masked_kl_cifar(
     stored_soft: torch.Tensor,
     classes_seen_per_entry: list[list[int]],
     num_classes: int = 100,
+    use_masked: bool = True,
 ) -> torch.Tensor:
     """KL divergence over the per-entry seen-class subset.
 
@@ -103,7 +104,21 @@ def masked_kl_cifar(
     and renormalised over the class set that hipp had seen at
     storage time, then KL(teacher || student) is computed against
     the neocortex's log-softmax. Returns the batchmean.
+
+    When ``use_masked=False`` (Pivot 2 ablation), the mask is
+    skipped entirely: full KL across all ``num_classes`` positions.
+    This forces the neo to match hipp's tiny / untrained-class-
+    weight values on the unseen classes too — testing whether
+    those values are noise (the original motivation for masking)
+    or actually useful regularisation signal.
     """
+    if not use_masked:
+        log_neo = F.log_softmax(neo_logits, dim=-1)
+        # PyTorch convention: kl_div(input=log_probs_student,
+        # target=probs_teacher, reduction='batchmean') computes
+        # KL(target || input) per the docs.
+        return F.kl_div(log_neo, stored_soft, reduction="batchmean")
+
     B = neo_logits.shape[0]
     device = neo_logits.device
     mask = torch.zeros(B, num_classes, dtype=torch.bool, device=device)
@@ -141,6 +156,7 @@ def train_step_with_interleaved_replay(
     replay_batch_size: int = 32,
     num_classes: int = 100,
     grad_clip: float | None = 1.0,
+    use_masked_kl: bool = True,
 ) -> dict[str, float]:
     """Single SGD step: hipp = CE on current task; neo = CE on
     current task + interleaved masked KL on a replay batch.
@@ -179,7 +195,7 @@ def train_step_with_interleaved_replay(
             replay_neo_logits = neocortex(replay_x)
             loss_replay = masked_kl_cifar(
                 replay_neo_logits, replay_soft, replay_classes,
-                num_classes=num_classes,
+                num_classes=num_classes, use_masked=use_masked_kl,
             )
 
     total_neo_loss = loss_current + lambda_replay_inline * loss_replay
@@ -215,6 +231,7 @@ def consolidate_cifar(
     lambda_anchor_high: float = 0.1,
     num_classes: int = 100,
     grad_clip: float | None = 1.0,
+    use_masked_kl: bool = True,
     device: torch.device | None = None,
 ) -> dict[str, float]:
     """Deep consolidation phase: ``cons_epochs`` full passes over
@@ -304,7 +321,7 @@ def consolidate_cifar(
             task_loss = F.cross_entropy(neo_logits, y)
             distill = masked_kl_cifar(
                 neo_logits, stored_soft, classes_seen,
-                num_classes=num_classes,
+                num_classes=num_classes, use_masked=use_masked_kl,
             )
             (task_loss + lambda_distill * distill).backward()
             if grad_clip is not None:
@@ -518,13 +535,24 @@ def _run_one_seed(
     set_seed(seed)
     device = torch.device(args.device)
     hipp = CIFARHippocampus(num_classes=args.num_classes).to(device)
-    neo  = CIFARNeocortex(num_classes=args.num_classes).to(device)
+    # Pivot 3: optionally use CIFARHippocampus as the neocortex too,
+    # giving us "small CNN both substrates" — tests whether the
+    # dual-system mechanism does more work at MLP-scale capacity
+    # vs the ~11M-param ResNet-18.
+    if args.neocortex_arch == "small_cnn":
+        neo = CIFARHippocampus(num_classes=args.num_classes).to(device)
+    else:
+        neo = CIFARNeocortex(num_classes=args.num_classes).to(device)
+    # Pivot 1: --lr is a unified knob that overrides both per-
+    # model lrs when set. Otherwise each model keeps its own.
+    base_hipp_lr = args.lr if args.lr is not None else args.hipp_lr
+    base_neo_lr  = args.lr if args.lr is not None else args.neo_lr
     hipp_optimizer = torch.optim.SGD(
-        hipp.parameters(), lr=args.hipp_lr,
+        hipp.parameters(), lr=base_hipp_lr,
         momentum=args.momentum, weight_decay=args.weight_decay,
     )
     neo_optimizer = torch.optim.SGD(
-        neo.parameters(), lr=args.neo_lr,
+        neo.parameters(), lr=base_neo_lr,
         momentum=args.momentum, weight_decay=args.weight_decay,
     )
     memory = CIFARMultiLevelMemory(
@@ -567,6 +595,22 @@ def _run_one_seed(
         t_task = time.time()
         last_epoch_diag: dict[str, float] = {}
         for epoch in range(args.epochs_per_task):
+            # Pivot 1: per-task linear warmup. Ramps lr from
+            # base/warmup_epochs up to base over the first
+            # warmup_epochs epochs of THIS task; resets at every
+            # task transition.
+            if args.warmup_epochs > 0 and epoch < args.warmup_epochs:
+                ramp = (epoch + 1) / args.warmup_epochs
+                for pg in hipp_optimizer.param_groups:
+                    pg["lr"] = base_hipp_lr * ramp
+                for pg in neo_optimizer.param_groups:
+                    pg["lr"] = base_neo_lr * ramp
+            elif args.warmup_epochs > 0 and epoch == args.warmup_epochs:
+                # Lock to base lr once warmup completes for this task.
+                for pg in hipp_optimizer.param_groups:
+                    pg["lr"] = base_hipp_lr
+                for pg in neo_optimizer.param_groups:
+                    pg["lr"] = base_neo_lr
             per_batch_diag: dict[str, list[float]] = {
                 "hipp_loss": [], "neo_current_loss": [], "neo_replay_loss": [],
             }
@@ -581,6 +625,7 @@ def _run_one_seed(
                     grad_clip=(
                         args.grad_clip if args.grad_clip > 0 else None
                     ),
+                    use_masked_kl=(not args.no_masked_kl),
                 )
                 for k, v in step.items():
                     per_batch_diag[k].append(v)
@@ -620,6 +665,7 @@ def _run_one_seed(
             lambda_anchor_high=args.lambda_anchor_high,
             num_classes=args.num_classes,
             grad_clip=(args.grad_clip if args.grad_clip > 0 else None),
+            use_masked_kl=(not args.no_masked_kl),
             device=device,
         )
 
@@ -727,6 +773,19 @@ def parse_args() -> argparse.Namespace:
         help="Neocortex learning rate. Same NaN risk at lr=0.1; "
              "0.05 is the safe CIFAR default.",
     )
+    p.add_argument(
+        "--lr", type=float, default=None,
+        help="Unified learning rate. When set, overrides BOTH "
+             "--hipp_lr and --neo_lr. Useful for the lr+warmup "
+             "pivot where we want one knob.",
+    )
+    p.add_argument(
+        "--warmup_epochs", type=int, default=0,
+        help="Linear LR warmup over the first N epochs of EACH "
+             "task (resets at every task transition). 0 = no "
+             "warmup. With --lr=0.1 and --warmup_epochs=5, the "
+             "first 5 epochs of each task ramp from lr/5 → lr.",
+    )
     p.add_argument("--momentum", type=float, default=0.9)
     p.add_argument("--weight_decay", type=float, default=5e-4)
     p.add_argument(
@@ -744,6 +803,21 @@ def parse_args() -> argparse.Namespace:
     # Interleaved replay.
     p.add_argument("--lambda_replay_inline", type=float, default=1.0)
     p.add_argument("--replay_batch_size", type=int, default=32)
+    p.add_argument(
+        "--no_masked_kl", action="store_true",
+        help="Replace masked KL (renormalised over the per-entry "
+             "classes_seen_at_storage) with full KL over all "
+             "num_classes positions. Pivot 2 test.",
+    )
+    p.add_argument(
+        "--neocortex_arch", type=str, default="resnet18",
+        choices=("resnet18", "small_cnn"),
+        help="'resnet18' (default) is the Reduced ResNet-18 from "
+             "Phase 5.6.1. 'small_cnn' uses CIFARHippocampus for "
+             "the neocortex role too — tests whether the "
+             "dual-substrate works better at MLP-scale capacity "
+             "(Pivot 3).",
+    )
 
     # Separate consolidation (Variant C lambdas).
     p.add_argument("--cons_epochs", type=int, default=2)
@@ -837,16 +911,23 @@ def main() -> int:
         args.device = str(get_device())
 
     mode = "SMOKE" if args.smoke else "PILOT"
+    eff_hipp_lr = args.lr if args.lr is not None else args.hipp_lr
+    eff_neo_lr  = args.lr if args.lr is not None else args.neo_lr
     print(
         f"Phase 5.6.3 — CIFAR CLS-CI v2 [{mode}]\n"
         f"  T={args.num_tasks}  epochs_per_task={args.epochs_per_task}  "
         f"n_seeds={args.n_seeds}\n"
-        f"  hipp_lr={args.hipp_lr}  neo_lr={args.neo_lr}  "
-        f"momentum={args.momentum}  wd={args.weight_decay}\n"
+        f"  hipp_lr={eff_hipp_lr}  neo_lr={eff_neo_lr}  "
+        f"(unified --lr={args.lr})  "
+        f"warmup_epochs={args.warmup_epochs}  "
+        f"momentum={args.momentum}  wd={args.weight_decay}  "
+        f"grad_clip={args.grad_clip}\n"
         f"  memory: samples_per_task={args.samples_per_task}  "
-        f"max={args.max_memory}\n"
+        f"max={args.max_memory}  "
+        f"neocortex_arch={args.neocortex_arch}\n"
         f"  interleaved: λ_replay_inline={args.lambda_replay_inline}  "
-        f"replay_batch={args.replay_batch_size}\n"
+        f"replay_batch={args.replay_batch_size}  "
+        f"masked_kl={not args.no_masked_kl}\n"
         f"  consolidation: cons_epochs={args.cons_epochs}  "
         f"batch={args.cons_batch_size}\n"
         f"    λ_distill={args.lambda_distill}  "
