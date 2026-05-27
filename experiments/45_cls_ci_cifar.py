@@ -140,14 +140,28 @@ def train_step_with_interleaved_replay(
     lambda_replay_inline: float = 1.0,
     replay_batch_size: int = 32,
     num_classes: int = 100,
+    grad_clip: float | None = 1.0,
 ) -> dict[str, float]:
     """Single SGD step: hipp = CE on current task; neo = CE on
-    current task + interleaved masked KL on a replay batch."""
+    current task + interleaved masked KL on a replay batch.
+
+    ``grad_clip``: max L2 norm passed to clip_grad_norm_ before
+    each optimizer.step(). Critical at task transitions in CIFAR
+    CL — the new-class CE on a model trained to be confident
+    about other classes produces large gradients that, combined
+    with SGD momentum, will explode the weights to NaN without
+    a clip. Default 1.0 matches the ResNet-CIFAR literature.
+    Pass ``None`` to disable.
+    """
     # ----- Hippocampe step (CE on current task) -----
     hipp_optimizer.zero_grad()
     hipp_logits = hippocampus(x_batch)
     hipp_loss = F.cross_entropy(hipp_logits, y_batch)
     hipp_loss.backward()
+    if grad_clip is not None:
+        torch.nn.utils.clip_grad_norm_(
+            hippocampus.parameters(), max_norm=grad_clip,
+        )
     hipp_optimizer.step()
 
     # ----- Neocortex step (CE on current + interleaved replay) -----
@@ -170,6 +184,10 @@ def train_step_with_interleaved_replay(
 
     total_neo_loss = loss_current + lambda_replay_inline * loss_replay
     total_neo_loss.backward()
+    if grad_clip is not None:
+        torch.nn.utils.clip_grad_norm_(
+            neocortex.parameters(), max_norm=grad_clip,
+        )
     neo_optimizer.step()
 
     return {
@@ -196,6 +214,7 @@ def consolidate_cifar(
     lambda_anchor_mid: float = 0.5,
     lambda_anchor_high: float = 0.1,
     num_classes: int = 100,
+    grad_clip: float | None = 1.0,
     device: torch.device | None = None,
 ) -> dict[str, float]:
     """Deep consolidation phase: ``cons_epochs`` full passes over
@@ -256,6 +275,10 @@ def consolidate_cifar(
                 + lambda_anchor_high * anchor_high
             )
             anchor_total.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    hippocampus.parameters(), max_norm=grad_clip,
+                )
             hipp_optimizer.step()
 
             with torch.no_grad():
@@ -284,6 +307,10 @@ def consolidate_cifar(
                 num_classes=num_classes,
             )
             (task_loss + lambda_distill * distill).backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    neocortex.parameters(), max_norm=grad_clip,
+                )
             neo_optimizer.step()
 
             metrics["task_losses"].append(float(task_loss.item()))
@@ -551,6 +578,9 @@ def _run_one_seed(
                     lambda_replay_inline=args.lambda_replay_inline,
                     replay_batch_size=args.replay_batch_size,
                     num_classes=args.num_classes,
+                    grad_clip=(
+                        args.grad_clip if args.grad_clip > 0 else None
+                    ),
                 )
                 for k, v in step.items():
                     per_batch_diag[k].append(v)
@@ -589,6 +619,7 @@ def _run_one_seed(
             lambda_anchor_mid=args.lambda_anchor_mid,
             lambda_anchor_high=args.lambda_anchor_high,
             num_classes=args.num_classes,
+            grad_clip=(args.grad_clip if args.grad_clip > 0 else None),
             device=device,
         )
 
@@ -684,10 +715,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_classes", type=int, default=100)
 
     # Optimizer.
-    p.add_argument("--hipp_lr", type=float, default=0.1)
-    p.add_argument("--neo_lr", type=float, default=0.1)
+    p.add_argument(
+        "--hipp_lr", type=float, default=0.05,
+        help="Hippocampe learning rate. The pre-fix default 0.1 "
+             "blew up at task transitions on CIFAR (NaN cascade "
+             "from new-class CE × momentum). 0.05 matches the "
+             "MLP recipe from Phase 5.5.6.",
+    )
+    p.add_argument(
+        "--neo_lr", type=float, default=0.05,
+        help="Neocortex learning rate. Same NaN risk at lr=0.1; "
+             "0.05 is the safe CIFAR default.",
+    )
     p.add_argument("--momentum", type=float, default=0.9)
     p.add_argument("--weight_decay", type=float, default=5e-4)
+    p.add_argument(
+        "--grad_clip", type=float, default=1.0,
+        help="Max L2 norm for gradient clipping before every "
+             "optimizer.step(). Disable with 0 or a negative "
+             "value. 1.0 matches ResNet-CIFAR literature; "
+             "critical at task transitions in CL.",
+    )
 
     # Memory.
     p.add_argument("--samples_per_task", type=int, default=100)
