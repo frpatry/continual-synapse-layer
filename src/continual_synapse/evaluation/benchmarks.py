@@ -192,6 +192,137 @@ def _hf_split_to_tensors(
     return torch.from_numpy(images), torch.from_numpy(labels)
 
 
+# ---- SplitMNIST class-incremental variant ----
+
+
+def _build_ci_task(
+    name: str,
+    classes: SplitPair,
+    train_images: torch.Tensor,
+    train_labels: torch.Tensor,
+    test_images: torch.Tensor,
+    test_labels: torch.Tensor,
+) -> Task:
+    """Filter samples whose label is in ``classes`` and KEEP the
+    original 0-9 label values. Returns a Task whose train/test
+    datasets have ``y`` taking values in ``classes`` directly,
+    not remapped to {0, 1}.
+    """
+    return Task(
+        name=name,
+        train=_filter_keep_labels(train_images, train_labels, classes),
+        test=_filter_keep_labels(test_images, test_labels, classes),
+        classes=classes,
+    )
+
+
+def _filter_keep_labels(
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    classes: SplitPair,
+) -> TensorDataset:
+    cls_a, cls_b = classes
+    mask = (labels == cls_a) | (labels == cls_b)
+    x = images[mask].to(torch.float32)
+    if x.numel() and x.max() > 1.5:
+        x = x / 255.0
+    x = x.flatten(start_dim=1)
+    # Critical difference from _filter_and_remap: labels stay at
+    # their original 0-9 values so the model is forced to predict
+    # over the full 10-class label space without task-ID help.
+    y = labels[mask].to(torch.int64)
+    return TensorDataset(x, y)
+
+
+class SplitMNISTClassIncremental:
+    """Class-incremental variant of Split-MNIST.
+
+    Same data partition as :class:`SplitMNIST` — five sequential
+    tasks over the digit pairs (0,1), (2,3), (4,5), (6,7), (8,9) —
+    but labels are kept at their original 0-9 values, and the model
+    must predict over the **full 10-class label space** at every
+    eval point without being told the task ID. This is the
+    standard class-incremental setup and is substantially harder
+    than the task-incremental version because the model has to
+    learn to distinguish new classes from all previously-seen ones
+    without explicit guidance.
+
+    Eval semantics (caller's responsibility, not the benchmark's):
+    after training task ``k``, evaluate over the **union** of test
+    samples from tasks ``0..k`` against the full 10-class output
+    space. The model is never told which task a sample came from.
+    """
+
+    name: str = "split_mnist_class_incremental"
+    SPLITS: tuple[SplitPair, ...] = ((0, 1), (2, 3), (4, 5), (6, 7), (8, 9))
+
+    def __init__(
+        self,
+        train_images: torch.Tensor,
+        train_labels: torch.Tensor,
+        test_images: torch.Tensor,
+        test_labels: torch.Tensor,
+        splits: Sequence[SplitPair] | None = None,
+    ) -> None:
+        SplitMNIST._validate_inputs(train_images, train_labels, "train")
+        SplitMNIST._validate_inputs(test_images, test_labels, "test")
+        self._train_images = train_images
+        self._train_labels = train_labels
+        self._test_images = test_images
+        self._test_labels = test_labels
+        self._splits = tuple(splits) if splits is not None else self.SPLITS
+
+    def tasks(self) -> list[Task]:
+        return [
+            _build_ci_task(
+                name=f"{self.name}_{a}{b}",
+                classes=(a, b),
+                train_images=self._train_images,
+                train_labels=self._train_labels,
+                test_images=self._test_images,
+                test_labels=self._test_labels,
+            )
+            for (a, b) in self._splits
+        ]
+
+    @property
+    def num_classes_per_task(self) -> int:
+        # Output space is the full 10-class label set even though
+        # each task only exposes 2 of them during training. Models
+        # must predict over all 10 at every eval point.
+        return 10
+
+    @property
+    def input_shape(self) -> tuple[int, ...]:
+        return (int(torch.tensor(self._train_images.shape[1:]).prod().item()),)
+
+    def all_test_dataset(self) -> TensorDataset:
+        """Return a single TensorDataset containing every test
+        sample whose label appears in any split. Useful for the
+        full-10-class eval after all tasks have been trained."""
+        seen_classes = {c for pair in self._splits for c in pair}
+        mask = torch.zeros(self._test_labels.shape[0], dtype=torch.bool)
+        for c in seen_classes:
+            mask = mask | (self._test_labels == c)
+        x = self._test_images[mask].to(torch.float32)
+        if x.numel() and x.max() > 1.5:
+            x = x / 255.0
+        x = x.flatten(start_dim=1)
+        y = self._test_labels[mask].to(torch.int64)
+        return TensorDataset(x, y)
+
+    @classmethod
+    def from_huggingface(
+        cls, cache_dir: str | None = None,
+    ) -> "SplitMNISTClassIncremental":
+        from datasets import load_dataset  # type: ignore[import-untyped]
+
+        ds = load_dataset("ylecun/mnist", cache_dir=cache_dir)
+        train_images, train_labels = _hf_split_to_tensors(ds["train"])
+        test_images, test_labels = _hf_split_to_tensors(ds["test"])
+        return cls(train_images, train_labels, test_images, test_labels)
+
+
 # ---- PermutedMNIST: long-sequence continual benchmark ----
 
 
