@@ -216,6 +216,45 @@ class CIFARMultiLevelMemory:
 
     # ---------- read path ----------
 
+    def sample_batch_by_indices(
+        self, indices: Sequence[int], device: torch.device | str = "cpu",
+    ) -> dict:
+        """Same shape as :meth:`sample_batch` but the caller chooses
+        which entries to pull (used by the consolidation step's
+        full-pass loop). The order in ``indices`` is preserved.
+        """
+        if not self.inputs:
+            raise RuntimeError(
+                "Cannot sample by indices from an empty memory."
+            )
+        idx = [int(i) for i in indices]
+        for j in idx:
+            if not 0 <= j < len(self.inputs):
+                raise IndexError(
+                    f"index {j} out of range for memory of size "
+                    f"{len(self.inputs)}"
+                )
+        device_t = torch.device(device)
+
+        def _stack(lst: list[Tensor]) -> Tensor:
+            return torch.stack([lst[i] for i in idx]).to(device_t)
+
+        return {
+            "inputs":        _stack(self.inputs),
+            "hipp_low_gap":  _stack(self.hipp_low_gap),
+            "hipp_mid_gap":  _stack(self.hipp_mid_gap),
+            "hipp_high_gap": _stack(self.hipp_high_gap),
+            "neo_low_gap":   _stack(self.neo_low_gap),
+            "neo_mid_gap":   _stack(self.neo_mid_gap),
+            "neo_high_gap":  _stack(self.neo_high_gap),
+            "soft_targets":  _stack(self.soft_targets),
+            "labels":        torch.tensor(
+                [self.labels[i] for i in idx],
+                dtype=torch.long, device=device_t,
+            ),
+            "classes_seen":  [self.classes_seen[i] for i in idx],
+        }
+
     def sample_batch(
         self, batch_size: int, device: torch.device | str = "cpu",
     ) -> dict | None:
