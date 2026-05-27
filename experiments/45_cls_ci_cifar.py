@@ -60,6 +60,34 @@ from continual_synapse.evaluation.runner import set_seed  # noqa: E402
 from continual_synapse.memory import CIFARMultiLevelMemory  # noqa: E402
 
 
+# ---------- device + dataloader helpers ----------
+
+
+def get_device() -> torch.device:
+    """Return CUDA if available, else CPU. Used at script entry so
+    the rest of the code can be agnostic to where it's running
+    (CPU dev, Colab GPU, etc.)."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def _loader_kwargs(args: argparse.Namespace) -> dict:
+    """Centralised DataLoader kwargs honouring the CLI knobs. On
+    CUDA we default to ``pin_memory=True`` for the host-to-device
+    transfer speedup; on CPU it's a no-op so we default it off."""
+    pin = (
+        args.pin_memory
+        if args.pin_memory is not None
+        else (args.device == "cuda")
+    )
+    return {
+        "num_workers": int(args.num_workers),
+        "pin_memory":  bool(pin),
+        "persistent_workers": args.num_workers > 0,
+    }
+
+
 # ---------- masked KL ----------
 
 
@@ -324,6 +352,135 @@ def _sample_from_task_for_storage(
     return xs, ys
 
 
+# ---------- checkpointing ----------
+
+
+def _checkpoint_path(
+    args: argparse.Namespace, seed: int, task_id: int,
+) -> Path:
+    """Per-(seed, task) checkpoint location. The pilot's standard
+    layout puts these under ``results/checkpoints/cifar100_ci/``
+    so a Colab disconnect mid-pilot can resume cleanly."""
+    return Path(args.checkpoint_dir) / (
+        f"{args.config_name}_seed{seed}_task{task_id}.pt"
+    )
+
+
+def _save_task_checkpoint(
+    args: argparse.Namespace, *,
+    seed: int, task_id: int,
+    hipp: CIFARHippocampus, neo: CIFARNeocortex,
+    hipp_optimizer: torch.optim.Optimizer,
+    neo_optimizer: torch.optim.Optimizer,
+    memory: CIFARMultiLevelMemory,
+    classes_seen_so_far: list[int],
+    results_per_task: list[dict[str, Any]],
+) -> Path:
+    """Atomic save of model + optimizer + memory + run state."""
+    path = _checkpoint_path(args, seed=seed, task_id=task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "config_name": args.config_name,
+        "seed": int(seed),
+        "task_id": int(task_id),
+        "classes_seen_so_far": list(classes_seen_so_far),
+        "results_per_task": results_per_task,
+        "hipp_state_dict":           hipp.state_dict(),
+        "neo_state_dict":            neo.state_dict(),
+        "hipp_optimizer_state":      hipp_optimizer.state_dict(),
+        "neo_optimizer_state":       neo_optimizer.state_dict(),
+        "memory": {
+            "max_total":      memory.max_total,
+            "num_classes":    memory.num_classes,
+            "n_seen":         memory.n_seen,
+            "inputs":         memory.inputs,
+            "hipp_low_gap":   memory.hipp_low_gap,
+            "hipp_mid_gap":   memory.hipp_mid_gap,
+            "hipp_high_gap":  memory.hipp_high_gap,
+            "neo_low_gap":    memory.neo_low_gap,
+            "neo_mid_gap":    memory.neo_mid_gap,
+            "neo_high_gap":   memory.neo_high_gap,
+            "soft_targets":   memory.soft_targets,
+            "labels":         memory.labels,
+            "classes_seen":   memory.classes_seen,
+        },
+        # Snapshot the config (paths flattened to strings) so a
+        # reload can detect mismatched hyperparameters.
+        "config": {
+            k: (str(v) if isinstance(v, Path) else v)
+            for k, v in vars(args).items()
+        },
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp)
+    tmp.replace(path)
+    return path
+
+
+def _maybe_resume(
+    args: argparse.Namespace, *, seed: int,
+    hipp: CIFARHippocampus, neo: CIFARNeocortex,
+    hipp_optimizer: torch.optim.Optimizer,
+    neo_optimizer: torch.optim.Optimizer,
+    memory: CIFARMultiLevelMemory,
+    classes_seen_so_far: list[int],
+    results_per_task: list[dict[str, Any]],
+) -> int:
+    """Look for the highest task_id checkpoint for this seed and,
+    if found and ``--resume`` is on, restore everything. Returns
+    the loaded task_id (so the caller starts at task_id+1), or
+    -1 when there's nothing to resume from."""
+    if args.no_checkpoint or not args.resume:
+        return -1
+    latest_task = -1
+    latest_path: Path | None = None
+    for t in range(args.num_tasks - 1, -1, -1):
+        p = _checkpoint_path(args, seed=seed, task_id=t)
+        if p.exists():
+            latest_task = t
+            latest_path = p
+            break
+    if latest_path is None:
+        return -1
+
+    ckpt = torch.load(latest_path, map_location="cpu", weights_only=False)
+    # Sanity-check the config_name matches; otherwise the user
+    # may be silently mixing different run configs.
+    if ckpt.get("config_name") != args.config_name:
+        raise RuntimeError(
+            f"Checkpoint at {latest_path} was written by "
+            f"config_name={ckpt.get('config_name')!r}, but the "
+            f"current run uses config_name={args.config_name!r}. "
+            f"Use --config_name to match, or --no_checkpoint to "
+            f"start fresh."
+        )
+
+    hipp.load_state_dict(ckpt["hipp_state_dict"])
+    neo.load_state_dict(ckpt["neo_state_dict"])
+    hipp_optimizer.load_state_dict(ckpt["hipp_optimizer_state"])
+    neo_optimizer.load_state_dict(ckpt["neo_optimizer_state"])
+
+    ms = ckpt["memory"]
+    memory.n_seen = int(ms["n_seen"])
+    memory.inputs        = list(ms["inputs"])
+    memory.hipp_low_gap  = list(ms["hipp_low_gap"])
+    memory.hipp_mid_gap  = list(ms["hipp_mid_gap"])
+    memory.hipp_high_gap = list(ms["hipp_high_gap"])
+    memory.neo_low_gap   = list(ms["neo_low_gap"])
+    memory.neo_mid_gap   = list(ms["neo_mid_gap"])
+    memory.neo_high_gap  = list(ms["neo_high_gap"])
+    memory.soft_targets  = list(ms["soft_targets"])
+    memory.labels        = list(ms["labels"])
+    memory.classes_seen  = list(ms["classes_seen"])
+
+    classes_seen_so_far.clear()
+    classes_seen_so_far.extend(ckpt["classes_seen_so_far"])
+    results_per_task.clear()
+    results_per_task.extend(ckpt["results_per_task"])
+    return int(latest_task)
+
+
 # ---------- per-seed driver ----------
 
 
@@ -353,11 +510,30 @@ def _run_one_seed(
     results_per_task: list[dict[str, Any]] = []
     t_seed = time.time()
 
-    for task_id in range(args.num_tasks):
+    # Resume from latest existing checkpoint for this seed, if any.
+    resume_task = _maybe_resume(
+        args, seed=seed,
+        hipp=hipp, neo=neo,
+        hipp_optimizer=hipp_optimizer, neo_optimizer=neo_optimizer,
+        memory=memory,
+        classes_seen_so_far=classes_seen_so_far,
+        results_per_task=results_per_task,
+    )
+    start_task = resume_task + 1 if resume_task >= 0 else 0
+    if start_task > 0:
+        print(
+            f"  seed={seed}: resumed from checkpoint at task "
+            f"{resume_task}; starting at task {start_task}",
+            flush=True,
+        )
+
+    loader_kwargs = _loader_kwargs(args)
+    for task_id in range(start_task, args.num_tasks):
         task_classes = bench.task_classes(task_id)
         classes_seen_so_far.extend(int(c) for c in task_classes)
         train_loader = bench.get_task_train_loader(
             task_id, batch_size=args.batch_size, shuffle=True,
+            **loader_kwargs,
         )
 
         # ---- per-task training with interleaved replay ----
@@ -419,6 +595,7 @@ def _run_one_seed(
         # ---- eval on all classes seen so far ----
         eval_loader = bench.get_eval_loader(
             up_to_task=task_id, batch_size=args.eval_batch_size,
+            **loader_kwargs,
         )
         neo_eval  = evaluate_model(neo,  eval_loader, device, args.num_classes)
         hipp_eval = evaluate_model(hipp, eval_loader, device, args.num_classes)
@@ -448,6 +625,20 @@ def _run_one_seed(
             f"HIPP ACC={hipp_eval['acc']:.3f}",
             flush=True,
         )
+
+        # Save checkpoint at end of every task so a Colab
+        # disconnect mid-pilot doesn't lose more than one task's
+        # worth of compute.
+        if not args.no_checkpoint:
+            _save_task_checkpoint(
+                args, seed=seed, task_id=task_id,
+                hipp=hipp, neo=neo,
+                hipp_optimizer=hipp_optimizer,
+                neo_optimizer=neo_optimizer,
+                memory=memory,
+                classes_seen_so_far=classes_seen_so_far,
+                results_per_task=results_per_task,
+            )
 
     return {
         "seed": int(seed),
@@ -504,10 +695,44 @@ def parse_args() -> argparse.Namespace:
         "--device", type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
+    p.add_argument(
+        "--num_workers", type=int, default=0,
+        help="DataLoader worker count. 0 keeps the simple "
+             "in-process iterator; 2-4 helps on Colab GPU where "
+             "host I/O is a bottleneck.",
+    )
+    p.add_argument(
+        "--pin_memory", type=lambda s: s.lower() in ("1", "true", "yes"),
+        default=None,
+        help="DataLoader pin_memory. None (default) means 'true on "
+             "CUDA, false on CPU'. Pass 'true'/'false' to override.",
+    )
     p.add_argument("--verbose", action="store_true")
     p.add_argument(
         "--output-dir", type=Path,
         default=_REPO_ROOT / "results" / "logs" / "split_cifar100_ci",
+    )
+
+    # Checkpointing — end-of-task save/load so a Colab disconnect
+    # mid-pilot doesn't lose more than one task's compute.
+    p.add_argument(
+        "--config_name", type=str, default="cls_ci_v2_cifar",
+        help="Short identifier baked into checkpoint filenames so "
+             "different configs don't trample each other.",
+    )
+    p.add_argument(
+        "--checkpoint_dir", type=Path,
+        default=_REPO_ROOT / "results" / "checkpoints" / "cifar100_ci",
+    )
+    p.add_argument(
+        "--no_checkpoint", action="store_true",
+        help="Disable end-of-task checkpoint writes entirely.",
+    )
+    p.add_argument(
+        "--resume", action="store_true",
+        help="If a checkpoint for this (config_name, seed) exists "
+             "at any task >= 0, restore it and start the loop at "
+             "the next task. Otherwise start from scratch.",
     )
     return p.parse_args()
 
@@ -542,6 +767,12 @@ def main() -> int:
         if not _user_passed("n_seeds"):
             args.n_seeds = 1
         args.verbose = True
+
+    # Honour --device when explicitly passed; otherwise fall back
+    # to GPU when available. This keeps the script behaviour
+    # identical on the user's CPU dev box and on Colab L4.
+    if not _user_passed("device"):
+        args.device = str(get_device())
 
     mode = "SMOKE" if args.smoke else "PILOT"
     print(

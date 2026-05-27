@@ -250,22 +250,26 @@ class SplitCIFAR100ClassIncremental:
     def get_task_train_loader(
         self, task_id: int, batch_size: int = 64,
         shuffle: bool = True, num_workers: int = 0,
-        augment: bool = True,
+        augment: bool = True, pin_memory: bool = False,
+        persistent_workers: bool = False,
     ) -> DataLoader:
         return DataLoader(
             self.task_train_dataset(task_id, augment=augment),
             batch_size=batch_size, shuffle=shuffle,
-            num_workers=num_workers,
+            num_workers=num_workers, pin_memory=pin_memory,
+            persistent_workers=(persistent_workers and num_workers > 0),
         )
 
     def get_eval_loader(
         self, up_to_task: int, batch_size: int = 256,
-        num_workers: int = 0,
+        num_workers: int = 0, pin_memory: bool = False,
+        persistent_workers: bool = False,
     ) -> DataLoader:
         return DataLoader(
             self.eval_dataset(up_to_task),
             batch_size=batch_size, shuffle=False,
-            num_workers=num_workers,
+            num_workers=num_workers, pin_memory=pin_memory,
+            persistent_workers=(persistent_workers and num_workers > 0),
         )
 
     # ---------- loading ----------
