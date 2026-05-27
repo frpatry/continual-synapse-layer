@@ -47,6 +47,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -478,17 +479,34 @@ def _run_one_seed(
             generator=gen,
         )
 
-        cons = consolidate(
-            hipp, neo, memory,
-            hipp_optimizer, neo_optimizer,
-            batch_size=args.cons_batch_size,
-            n_epochs=args.cons_epochs,
-            lambda_distill=args.lambda_distill,
-            lambda_anchor_low=args.lambda_anchor_low,
-            lambda_anchor_mid=args.lambda_anchor_mid,
-            lambda_anchor_high=args.lambda_anchor_high,
-            device=device,
-        )
+        if args.skip_consolidation:
+            # Ablation v2_no_consolidation: leave hipp / neo
+            # untouched after storage. The interleaved replay
+            # during per-task training is the only consolidation
+            # signal.
+            cons = {
+                "task_losses": float("nan"),
+                "distill_losses": float("nan"),
+                "anchor_low_losses": float("nan"),
+                "anchor_mid_losses": float("nan"),
+                "anchor_high_losses": float("nan"),
+                "drift_low_corr": float("nan"),
+                "drift_mid_corr": float("nan"),
+                "drift_high_corr": float("nan"),
+                "skipped": True,
+            }
+        else:
+            cons = consolidate(
+                hipp, neo, memory,
+                hipp_optimizer, neo_optimizer,
+                batch_size=args.cons_batch_size,
+                n_epochs=args.cons_epochs,
+                lambda_distill=args.lambda_distill,
+                lambda_anchor_low=args.lambda_anchor_low,
+                lambda_anchor_mid=args.lambda_anchor_mid,
+                lambda_anchor_high=args.lambda_anchor_high,
+                device=device,
+            )
         cons["task_idx"] = int(task_idx)
         cons["memory_size_after"] = int(len(memory))
         consolidation_diag.append(cons)
@@ -537,6 +555,82 @@ def _run_one_seed(
         ),
         "wall_time_s": float(time.time() - t_start),
     }
+
+
+# ---------- statistical block ----------
+
+
+def _bootstrap_ci(
+    values: list[float], n_resamples: int = 10_000,
+    alpha: float = 0.05, seed: int = 0,
+) -> tuple[float, float]:
+    rng = np.random.default_rng(seed)
+    arr = np.asarray(values, dtype=float)
+    n = arr.shape[0]
+    means = arr[rng.integers(0, n, size=(n_resamples, n))].mean(axis=1)
+    return (
+        float(np.quantile(means, alpha / 2.0)),
+        float(np.quantile(means, 1.0 - alpha / 2.0)),
+    )
+
+
+def _print_stats_block(
+    values: list[float],
+    der_seeds: list[float] | None,
+    label: str,
+) -> dict[str, Any]:
+    """Bootstrap CI + Wilcoxon vs DER reference. Mirrors the
+    exp 35 statistical_confirmation block, scoped down to the
+    single-metric (NEO ACC) shape needed here."""
+    mean = float(statistics.fmean(values))
+    sd   = float(statistics.stdev(values)) if len(values) > 1 else 0.0
+    lo, hi = _bootstrap_ci(values)
+    print()
+    print(f"=== Statistical confirmation ({label}, n={len(values)}) ===")
+    print(
+        f"  mean={mean:.3f}  std={sd:.3f}  "
+        f"min={min(values):.3f}  max={max(values):.3f}  "
+        f"median={statistics.median(values):.3f}"
+    )
+    print(f"  Bootstrap 95% CI (10k resamples): [{lo:.3f}, {hi:.3f}]")
+
+    out: dict[str, Any] = {
+        "n": int(len(values)),
+        "mean": mean, "std": sd,
+        "min": float(min(values)), "max": float(max(values)),
+        "median": float(statistics.median(values)),
+        "ci_lo": lo, "ci_hi": hi,
+    }
+    if der_seeds is not None:
+        der_mean = statistics.fmean(der_seeds)
+        ci_overlap = lo <= der_mean <= hi
+        gap = mean - der_mean
+        sign = "+" if gap >= 0 else ""
+        print(
+            f"  DER reference mean = {der_mean:.3f}  "
+            f"(per-seed: {[round(v,3) for v in der_seeds]})"
+        )
+        print(
+            f"  CI contains DER mean? {ci_overlap}  "
+            f"|  CLS−DER = {sign}{gap:.4f}"
+        )
+        try:
+            from scipy.stats import ranksums  # type: ignore[import-untyped]
+            r = ranksums(values, der_seeds)
+            print(
+                f"  Wilcoxon rank-sum vs DER: statistic={r.statistic:.3f}  "
+                f"p={r.pvalue:.4f}"
+            )
+            out["wilcoxon_vs_der"] = {
+                "statistic": float(r.statistic),
+                "p": float(r.pvalue),
+            }
+        except Exception:
+            pass
+        out["der_mean"]    = float(der_mean)
+        out["ci_overlap"]  = bool(ci_overlap)
+        out["gap_vs_der"]  = float(gap)
+    return out
 
 
 # ---------- main ----------
@@ -602,6 +696,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--lambda-anchor-high", "--lambda_anchor_high",
         dest="lambda_anchor_high", type=float, default=0.1,
+    )
+
+    # Ablation flag: skip the separate "deep consolidation" phase
+    # entirely. With this on, only the interleaved replay channel
+    # remains — useful for testing whether sep consolidation adds
+    # anything beyond the wake-time replay.
+    p.add_argument(
+        "--skip-consolidation", "--skip_consolidation",
+        dest="skip_consolidation", action="store_true",
+        help="If set, bypass the separate consolidation phase. "
+             "Only the interleaved replay during per-task training "
+             "remains active. Used by the v2_no_consolidation "
+             "ablation.",
     )
 
     p.add_argument(
@@ -691,9 +798,11 @@ def main() -> None:
         args.output_dir.glob("*38_split_mnist_ci_der.json"),
         key=lambda p: p.stat().st_mtime,
     )
+    der_seeds: list[float] | None = None
     if der_path:
         with der_path[-1].open() as f:
             der = json.load(f)
+        der_seeds = [s["final_acc"] for s in der["per_seed"]]
         der_acc = der["summary"]["final_acc_mean"]
         print(
             f"\n  Reference: DER baseline ACC={der_acc:.3f} "
@@ -702,6 +811,13 @@ def main() -> None:
         gap = statistics.fmean(neo_accs) - der_acc
         sign = "+" if gap >= 0 else ""
         print(f"  CLS-CI v2 − DER = {sign}{gap:.3f}")
+
+    # ----- Statistical confirmation block (n >= 5) -----
+    stats_block: dict[str, Any] | None = None
+    if len(neo_accs) >= 5:
+        stats_block = _print_stats_block(
+            neo_accs, der_seeds=der_seeds, label="CLS-CI v2 NEO ACC",
+        )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
@@ -727,6 +843,7 @@ def main() -> None:
                 "per_class_means_neo":  per_class_means_neo,
                 "per_class_means_hipp": per_class_means_hipp,
             },
+            "stats_block": stats_block,
         }, f, indent=2)
     print(f"\nWrote results JSON to {out_path}")
 
