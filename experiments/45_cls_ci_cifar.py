@@ -660,7 +660,21 @@ def parse_args() -> argparse.Namespace:
         "--smoke", action="store_true",
         help="Smoke mode: --num_tasks 2 --epochs_per_task 5 --n_seeds 1.",
     )
-    p.add_argument("--num_tasks", type=int, default=10)
+    p.add_argument(
+        "--num_tasks", type=int, default=10,
+        help="How many of the benchmark's tasks to train on. The "
+             "benchmark itself is fixed at --bench_num_tasks (10 "
+             "tasks of 10 classes each by default). Setting this "
+             "to 2 means 'train tasks 0 and 1 only', which is "
+             "what --smoke does.",
+    )
+    p.add_argument(
+        "--bench_num_tasks", type=int, default=10,
+        help="How many tasks the benchmark exposes. With 100 "
+             "CIFAR-100 classes and the default 10, each task "
+             "gets 10 classes — the Phase 5.6 spec. Changing "
+             "this changes the per-task class count.",
+    )
     p.add_argument("--epochs_per_task", type=int, default=30)
     p.add_argument("--n_seeds", type=int, default=3)
     p.add_argument("--seed_base", type=int, default=0)
@@ -794,9 +808,24 @@ def main() -> int:
         flush=True,
     )
 
+    # The benchmark is fixed at the standard 10-tasks-of-10-classes
+    # layout regardless of --num_tasks (which now controls *how
+    # many of those 10 tasks the training loop iterates*). This
+    # decouples the "training scope" knob from the per-task
+    # class count so smoke at --num_tasks 2 trains over only
+    # 20 classes (the first two tasks) instead of forcing the
+    # benchmark into a 2-tasks-of-50-classes layout that doesn't
+    # match the Phase 5.6 spec.
+    bench_num_tasks = args.bench_num_tasks
+    if args.num_tasks > bench_num_tasks:
+        raise ValueError(
+            f"--num_tasks ({args.num_tasks}) cannot exceed "
+            f"--bench_num_tasks ({bench_num_tasks}); the benchmark "
+            f"only exposes that many tasks."
+        )
     t_load = time.time()
     bench = SplitCIFAR100ClassIncremental.from_huggingface(
-        num_tasks=args.num_tasks,
+        num_tasks=bench_num_tasks,
     )
     print(f"Loaded benchmark in {time.time() - t_load:.1f}s.\n")
 
@@ -828,7 +857,14 @@ def main() -> int:
             for v in (r["neo_eval_acc"], r["hipp_eval_acc"])
         )
         mem_grew = per_seed[0]["per_task"][-1]["memory_size"] >= args.samples_per_task
-        random_chance = 1.0 / (args.num_tasks * 10)  # 10 classes per task
+        # Classes seen by the end of training = (tasks trained) ×
+        # (classes per task as exposed by the benchmark). Random
+        # chance = 1 / classes_seen. Earlier versions hard-coded
+        # 10 classes/task; this now reflects the real benchmark
+        # layout regardless of --bench_num_tasks.
+        classes_per_task = bench.classes_per_task
+        classes_seen = args.num_tasks * classes_per_task
+        random_chance = 1.0 / max(classes_seen, 1)
         above_random = per_seed[0]["final_neo_acc"] > random_chance * 2
         print()
         print("Smoke verdict:")
@@ -838,7 +874,8 @@ def main() -> int:
             f"{'PASS' if mem_grew else 'FAIL'}"
         )
         print(
-            f"  NEO ACC > 2 * chance ({random_chance*2:.3f}): "
+            f"  NEO ACC > 2 * chance (chance={random_chance:.3f} on "
+            f"{classes_seen} classes; threshold={random_chance*2:.3f}): "
             f"{'PASS' if above_random else 'FAIL'}"
         )
         print(
