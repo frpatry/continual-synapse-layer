@@ -23,7 +23,9 @@ Architecture:
 - Neocortex MLP: 784 -> 256 -> 256 -> 128 -> 10
 - SGD, lr=0.01 (5× slower than the hippocampe's 0.05),
   momentum=0.9
-- Batch size 64, 3 epochs/task
+- Batch size 64, 1 epoch/task (matches the training budget used by
+  every other CL experiment in this project, including the
+  cs_gated_cosine_functional DER-equivalent baseline at ACC=0.904)
 - Permuted-MNIST T=15, n_seeds=2
 
 Run from the repo root::
@@ -385,7 +387,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--T", type=int, default=15)
     p.add_argument("--n_seeds", type=int, default=2)
     p.add_argument("--seed-base", type=int, default=0)
-    p.add_argument("--epochs-per-task", type=int, default=3)
+    p.add_argument(
+        "--epochs-per-task", "--epochs_per_task",
+        dest="epochs_per_task", type=int, default=1,
+        help=(
+            "Training budget per task. Default 1 to match every "
+            "other CL experiment in this project; later phases "
+            "should keep this fixed so Phase 6 eval is comparable "
+            "to the audited 0.904/0.908 DER-equivalent baseline."
+        ),
+    )
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=0.01)
     p.add_argument("--momentum", type=float, default=0.9)
