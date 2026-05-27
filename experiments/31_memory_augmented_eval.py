@@ -554,6 +554,14 @@ def _save_memaug_checkpoint(
             "key_dim": model.memory.key_dim,
             "value_dim": model.memory.value_dim,
             "final_size": int(len(model.memory)),
+            # Architecture parameters that affect the forward pass
+            # at eval time (and therefore must match between train
+            # and reload). Saved explicitly so the loader can refuse
+            # silent mismatches that would otherwise produce
+            # meaningless eval numbers.
+            "maturity_target": int(model.maturity_target),
+            "hidden_dim": int(model.hidden_dim),
+            "n_classes": int(model.n_classes),
         },
         "diagnostics": diagnostics,
     }
@@ -568,12 +576,37 @@ def _load_memaug_checkpoint(
     num_classes: int, seed: int,
 ) -> tuple[MemoryAugmentedMLP, dict[str, Any]]:
     ckpt = torch.load(path, map_location=args.device, weights_only=False)
+    meta = ckpt.get("memory_meta", {})
+    # Refuse to load a checkpoint whose architecture differs from
+    # the currently-configured one — silent mismatch on
+    # ``maturity_target`` in particular produces meaningless eval
+    # numbers because the floor is applied at inference too. The
+    # failure mode that motivated this guard: pre-floor training
+    # produced a memory the model learned to ignore; reloading
+    # that checkpoint with a high maturity_target then forces the
+    # eval to rely on the unusable memory and ACC collapses.
+    saved_target = meta.get("maturity_target")
+    if saved_target is not None and int(saved_target) != int(args.maturity_target):
+        raise RuntimeError(
+            f"Memory-augmented checkpoint at {path} was trained with "
+            f"maturity_target={saved_target}, but the current run is "
+            f"configured for maturity_target={args.maturity_target}. "
+            f"The maturity floor is computed live in forward(), so "
+            f"loading this checkpoint and re-evaluating under the "
+            f"new target would silently produce incorrect numbers "
+            f"(the stored memory was written by a model that didn't "
+            f"see the new floor during training). Resolutions:\n"
+            f"  - delete the stale checkpoint and let the script "
+            f"retrain:\n"
+            f"      rm {path}\n"
+            f"  - or pass --maturity-target {saved_target} to match "
+            f"the checkpoint's original training config."
+        )
     model = _build_memory_augmented(
         args, num_classes=num_classes, seed=seed,
     ).to(args.device)
     # Need to make the buffer shapes match the saved memory size
     # before load_state_dict can replace them.
-    meta = ckpt.get("memory_meta", {})
     final_size = int(meta.get("final_size", 0))
     if final_size > 0:
         with torch.no_grad():
