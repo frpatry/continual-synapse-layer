@@ -94,6 +94,37 @@ _T5_REF: dict[str, float] = {
     "drift_high_end":  0.795,
 }
 
+# ---------- T=15 Phase 4 reference (n=4, the audited run) ----------
+#
+# Captured from the T=15 n=4 run logged at
+# results/logs/cls_phase4/1779893522_35_T15_cls_phase4.json
+# (commit 933a15e plus the n=4 re-run). Used as the prior
+# milestone for T=50 scaling comparison.
+_T15_REF: dict[str, float] = {
+    "T":               15.0,
+    "neo_acc":         0.893,
+    "neo_task0":       0.820,
+    "neo_taskN":       0.948,
+    "hipp_acc":        0.585,
+    "hipp_task0":      0.403,
+    "hipp_taskN":      0.934,
+    "drift_low_end":   0.864,
+    "drift_mid_end":   0.769,
+    "drift_high_end":  0.769,
+}
+
+# ---------- DER-equivalent T=50 reference (verdict A/B/C/D) ----------
+#
+# cs_gated_cosine_functional T=50 n=3 historical: ACC=0.870,
+# Task-0=0.764, Task-N≈0.95. The Phase 4 T=50 outcome thresholds
+# are calibrated around these numbers.
+_DER_EQUIV_T50_REF: dict[str, float] = {
+    "T":           50.0,
+    "neo_acc":     0.870,
+    "neo_task0":   0.764,
+    "neo_taskN":   0.95,
+}
+
 
 # ---------- models (copies from exp 32 / 33 — self-contained) ----------
 
@@ -543,11 +574,24 @@ def _row_summary(row: list[float]) -> dict[str, float]:
 def _print_consolidation_table(
     per_seed: list[dict[str, Any]], num_tasks: int,
 ) -> None:
-    """One row per task transition, averaged across seeds."""
+    """One row per task transition, averaged across seeds. When
+    ``num_tasks > 20`` only the first / middle / last rows are
+    printed to keep the report readable (the JSON log still has
+    everything)."""
     print()
     print("Per-consolidation diagnostics (averaged across seeds):")
     print()
-    for t in range(num_tasks):
+
+    if num_tasks > 20:
+        tasks_to_print = [0, num_tasks // 2, num_tasks - 1]
+        print(
+            f"  (showing first / middle / last of {num_tasks} "
+            f"consolidations; full sequence in the JSON log)"
+        )
+    else:
+        tasks_to_print = list(range(num_tasks))
+
+    for t in tasks_to_print:
         rows = [
             s["consolidation_diagnostics"][t] for s in per_seed
             if t < len(s["consolidation_diagnostics"])
@@ -596,17 +640,24 @@ def _print_retention_rows(
     ]
     print()
     print("Per-task retention (R[T-1, k]) for k=0..{}:".format(num_tasks - 1))
+    def _render(values: list[float]) -> str:
+        # Wrap at 10 entries per line — fine for T=15, essential
+        # for T=50.
+        lines: list[str] = []
+        for start in range(0, len(values), 10):
+            chunk = values[start : start + 10]
+            lines.append("  " + "  ".join(
+                f"t{start + i}: {v:.2f}" for i, v in enumerate(chunk)
+            ))
+        return "\n".join(lines)
+
     print()
     print("HIPPOCAMPUS:")
-    print("  " + "  ".join(
-        f"t{k}: {hipp_means[k]:.2f}" for k in range(num_tasks)
-    ))
+    print(_render(hipp_means))
     print("  (expect volatile fast-learner pattern from Phase 1)")
     print()
     print("NEOCORTEX:")
-    print("  " + "  ".join(
-        f"t{k}: {neo_means[k]:.2f}" for k in range(num_tasks)
-    ))
+    print(_render(neo_means))
     print(
         "  (expect IMPROVEMENT over naive Phase 2 baseline — "
         f"Task-0 should be > {_PHASE2_NAIVE_TASK0:.2f} + 0.05 = "
@@ -615,15 +666,24 @@ def _print_retention_rows(
     return hipp_means, neo_means
 
 
+def _pick_prior_milestone(current_T: int) -> dict[str, float] | None:
+    """Pick the most-relevant prior Phase 4 milestone to compare
+    a new run against. Anything past T=15 compares to T=15;
+    anything past T=5 compares to T=5; T=5 itself has no prior."""
+    if current_T > 15:
+        return _T15_REF
+    if current_T > 5:
+        return _T5_REF
+    return None
+
+
 def _print_scaling_comparison(
     per_seed: list[dict[str, Any]],
     hipp_means: list[float], neo_means: list[float],
     current_T: int,
-) -> dict[str, dict[str, float]]:
-    """Print a T=5-vs-current side-by-side delta table. Only
-    meaningful when ``current_T != 5``; when it IS 5 the deltas
-    are all zero and the block just renders as a sanity check.
-    """
+) -> dict[str, Any]:
+    """Print a side-by-side delta table against the most-relevant
+    prior Phase 4 milestone (T=5 or T=15). Skipped at T=5."""
     last_drift_lows = [
         s["consolidation_diagnostics"][-1]["drift_low_corr"]
         for s in per_seed if s["consolidation_diagnostics"]
@@ -648,19 +708,23 @@ def _print_scaling_comparison(
         "drift_high_end": statistics.fmean(last_drift_highs),
     }
 
+    ref = _pick_prior_milestone(current_T)
+    if ref is None:
+        return {"prior_ref": None, "current": cur}
+
     print()
-    print(f"Compare to T={int(_T5_REF['T'])} baseline:")
+    print(f"Compare to T={int(ref['T'])} baseline:")
     print(
-        f"              T={int(_T5_REF['T']):<5d} T={current_T:<5d} Δ"
+        f"              T={int(ref['T']):<5d} T={current_T:<5d} Δ"
     )
 
     def _line(label: str, key: str) -> None:
-        ref = _T5_REF[key]
+        v_ref = ref[key]
         val = cur[key]
-        delta = val - ref
+        delta = val - v_ref
         sign = "+" if delta >= 0 else ""
         print(
-            f"  {label:<13} {ref:<6.3f}  {val:<6.3f}  {sign}{delta:.3f}"
+            f"  {label:<13} {v_ref:<6.3f}  {val:<6.3f}  {sign}{delta:.3f}"
         )
 
     _line("neo ACC:",     "neo_acc")
@@ -669,7 +733,74 @@ def _print_scaling_comparison(
     _line("hipp Task-N:", "hipp_taskN")
     _line("drift_low:",   "drift_low_end")
 
-    return {"T5_ref": dict(_T5_REF), "current": cur}
+    return {"prior_ref": dict(ref), "current": cur}
+
+
+def _print_der_comparison_t50(
+    hipp_means: list[float], neo_means: list[float],
+) -> dict[str, Any]:
+    """T=50-specific block: side-by-side vs the cs_gated_cosine_functional
+    T=50 reference (ACC=0.870, Task-0=0.764)."""
+    cur_acc = statistics.fmean(neo_means)
+    cur_t0 = neo_means[0]
+    ref_acc = _DER_EQUIV_T50_REF["neo_acc"]
+    ref_t0 = _DER_EQUIV_T50_REF["neo_task0"]
+    print()
+    print("Comparison to cs_gated_cosine_functional T=50:")
+    print("                CLS (us)   DER-equiv (ref)   Δ")
+    for label, ours, ref in (
+        ("ACC:",    cur_acc, ref_acc),
+        ("Task-0:", cur_t0,  ref_t0),
+    ):
+        delta = ours - ref
+        sign = "+" if delta >= 0 else ""
+        print(
+            f"  {label:<13} {ours:<10.3f} {ref:<17.3f} {sign}{delta:.3f}"
+        )
+    return {
+        "cls_neo_acc":   float(cur_acc),
+        "cls_neo_task0": float(cur_t0),
+        "der_neo_acc":   float(ref_acc),
+        "der_neo_task0": float(ref_t0),
+        "delta_acc":     float(cur_acc - ref_acc),
+        "delta_task0":   float(cur_t0 - ref_t0),
+    }
+
+
+def _classify_outcome_abcd(
+    neo_acc: float, neo_task0: float,
+) -> tuple[str, str]:
+    """Auto-classify the T=50 outcome A/B/C/D per the spec's
+    decision criteria. Returns (letter, one-line interpretation).
+    """
+    # Outcome A: CLS dominates (both metrics at/above DER reference)
+    if neo_acc >= 0.87 and neo_task0 >= 0.77:
+        return (
+            "A",
+            "CLS dominates — scales better than DER-equivalent. "
+            "Headline flip.",
+        )
+    # Outcome B: CLS matches (both metrics inside the DER-equiv band)
+    if (0.83 <= neo_acc <= 0.87) and (0.65 <= neo_task0 <= 0.77):
+        return (
+            "B",
+            "CLS matches DER-equivalent — different mechanism, "
+            "comparable performance. Solid contribution.",
+        )
+    # Outcome D: broken at scale
+    if neo_acc < 0.75 or neo_task0 < 0.50:
+        return (
+            "D",
+            "CLS breaks at scale — mechanism doesn't carry to 50 "
+            "tasks. Major debug needed.",
+        )
+    # Outcome C: anything else in the partial-degradation zone
+    return (
+        "C",
+        "CLS scales with cost — partial degradation suggests "
+        "lambda tuning may help (try lambda_anchor_low=2.0 or "
+        "cons_epochs=2).",
+    )
 
 
 def _print_gates(
@@ -946,6 +1077,20 @@ def main() -> None:
         per_seed, hipp_means, neo_means, current_T=args.T,
     )
 
+    # T=50 stress-test specific reporting: DER-equivalent
+    # comparison + auto-classified A/B/C/D verdict.
+    der_comparison: dict[str, Any] | None = None
+    outcome: dict[str, str] | None = None
+    if args.T >= 50:
+        der_comparison = _print_der_comparison_t50(hipp_means, neo_means)
+        neo_acc = statistics.fmean(neo_means)
+        neo_task0 = neo_means[0]
+        letter, blurb = _classify_outcome_abcd(neo_acc, neo_task0)
+        print()
+        print(f"=== Verdict at T={args.T}: Outcome {letter} ===")
+        print(f"  {blurb}")
+        outcome = {"letter": letter, "blurb": blurb}
+
     # ----- persist -----
     args.output_dir.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
@@ -968,6 +1113,9 @@ def main() -> None:
         "hipp_per_task_means": hipp_means,
         "neo_per_task_means": neo_means,
         "gates": gates,
+        "scaling_comparison": scaling_comparison,
+        "der_comparison_t50": der_comparison,
+        "outcome_abcd": outcome,
     }
     with out_path.open("w") as f:
         json.dump(payload, f, indent=2)
