@@ -535,6 +535,14 @@ def _save_functional_checkpoint(
             "samples_per_task": memory.samples_per_task,
             "max_total": memory.max_total,
         },
+        # Training-budget parameter that changes the weights but not
+        # the architecture — stored explicitly so the loader can
+        # refuse silent re-eval of a stale checkpoint when a sweep
+        # bumps --epochs-per-task. Same fail-loud discipline as the
+        # exp 31 maturity_target guard (commit 89380e9).
+        "training_meta": {
+            "epochs_per_task": int(config_dict.get("epochs_per_task", 1)),
+        },
         "diagnostics": diagnostics,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -737,6 +745,36 @@ def main() -> None:
                         ckpt, map_location=args.device,
                         weights_only=False,
                     )
+                    # Refuse to load a checkpoint trained under a
+                    # different epochs_per_task budget — otherwise
+                    # the sweep silently re-evaluates the prior
+                    # invocation's checkpoint and reports identical
+                    # numbers, exactly the failure mode that wasted
+                    # the maturity-target sweep before commit
+                    # 89380e9.
+                    training_meta = payload.get("training_meta", {})
+                    saved_epochs = training_meta.get("epochs_per_task")
+                    if (
+                        saved_epochs is not None
+                        and int(saved_epochs) != int(args.epochs_per_task)
+                    ):
+                        raise RuntimeError(
+                            f"Functional checkpoint at {ckpt} was trained "
+                            f"with epochs_per_task={saved_epochs}, but the "
+                            f"current run is configured for "
+                            f"epochs_per_task={args.epochs_per_task}. "
+                            f"Loading this checkpoint would silently "
+                            f"re-evaluate the old training run and produce "
+                            f"numbers identical to the original "
+                            f"epochs_per_task={saved_epochs} configuration. "
+                            f"Resolutions:\n"
+                            f"  - delete the stale checkpoint and let the "
+                            f"script retrain at the new epoch budget:\n"
+                            f"      rm {ckpt}\n"
+                            f"  - or pass --epochs-per-task {saved_epochs} "
+                            f"to match the checkpoint's original training "
+                            f"config."
+                        )
                     if cfg.use_synapse:
                         model = _build_synapse_augmented(
                             args, num_classes=bench.num_classes_per_task,

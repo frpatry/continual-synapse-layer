@@ -562,6 +562,7 @@ def _save_memaug_checkpoint(
             "maturity_target": int(model.maturity_target),
             "hidden_dim": int(model.hidden_dim),
             "n_classes": int(model.n_classes),
+            "epochs_per_task": int(config_dict.get("epochs_per_task", 1)),
         },
         "diagnostics": diagnostics,
     }
@@ -600,6 +601,28 @@ def _load_memaug_checkpoint(
             f"retrain:\n"
             f"      rm {path}\n"
             f"  - or pass --maturity-target {saved_target} to match "
+            f"the checkpoint's original training config."
+        )
+    # Same fail-loud discipline for ``epochs_per_task``: silently
+    # loading a 1-epoch checkpoint when the current run is configured
+    # for 3/5/10 epochs would just re-evaluate the old weights and
+    # produce numbers indistinguishable from the 1-epoch run — the
+    # exact failure mode that wasted the prior maturity-target sweep
+    # before commit 89380e9.
+    saved_epochs = meta.get("epochs_per_task")
+    if saved_epochs is not None and int(saved_epochs) != int(args.epochs_per_task):
+        raise RuntimeError(
+            f"Memory-augmented checkpoint at {path} was trained with "
+            f"epochs_per_task={saved_epochs}, but the current run is "
+            f"configured for epochs_per_task={args.epochs_per_task}. "
+            f"Loading this checkpoint would silently re-evaluate the "
+            f"old training run and produce numbers identical to the "
+            f"original epochs_per_task={saved_epochs} configuration. "
+            f"Resolutions:\n"
+            f"  - delete the stale checkpoint and let the script "
+            f"retrain at the new epoch budget:\n"
+            f"      rm {path}\n"
+            f"  - or pass --epochs-per-task {saved_epochs} to match "
             f"the checkpoint's original training config."
         )
     model = _build_memory_augmented(
