@@ -1,240 +1,248 @@
-# Session handoff — 2026-05-26 (functional regularization, Phase F infrastructure ready)
+# Session handoff — 2026-05-26 (memory-augmented native architecture ready)
 
 ## Where we are
 
-The dual-substrate / retrieval-ensemble line is closed. Across path-A
-(true labels), path-B (labels-as-of-now), path-C (per-class
-prototypes), and the episodic dual-substrate line in three variants
-(trainable encoder, trainable + re-encoding, frozen contrastive
-encoder), every post-hoc memory approach failed to preserve Task-0.
-The best across the entire line is **Task-0 ≈ 0.39**, vs the
-unchanged baseline ``cs_gated_cosine_developmental`` at **0.798**.
+The functional-regularization pivot worked but capped at
+**DER-equivalent** results: ``cs_gated_cosine_functional`` at T=15
+n=4 hits ACC=0.904, Task-0=0.908, FGT=0.003 — a clean, audited,
+strong result that ties (rather than surpasses) what Dark Experience
+Replay achieves in the literature. The six-step audit confirmed
+the result is real (no contamination, +2.23pp generalization gap,
+healthy loss magnitudes, flat per-task retention curve, exact memory
+math, tight 4-seed replication) — it's just not a breakthrough on
+the existing methodological frontier.
 
-The pattern across the whole project is now unambiguous:
+The pattern across **every architecture this project has tried** is
+the same: bolting memory onto a trained model — whether at inference
+(retrieval ensembles), as a distillation target (LwF / DER), or
+through gradient modulation (cosine gating) — hits a fundamental
+ceiling. Models that don't *learn to use memory* cannot leverage it
+effectively, even when the memory contains correct information.
 
-- **Interventions during training preserve knowledge.** Cosine
-  gating (``cs_gated_cosine_developmental``) and EWC hold Task-0
-  in the 0.8 range. Both intervene in the gradient step itself —
-  gating scales ``base.parameters()`` gradients down on familiar
-  inputs; EWC adds a Fisher-weighted penalty to the loss.
-- **Post-hoc retrieval-based corrections do not.** Every variant
-  that tried to recover lost knowledge at inference time, with the
-  base model's weights free to drift during training, capped at
-  ~0.4 Task-0.
+The pivot for this session: an architecture where memory access is
+**part of the forward pass during training**. Inspired by DNC
+(Graves 2016), MANN (Santoro 2016), Memorizing Transformers
+(Wu 2022), and the project's original Cold Storage vision — which
+proposed queryable storage trained jointly with the network, an
+idea we never properly implemented.
 
-The new pivot, codified in the latest decisions_log entry: **Learning
-Without Forgetting (Li & Hoiem 2017)**, adapted to the continual
-setting. Store ``(input, soft_target)`` pairs at the end of each
-task; during subsequent task training, add a knowledge-distillation
-loss against the stored soft targets. The model's weights are free
-to move; what's anchored is its **function on selected past inputs**.
+## What ships in this session (all committed)
 
-This is structurally a training-time intervention — the regulariser's
-gradient flows through the loss into all the model's weights at the
-same step the task gradient does. But its restoring force acts on
-function rather than weights, which is the part EWC arguably gets
-wrong. The composition ``cs_gated_cosine_functional`` is the most
-interesting cell: both mechanisms intervene during training but on
-different axes (weight scaling vs function anchoring); they may be
-additive.
+- `dda0881` — Phase 0: pivot rationale + decisions_log entry
+  codifying the "bolted-on memory hits a ceiling" pattern across
+  retrieval ensembles, dual-substrate, and functional reg.
+- `f632a16` — Phase 1: ``MemoryAugmentedMLP`` + ``ExternalMemory``
+  in ``src/continual_synapse/memory_augmented/`` with 8 unit tests
+  covering empty/non-empty paths, gradient flow through every
+  access head, and the frozen-stored-entries contract.
+- `c4aef77` — Phase 2: ``experiments/31_memory_augmented_eval.py``
+  with three configs (the proposal, the architectural control,
+  and the cs_gated_cosine_functional reference) + per-task
+  diagnostics (gate trace, attention entropy). Smoke-tested at
+  T=2.
+- (this commit) — Phase 3: handoff update + run command + decision
+  tiers + the post-pilot diagnostic playbook.
 
-## What ships in this session (incremental, all committed)
+The earlier path-A/B/C/D + dual-substrate + functional infrastructure
+all stays in the codebase under its original subpackages. The new
+memory-augmented work is purely additive.
 
-Three commits land the functional-reg line:
+## Architecture sketch
 
-- `1399b4a` — Phase 0: pivot rationale + decisions_log entry
-  consolidating the "interventions during training work" /
-  "post-hoc don't" pattern across all the prior architectures.
-- `6abbcfc` — Phase 1: ``FunctionalMemory`` + ``distillation_loss``
-  utility module with the Hinton T² rebalancing. 7 unit tests.
-- `fb7b3ee` — Phase 2: ``experiments/30_functional_regularization_eval.py``
-  driver. Three configs (baseline reload, ``cs_functional_only``,
-  ``cs_gated_cosine_functional``). Custom training loop with the
-  per-batch ``task_loss + λ·reg_loss`` composition. Smoke-tested
-  at T=2 n=1.
+```
+x -> encoder -> h
+h -> query_proj -> query
+retrieved, weights = attention(query, memory.keys, memory.values)
+h, retrieved -> context_combiner -> combined
+gate = sigmoid(memory_gate(h))                  # (B, 1)
+effective_h = (1 - gate) * h + gate * combined
+logits = classifier(effective_h)
+```
 
-The earlier dual-substrate / episodic infrastructure (commits
-through `90dbd78`) all stay in the codebase — `src/continual_synapse/episodic/`
-is intact, exp 28 + exp 29 still work, the contrastive encoder
-checkpoint at ``results/pretrained/contrastive_encoder.pt`` is left
-on disk. The new functional-reg line is purely additive and lives
-under ``src/continual_synapse/functional/``.
+The four memory-access heads — ``query_proj``, ``value_proj``,
+``context_combiner``, ``memory_gate`` — are ``nn.Linear`` parameters
+trained end-to-end via the task loss from batch 0. The stored
+``(keys, values, task_ids)`` are ``register_buffer`` snapshots
+written at task end under ``torch.no_grad``; they don't appear in
+``model.parameters()`` and don't accumulate gradients.
+
+The empty-memory regime returns zero retrieved values, and the
+forward's ``if len(memory) > 0`` guard bypasses the gate/combiner
+path entirely — so before any writes have happened the model's
+output equals ``classifier(encoder(x))`` bit-exactly. ``query_proj``
+still runs in that regime (we compute it before the read), so the
+gradient path through it warms up from batch 0; the real signal
+for the access heads kicks in once memory is non-empty (first
+batch of task 1 onward).
 
 ## Running the pilot
 
 ```bash
 source .venv/bin/activate
-python experiments/30_functional_regularization_eval.py --T 15 --n_seeds 2
+python experiments/31_memory_augmented_eval.py --T 15 --n_seeds 3
 ```
 
-(The venv must be activated first — the system has no ``python`` on
-PATH outside the venv.)
-
-ETA: at T=2 n=1, ``cs_functional_only`` took 3.4s, ``cs_gated_cosine_functional``
-took 40s. Extrapolating to T=15 n=2 and adding the baseline reload:
-
-- cs_gated_cosine_developmental (reload from disk + eval): ~5s × 2 seeds
-- cs_functional_only (train + eval): ~30s × 2 seeds
-- cs_gated_cosine_functional (train + eval, synapse + LwF overhead): ~5 min × 2 seeds
-
-**Total ETA: ~12 minutes.**
+ETA: cs_gated_cosine_functional reloads from
+``results/checkpoints/phase_f/`` (~5s/seed). The two memory-augmented
+configs train fresh (plain MLP + attention head, no synapse machinery)
+— ~30s/seed each at T=15. Total: ~5 minutes for three configs × three
+seeds. Well within harness limits, no chunking needed.
 
 ## What to watch in the printed output
 
-The headline summary looks like:
+Per-seed lines for the memory-augmented configs:
 
 ```
-=== Functional regularization pilot — T=15, n=2 ===
-config                              ACC     Task-0    Task-N    FGT     memory
-cs_gated_cosine_developmental      0.815    0.798     0.906    +0.11   N/A (ref)
-cs_functional_only                 X.XXX    X.XXX     X.XXX    X.XX    1500 avg
-cs_gated_cosine_functional         X.XXX    X.XXX     X.XXX    X.XX    1500 avg
+trained in Xs; final memory size = N
+eval done in Ys   ACC=X.XXX  Task-0=X.XXX  Task-N=X.XXX
+memory: t0=N0, t1=N1, ..., t14=N14
+gate_mean: t0=0.XXX  tmid=0.XXX  tlast=0.XXX
+attention entropy (last non-zero): X.XXX  (uniform would be ln(N_mem))
 ```
 
-Per-seed diagnostics also print:
+The two single most diagnostic lines:
 
-- **per-task memory growth**: ``t0=+100(100), t1=+100(200), ..., t14=+100(1500)``.
-  Exactly 100 entries should be added at every task end — confirms
-  ``record_task_end`` fires correctly.
-- **avg reg_loss per task**: should be 0 on task 0 (empty memory)
-  and strictly positive on tasks 1..N (distillation active against
-  stored soft targets). The first non-zero value lands at task 1.
-- **per-task avg task loss**: should track the usual MNIST training
-  curve.
-
-The smoke at T=2 n=1 produced exactly this pattern (memory grew
-t0=+100, t1=+100; reg_loss=0 on task 0, ~0.006-0.008 on task 1).
+1. **gate_mean trajectory.** At init the gate is ``sigmoid(0)=0.5``.
+   If it stays near 0.5 or rises, the model is learning to use
+   memory. If it drops toward 0, the model has learned to ignore
+   the memory path — the architecture is structurally fine but
+   not actually contributing.
+2. **Attention entropy** of the last non-zero task. Maximum entropy
+   for ``N`` stored entries is ``ln(N)``: at T=15 with 1500 entries,
+   that's ≈ 7.31. If observed entropy is close to that (within
+   ~0.5), the model is spreading attention uniformly = not finding
+   useful structure. If it's significantly lower (say < 5.0), the
+   model is focusing on specific entries = retrieval is finding
+   useful neighbours.
 
 ## Decision criteria
 
-- **Strong win**: Either functional variant gives Task-0 ≥ baseline
-  (0.798) AND ACC ≥ 0.78 → functional regularisation works in
-  isolation or composition. Proceed to a T=50 + hyperparameter
-  sweep in a later session.
-- **Composition bonus**: if ``cs_gated_cosine_functional`` beats
-  **both** ``cs_gated_cosine_developmental`` and ``cs_functional_only``,
-  the two mechanisms are additive. That's a publishable composition
-  finding on its own.
-- **Moderate**: Task-0 in [0.75, 0.79] AND ACC ≥ 0.78 → roughly
-  matches baseline; tuning needed (sweep ``--lambda-reg``,
-  ``--samples-per-task``, ``--temperature``).
-- **Null**: Task-0 < 0.60 for both functional variants → functional
-  regularisation is insufficient at this scale on this benchmark.
-  Document the negative result.
+Baseline to clear is ``cs_gated_cosine_functional``:
+ACC=0.904, Task-0=0.908.
 
-## Hyperparameters to sweep if the pilot is positive
+- **Strong win**: ACC ≥ 0.92 AND Task-0 ≥ 0.92 → genuine surpass
+  of the DER-equivalent baseline by ≥ +1.6 pp on both axes. The
+  +5 pp goal from the decisions_log entry would be Task-0 ≥ 0.96
+  — that's the headline target. Strong-win opens a T=50 + n=10
+  validation in a later session.
+- **Moderate**: ACC and Task-0 within ±2 pp of baseline → the
+  architecture matches but doesn't surpass. Tuning candidates
+  (``gate_init``, ``key_dim``, ``samples_per_task``) before any
+  follow-up.
+- **Null**: ACC or Task-0 significantly below baseline (≥ 5 pp
+  worse) → integration issues; debug per the diagnostic playbook
+  below or pivot back.
 
-The three knobs most likely to matter:
+The architectural control (``memory_augmented_no_memory``) is
+essential: it uses the same model but never writes to memory. If
+it matches or beats ``memory_augmented_native``, the architecture's
+gains aren't coming from memory — they're coming from parameter
+count or shape, which would invalidate the result.
 
-- ``--lambda-reg`` ∈ {0.5, 1.0, 2.0}: balance between task loss
-  and distillation. Higher → more retention, less plasticity. The
-  default 1.0 weights them equally.
-- ``--samples-per-task`` ∈ {50, 100, 300}: how much of each task
-  to remember. Bigger memory = more rehearsal coverage but more
-  compute per training step. The default 100 → 1500 entries at
-  T=15, manageable on CPU.
-- ``--temperature`` ∈ {1.0, 2.0, 4.0}: distillation softness.
-  Higher temperature exposes more inter-class similarity structure
-  in the teacher signal. The default 2.0 matches Hinton's
-  original paper. ``T=1`` reduces to plain KL between
-  unsoftened distributions; ``T=4`` flattens substantially.
+## Post-pilot diagnostic playbook
 
-The composition config ``cs_gated_cosine_functional`` has more
-hyperparameter interaction (gating's ``α``, maturity target, all
-the scout_a095 knobs). The sensible v1 sweep keeps those at the
-scout_a095 defaults and varies only the LwF hyperparameters.
+If the result is moderate or null, the printed diagnostics tell
+you what to try next:
 
-## Two integration bugs surfaced + fixed during smoke
+1. **gate_mean stuck near 0 across all tasks** → model isn't
+   learning to use memory. Try ``--gate-init 2.0`` (biases the
+   initial sigmoid output toward open ≈ 0.88). Also worth trying
+   a higher learning rate just for the gate.
+2. **attention entropy near ``ln(N_mem)`` throughout** → model
+   can't distinguish useful entries. Increase ``--key-dim`` to
+   128 or 256 — wider keys give the query more capacity to be
+   selective.
+3. **ACC degrades over tasks (per-seed eval drops across the
+   run)** → memory is hurting more than helping. Likely cause:
+   ``value_proj`` is producing noisy values that the combiner
+   can't denoise. Try increasing ``--value-dim`` or adding a
+   nonlinearity in ``value_proj``.
+4. **memory_augmented_no_memory ≈ memory_augmented_native** →
+   the memory mechanism is contributing nothing; the architecture
+   alone happens to be a reasonable continual-learning regulariser
+   (probably via the gate adding parameters in an attention-like
+   way). Memory isn't the explanation; investigate the architectural
+   inductive bias separately.
 
-These are listed in the Phase 2 commit message but worth flagging
-here too in case anyone hits a related issue:
-
-1. **``_last_features`` cache pollution** — ``SynapseAugmentedMLP.forward``
-   updates ``_last_features`` and ``_last_logits`` on every call.
-   The composition config's memory forward (``model(x_old)``) would
-   overwrite the task batch's cached values, so the subsequent
-   ``apply_gradient_gating`` + ``apply_hebbian_update`` would
-   scale gradients on the *memory* batch's features rather than
-   the *current task*'s. Fixed by snapshotting + restoring the
-   caches around the memory forward.
-2. **Multi-pass observation buffer pollution** — every training-mode
-   forward on a ``SynapseAugmentedMLP`` pushes ``n_passes`` (=5)
-   activation observations into the synapse's buffer. The buffer's
-   batched stack+mean step requires all observations to share a
-   shape. The memory forward (and ``record_task_end``'s 100-sample
-   snapshot) would leave differently-shaped observations in the
-   buffer that crashed the next task's training forward. Fixed by
-   forcing ``model.eval()`` around both the per-batch memory
-   forward and the end-of-task snapshot — eval mode gates the
-   observation hook on ``self.training``, so the buffer stays
-   clean. Gradients still flow through the memory forward.
+The smoke at T=2 already showed a soft version of failure mode #1
+(gate trained DOWN to 0.03 with default ``gate_init=0``). At T=2
+the forgetting pressure is too weak to give the model a reason to
+use memory. The T=15 pilot is where the architectural bet actually
+gets tested — there's enough forgetting that retrieval should
+provide gradient signal toward opening the gate.
 
 ## Reference numbers for the comparison
 
-Baseline ``cs_gated_cosine_developmental`` from the path-D pilot at
-T=15 n=3: **ACC=0.8143, Task-0=0.8047, Task-N=0.9063**. Exp 30
-reloads the same checkpoints (under
-``results/checkpoints/phase_d/``) so the baseline row in the new
-JSON should reproduce these numbers within rounding.
+| metric | cs_gated_cosine_developmental (Phase B, T=15) | cs_gated_cosine_functional (DER-equivalent, T=15 n=4) |
+|---|---:|---:|
+| ACC | 0.814 | **0.904** |
+| Task-0 | 0.798 | **0.908** |
+| Task-N | 0.906 | 0.911 |
+| FGT proxy | +0.108 | **+0.003** |
 
-Across the path-A/B/C/D and dual-substrate lines, no variant ever
-broke Task-0 ≥ 0.5 on T=15. The functional regularisation pivot is
-the first principled attempt at a training-time intervention on
-function. If it falls in the strong-or-moderate band, that's a
-genuine result.
+``cs_gated_cosine_functional`` is the bar to clear. If
+``memory_augmented_native`` lands at e.g. ACC=0.92, Task-0=0.93,
+that's the headline result — a method that surpasses DER-equivalent
+on Permuted-MNIST without using a distillation loss.
 
-## What's still in flight from prior sessions
+## What's explicitly excluded from `memory_augmented_native`
 
-- T=50 n=5 validation on the existing Phase B configs (deferred).
-- Decay-subsystem honesty note in the README (deferred).
-- The contrastive encoder pretraining script (exp 29) and its
-  T=15 dual-substrate pilot (exp 28 with the frozen keying
-  encoder) are committed and runnable but conclusively negative;
-  see ``results/logs/episodic/1779821036_28_T15_dual_substrate.json``
-  for the diagnostic that closes that line.
+- No synapse layer, no cosine gating, no Hebbian state, no EWC.
+- No functional regularisation / distillation loss.
+- No retrieval blend at inference (memory is consulted during
+  training too — that's the whole point).
+
+The architectural control config (`memory_augmented_no_memory`)
+uses the same model but writes zero entries; the reference
+(`cs_gated_cosine_functional`) is the existing pipeline loaded
+from disk.
 
 ## Files of interest (new this session)
 
-- ``src/continual_synapse/functional/functional_memory.py`` — the
-  ``FunctionalMemory`` class + ``distillation_loss`` function.
-- ``src/continual_synapse/functional/__init__.py`` — package
-  exports.
-- ``experiments/30_functional_regularization_eval.py`` — the
-  pilot driver with three configs.
-- ``tests/test_functional_memory.py`` — 7 unit tests.
+- ``src/continual_synapse/memory_augmented/memory_augmented_model.py``
+  — ``ExternalMemory`` + ``MemoryAugmentedMLP``.
+- ``experiments/31_memory_augmented_eval.py`` — the driver with
+  three configs.
+- ``tests/test_memory_augmented.py`` — 8 unit tests.
 
 ## Suite status
 
-**451 tests passing** at end of session.
+**459 tests passing** at end of session.
 
-| pre-session (frozen encoder) | + Phase 1 functional memory | total |
+| pre-session (functional reg) | + Phase 1 memory-augmented | total |
 |---:|---:|---:|
-| 444 | +7 | 451 |
+| 451 | +8 | 459 |
 
-(Phase 2 added the driver script — manual run only, not exercised
-by pytest. The Phase 2 commit message documents the smoke at T=2
-that validated the training loop end-to-end.) No new dependencies
-introduced.
+(Phase 2's exp 31 is exercised by the T=2 smoke, not by pytest —
+matches the pattern of every prior exp script in this repo.) No
+new dependencies introduced.
 
-## If functional regularization works at T=15
+## If the pilot is moderate or null
 
-Next session would:
-1. Validate at T=50 n=5 with the best-performing config and
-   default hyperparameters.
-2. Sweep ``--lambda-reg`` × ``--samples-per-task`` × ``--temperature``
-   at T=15 n=5 to characterise the trade-off and identify any
-   particularly strong cell.
-3. Run exp 24 retention analysis on the T=50 JSON for the
-   retention curve + Wilcoxon Bonferroni vs the existing T=50
-   reference data.
+The diagnostic playbook above gives concrete sweep candidates
+(``gate_init``, ``key_dim``, ``value_dim``). If none of those
+recover a strong result at T=15, the honest read is that on this
+benchmark — Permuted-MNIST with a small MLP — native-attention
+memory doesn't structurally beat DER-equivalent distillation. The
+methodological contribution from the functional-reg pilot remains
+defensible (a clean re-derivation of DER plus the six-step audit),
+and the publishable story shifts to a thorough characterisation of
+what does and doesn't work across an unusually large set of
+continual-learning architectures.
 
-## If it fails
+If the pilot is a strong win, the next-session work is:
 
-If both functional variants land below Task-0 = 0.60, the honest
-read is that the plasticity-stability trade-off as captured in
-our experiments is **intrinsic** to the problem as we've defined
-it — not to any specific architectural choice we've made. The
-Pareto-frontier framing from the Phase B verdict (``decisions_log``
-2026-05-26) is the publishable story in that case: a thorough
-characterisation of why every reasonable architectural attempt
-fails to close the EWC Task-0 gap is itself a contribution.
+1. T=50 n=5 validation to confirm scale.
+2. Sweep ``key_dim`` × ``value_dim`` × ``gate_init`` ×
+   ``samples_per_task`` at T=15 n=5 to characterise the
+   architectural Pareto frontier.
+3. Compose with cosine gating
+   (``memory_augmented_native + gated_cosine``) as a follow-on
+   experiment — same composition test that worked for
+   ``cs_gated_cosine_functional`` over ``cs_functional_only``.
+
+## Open todos (deferred, not blocking)
+
+- T=50 n=3 pilot for functional reg (was started, hit harness
+  timeout — see prior handoff notes; can be resumed in chunks).
+- Decay-subsystem honesty note in README (still deferred).
