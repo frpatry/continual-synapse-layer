@@ -53,61 +53,70 @@ def test_generate_known_features_in_expected_range():
 
 
 def test_generate_unknown_features_in_expected_range():
+    """Phase 2h: unknown now allows non-zero alignment when facts
+    are in memory (real Qwen polite refusals trigger this)."""
     g = SyntheticDataGenerator(seed=2)
-    exs = [g.generate_unknown_example() for _ in range(100)]
-    # max_similarity should hug zero (most have n_facts == 0).
-    max_sims = [ex.features["max_similarity"] for ex in exs]
-    assert max(max_sims) < 0.31
-    # Alignment slots are ALL zero per the empty-facts contract.
-    for ex in exs:
+    exs = [g.generate_unknown_example() for _ in range(200)]
+    no_facts = [ex for ex in exs if ex.features["n_facts_retrieved"] == 0]
+    with_facts = [ex for ex in exs if ex.features["n_facts_retrieved"] > 0]
+    # The no-facts subset: all alignment slots fold to zero per the
+    # empty-facts contract.
+    for ex in no_facts:
         assert ex.features["alignment_max_cosine"] == 0.0
         assert ex.features["alignment_mean_cosine"] == 0.0
         assert ex.features["alignment_novel_token_ratio"] == 0.0
+        assert ex.features["max_similarity"] == 0.0
+    # The with-facts subset: irrelevant facts in memory produce
+    # mid-range similarity AND alignment, matching real-Qwen data.
+    if with_facts:
+        max_sims = [ex.features["max_similarity"] for ex in with_facts]
+        assert max(max_sims) > 0.30
+        assert max(max_sims) <= 0.71
 
 
 def test_generate_uncertain_features_in_expected_range():
+    """Phase 2h: uncertain now models real-Qwen behaviour where the
+    competing facts both retrieve at high (and very similar)
+    cosine — so similarity_variance is near zero, not high."""
     g = SyntheticDataGenerator(seed=3)
     exs = [g.generate_uncertain_example() for _ in range(200)]
     max_sims = [ex.features["max_similarity"] for ex in exs]
     sim_vars = [ex.features["similarity_variance"] for ex in exs]
-    # Beta(5,5)*0.3 + 0.4 → roughly [0.4, 0.7].
-    assert min(max_sims) >= 0.40 - 1e-6
-    assert max(max_sims) <= 0.70 + 1e-6
-    # Beta(5,2)*0.15 has mean ≈ (5/7)*0.15 ≈ 0.107. So mean of
-    # similarity_variance across 200 samples should comfortably
-    # exceed 0.05.
-    assert sum(sim_vars) / len(sim_vars) > 0.05
+    # Beta(7,4)*0.25 + 0.60 → roughly [0.60, 0.85].
+    assert min(max_sims) >= 0.60 - 1e-6
+    assert max(max_sims) <= 0.85 + 1e-6
+    # similarity_variance is small (real ≈ 0.001).
+    assert sum(sim_vars) / len(sim_vars) < 0.01
 
 
 def test_generate_hallucinated_features_diagnostic_pattern():
-    """Hallucinated signature: low memory + long response + low
-    attention + low alignment_max + HIGH novel_token_ratio (when
-    facts are present). Sample 200 then assert the *average*
-    pattern (individual draws have noise)."""
+    """Phase 2h: the hallucinated cohort is BIMODAL — half are
+    true confabulations (high novel-token ratio) and half are
+    polite refusals from Qwen's safety training (low novel-token
+    ratio). The diagnostic that still holds across both modes:
+      * long response (Poisson(70)+15 ≈ 85)
+      * low attention to facts (≪ 0.01)
+    """
     g = SyntheticDataGenerator(seed=4)
     exs = [g.generate_hallucinated_example() for _ in range(200)]
-
     avg_resp_len = sum(
         ex.features["response_length_tokens"] for ex in exs
     ) / len(exs)
     avg_att = sum(
         ex.features["attention_to_facts_mean"] for ex in exs
     ) / len(exs)
-    # Long: Poisson(30)+10 → mean ≈ 40.
-    assert avg_resp_len > 30
-    # LOW attention: Beta(2,8)*0.3 → mean ~ 0.06.
-    assert avg_att < 0.2
-
-    # For the subset WITH facts, novel-token ratio should be HIGH.
-    has_facts = [
-        ex for ex in exs if ex.features["n_facts_retrieved"] > 0
-    ]
-    if has_facts:
-        avg_novel = sum(
-            ex.features["alignment_novel_token_ratio"] for ex in has_facts
-        ) / len(has_facts)
-        # Beta(8,2)*0.3 + 0.6 → mean ≈ 0.84.
-        assert avg_novel > 0.6
+    # LONG response — mean should exceed 70.
+    assert avg_resp_len > 70
+    # LOW attention.
+    assert avg_att < 0.05
+    # Across the FULL cohort the novel-token mean is moderate
+    # (bimodal centred around ~0.30, not high or low).
+    avg_novel = sum(
+        ex.features["alignment_novel_token_ratio"] for ex in exs
+    ) / len(exs)
+    assert 0.05 <= avg_novel <= 0.55, (
+        f"bimodal cohort mean should sit in [0.05, 0.55], got {avg_novel:.3f}"
+    )
 
 
 # ---------- distinguishability ----------

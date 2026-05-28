@@ -3,21 +3,47 @@
 Generates labelled feature vectors that plausibly represent the four
 epistemic statuses (``known``, ``unknown``, ``uncertain``,
 ``hallucinated``). Rule-based, with per-class distributions calibrated
-from the *expected* shape of features rather than from a real LLM run.
+to *empirically observed* Qwen2.5-1.5B feature distributions from the
+Phase 2d.2 real-Qwen validation dump (
+``results/agi/phase_2_validation_raw.jsonl``), per the Phase 2h
+recalibration. The drift report this generator was tuned against lives
+at ``results/agi/distribution_drift_report.md``.
 
-**Limitations** — these are honest and deliberate:
+**Phase 2h recalibration (key changes from the Phase 2c v1):**
 
-- The distributions are synthetic; they encode our prior on what the
-  metacog signals should look like, not measured behaviour.
-- The ``hallucinated`` class is the most synthetic — real-world
-  hallucinations vary more than a single rule-based pattern can capture.
-- Numerical calibration (mean, variance, beta shape parameters) will
-  almost certainly need a second pass after Phase 2d trains on this and
-  we observe what the layer actually learns vs. what real Qwen produces.
+- ``alignment_novel_token_ratio`` was universally too low across all
+  classes in v1 — Qwen produces verbose, fluent responses with
+  conversational filler that synthetic underestimated. Boosted for
+  known/uncertain/unknown; in hallucinated, the v1 generator was
+  *inverted* (predicted high novelty when real cohort actually has
+  low novelty, because half of the "hallucinated" test cases trigger
+  Qwen2.5's safety-trained polite refusal rather than confabulation).
+- ``attention_to_facts_mean`` was wildly too high for known/uncertain
+  in v1 — Qwen's attention is more diffuse than the synthetic prior
+  suggested.
+- ``alignment_max_cosine`` for known was too high in v1 — real Qwen
+  responses are diluted by filler and don't match facts as tightly.
+- ``response_length_tokens`` was too short for unknown/hallucinated in
+  v1 — Qwen's polite refusals are LONG ("I'm sorry, but I cannot…
+  Could you give me more context?").
+- ``unknown`` with non-empty memory was modelled with alignment ≡ 0 in
+  v1, but real Qwen still computes a moderate cosine to the irrelevant
+  facts; bumped to mid-range.
 
-Two-stage strategy: use this synthetic data for initial training; then
-validate against real-LLM data once the metacog layer is integrated
-(Phase 2e+).
+**Limitations** that the recalibration does NOT fix:
+
+- The ``hallucinated`` cohort observed in real data is partially
+  contaminated with safety-trained refusals; the synthetic generator
+  models this contamination so the metacog routes both confabulations
+  and refusals to ``admit_ignorance``. A future phase that wants to
+  distinguish them needs a cleaner test set.
+- Query-side features (``query_length_tokens``, ``has_named_entity``,
+  ``query_specificity``) are test-set characteristics, not Qwen
+  behaviour; left as-is.
+
+Two-stage strategy: use this synthetic data for training; then validate
+against real-LLM data with the Phase 2d.2 pipeline (Phase 2h re-runs
+this).
 
 Feature naming — the dicts below are intentionally aligned with
 :mod:`agi.metacognition.features` constants
@@ -101,19 +127,20 @@ class SyntheticDataGenerator:
     # ------------------------------------------------------------------
 
     def generate_known_example(self) -> TrainingExample:
-        """``known``: memory has pertinent, recent, high-precision
-        facts and the LLM response leans on them.
+        """``known``: memory has pertinent facts and the LLM
+        response leans on them.
 
-        Diagnostic shape:
-          * many facts retrieved (2-5)
-          * high cosine similarity (max ~0.7-0.95)
-          * high precision_quality
-          * response is moderate length, low entropy
-          * alignment cosine high, novel-token ratio low
+        Phase 2h diagnostic shape (post-recalibration):
+          * 1-4 facts retrieved
+          * max_similarity ≈ 0.7-0.95 (memory key matches query)
+          * alignment_max_cosine ≈ 0.40-0.65 (filler dilutes)
+          * alignment_novel_token_ratio ≈ 0.70-0.90 (Qwen's filler)
+          * attention_to_facts_mean ≈ 0.05 (Qwen barely attends)
+          * response_length_tokens ≈ 30
         """
         memory = self._memory_known()
         query = self._query_default()
-        gen = self._generation_known()
+        gen = self._generation_known(has_facts=True)
         align = self._alignment_known()
         return self._assemble(
             memory, query, gen, align,
@@ -123,28 +150,38 @@ class SyntheticDataGenerator:
         )
 
     def generate_unknown_example(self) -> TrainingExample:
-        """``unknown``: memory empty or with low-similarity hits;
-        response is either an admission (short, possibly templated)
-        or an attempted answer with high entropy.
+        """``unknown``: memory empty or with irrelevant facts; Qwen
+        almost always issues a polite refusal.
 
-        Diagnostic shape:
-          * 0-2 facts retrieved (mostly 0)
-          * very low similarity if any
-          * alignment all-zero (per the Phase 2b empty-facts contract)
-          * response either short + admission OR long + high entropy
+        Phase 2h diagnostic shape (post-recalibration):
+          * 0-2 facts retrieved (~50/50 empty vs irrelevant)
+          * when facts present: max_similarity ≈ 0.40-0.65
+            (irrelevant facts still embed-close to query)
+          * response_length ≈ 50 (polite multi-sentence refusal)
+          * alignment_novel_token_ratio ≈ 0.5 when has_facts
+            (refusal vocab ∉ facts); 0 when no facts (per the
+            empty-facts contract)
         """
-        n_facts = int(self.rng.binomial(1, 0.3) * self.rng.integers(0, 3))
-        has_facts = n_facts > 0
+        has_facts = bool(self.rng.binomial(1, 0.5))
+        n_facts = int(self.rng.integers(1, 3)) if has_facts else 0
         memory = self._memory_unknown(n_facts, has_facts)
         query = self._query_default()
-        admitted = bool(self.rng.binomial(1, 0.7))
-        gen = self._generation_unknown(admitted)
-        align = self._alignment_zero()
+        admitted = bool(self.rng.binomial(1, 0.90))
+        gen = self._generation_unknown(admitted, has_facts)
+        align = (
+            self._alignment_unknown_with_facts()
+            if has_facts
+            else self._alignment_zero()
+        )
         return self._assemble(
             memory, query, gen, align,
             status="unknown",
             confidence=float(self.rng.beta(8, 2)),
-            metadata={"generator": "unknown", "admitted": admitted},
+            metadata={
+                "generator": "unknown",
+                "admitted": admitted,
+                "has_facts": has_facts,
+            },
         )
 
     def generate_uncertain_example(self) -> TrainingExample:
@@ -236,19 +273,30 @@ class SyntheticDataGenerator:
     # ---------- internal feature builders ----------
 
     def _memory_known(self) -> dict:
+        # Phase 2h recalibration vs v1:
+        #  - similarity_variance: ×0.1 → ×0.02 (real ~0)
+        #  - max_recency_days: exp(10) → exp(2) (real 0)
+        #  - mean_access_count: Poisson(5)+1 → Poisson(1)+1 (real 1)
+        # (max_similarity left at 0.7-0.95 — real 0.76 sits in range.)
         max_sim = float(self.rng.beta(8, 2) * 0.25 + 0.7)
-        mean_sim = max_sim * float(self.rng.uniform(0.7, 0.9))
+        mean_sim = max_sim * float(self.rng.uniform(0.85, 0.98))
         return {
-            "n_facts_retrieved": float(self.rng.integers(2, 6)),
+            "n_facts_retrieved": float(self.rng.integers(1, 5)),
             "max_similarity": max_sim,
             "mean_similarity": mean_sim,
-            "similarity_variance": float(self.rng.beta(2, 5) * 0.1),
-            "max_recency_days": float(self.rng.exponential(10)),
-            "mean_access_count": float(self.rng.poisson(5) + 1),
-            "precision_quality": float(self.rng.beta(8, 2)),
+            "similarity_variance": float(self.rng.beta(2, 5) * 0.02),
+            "max_recency_days": float(self.rng.exponential(2)),
+            "mean_access_count": float(self.rng.poisson(1) + 1),
+            "precision_quality": float(self.rng.beta(8, 2) * 0.2 + 0.8),
         }
 
     def _memory_unknown(self, n_facts: int, has_facts: bool) -> dict:
+        # Phase 2h recalibration vs v1:
+        #  - When has_facts: max/mean_similarity 0.06 → 0.40-0.65
+        #    (real 0.46 — even irrelevant facts retrieve at non-trivial
+        #    cosine because Qwen's embeddings cluster semantically).
+        #  - precision_quality: bumped to ~1.0 when has_facts
+        #    (test set always has fresh memory).
         if not has_facts:
             return {
                 "n_facts_retrieved": 0.0,
@@ -259,28 +307,38 @@ class SyntheticDataGenerator:
                 "mean_access_count": 0.0,
                 "precision_quality": 0.0,
             }
+        max_sim = float(self.rng.beta(5, 5) * 0.4 + 0.30)  # ~0.30-0.70
+        mean_sim = max_sim * float(self.rng.uniform(0.90, 1.0))
         return {
             "n_facts_retrieved": float(n_facts),
-            "max_similarity": float(self.rng.beta(2, 8) * 0.3),
-            "mean_similarity": float(self.rng.beta(2, 8) * 0.25),
-            "similarity_variance": float(self.rng.beta(3, 5) * 0.1),
-            "max_recency_days": float(self.rng.exponential(60)),
-            "mean_access_count": float(self.rng.poisson(1)),
-            "precision_quality": float(self.rng.beta(2, 5) * 0.5),
+            "max_similarity": max_sim,
+            "mean_similarity": mean_sim,
+            "similarity_variance": float(self.rng.beta(2, 8) * 0.005),
+            "max_recency_days": float(self.rng.exponential(2)),
+            "mean_access_count": float(self.rng.poisson(1) + 1),
+            "precision_quality": float(self.rng.beta(8, 2) * 0.2 + 0.8),
         }
 
     def _memory_uncertain(self) -> dict:
-        max_sim = float(self.rng.beta(5, 5) * 0.3 + 0.4)
-        mean_sim = max_sim * float(self.rng.uniform(0.6, 0.85))
+        # Phase 2h recalibration vs v1:
+        #  - max_similarity: 0.55 → 0.60-0.85 (real 0.70).
+        #  - mean_similarity: matched proportionally (real 0.69).
+        #  - similarity_variance: 0.11 → ~0.002 (real ~0; the test
+        #    set's "competing facts" both retrieve at nearly identical
+        #    cosine because facts in our test cases are encoded
+        #    similarly).
+        #  - max_recency_days: exp(60) → exp(2) (test set is fresh).
+        #  - precision_quality: bumped to ~1.0.
+        max_sim = float(self.rng.beta(7, 4) * 0.25 + 0.60)
+        mean_sim = max_sim * float(self.rng.uniform(0.92, 1.0))
         return {
             "n_facts_retrieved": float(self.rng.integers(1, 4)),
             "max_similarity": max_sim,
             "mean_similarity": mean_sim,
-            # Higher variance — multiple weakly-matching facts.
-            "similarity_variance": float(self.rng.beta(5, 2) * 0.15),
-            "max_recency_days": float(self.rng.exponential(60)),
-            "mean_access_count": float(self.rng.poisson(2)),
-            "precision_quality": float(self.rng.beta(3, 5)),
+            "similarity_variance": float(self.rng.beta(2, 8) * 0.005),
+            "max_recency_days": float(self.rng.exponential(2)),
+            "mean_access_count": float(self.rng.poisson(1) + 1),
+            "precision_quality": float(self.rng.beta(8, 2) * 0.2 + 0.8),
         }
 
     def _memory_hallucinated(self, n_facts: int, has_facts: bool) -> dict:
@@ -314,58 +372,98 @@ class SyntheticDataGenerator:
             "query_specificity": float(self.rng.beta(5, 2)),
         }
 
-    def _generation_known(self) -> dict:
-        mean_h = float(self.rng.gamma(2, 1))
+    def _generation_known(self, has_facts: bool = True) -> dict:
+        # Phase 2h recalibration vs v1:
+        #  - attention_to_facts_mean: Beta(8,2) (~0.80) → ~0.05
+        #    (real Qwen barely attends to fact spans even on the
+        #    cleanest known cases — observed 0.05 ± 0.025).
+        #  - mean_token_entropy: gamma(2,1) → gamma(1.5,0.6) (real
+        #    0.82, syn was 1.90).
+        #  - response_length kept around 25-35 (real 26).
+        mean_h = float(self.rng.gamma(1.5, 0.6))
+        # ``attention_to_facts`` is only meaningful when a fact span
+        # was actually injected into the prompt.
+        attention = (
+            float(self.rng.beta(3, 8) * 0.15 + 0.02)
+            if has_facts else 0.0
+        )
         return {
             "mean_token_entropy": mean_h,
-            "max_token_entropy": mean_h * float(self.rng.uniform(1.5, 3.0)),
+            "max_token_entropy": mean_h * float(self.rng.uniform(2.0, 4.0)),
             "response_length_tokens": float(self.rng.poisson(25) + 5),
-            "attention_to_facts_mean": float(self.rng.beta(8, 2)),
+            "attention_to_facts_mean": attention,
         }
 
-    def _generation_unknown(self, admitted: bool) -> dict:
+    def _generation_unknown(self, admitted: bool, has_facts: bool) -> dict:
+        # Phase 2h recalibration vs v1:
+        #  - admitted branch is now LONG (real refusals are 30-70
+        #    tokens, not 8-15): Poisson(40)+10 ≈ 50 (real 48).
+        #  - mean_token_entropy: lowered to gamma(1.5, 0.7) (real
+        #    1.13, syn was 2.91).
+        #  - attention_to_facts: 0 when no facts, tiny when has_facts
+        #    (real 0.016).
         if admitted:
-            mean_h = float(self.rng.gamma(2, 1))
-            length = float(self.rng.poisson(8) + 3)
+            mean_h = float(self.rng.gamma(1.5, 0.7))
+            length = float(self.rng.poisson(40) + 10)
         else:
-            # Long, high-entropy attempt despite no info.
-            mean_h = float(self.rng.gamma(5, 1))
-            length = float(self.rng.poisson(15) + 5)
+            # Long, high-entropy attempt despite no info — rare.
+            mean_h = float(self.rng.gamma(4, 0.8))
+            length = float(self.rng.poisson(40) + 10)
+        attention = (
+            float(self.rng.beta(3, 9) * 0.04 + 0.005)
+            if has_facts else 0.0
+        )
         return {
             "mean_token_entropy": mean_h,
-            "max_token_entropy": mean_h * float(self.rng.uniform(1.5, 3.0)),
+            "max_token_entropy": mean_h * float(self.rng.uniform(2.0, 4.0)),
             "response_length_tokens": length,
-            "attention_to_facts_mean": 0.0,
+            "attention_to_facts_mean": attention,
         }
 
     def _generation_uncertain(self) -> dict:
-        # Medium entropy = hedging.
-        mean_h = float(self.rng.gamma(3, 1))
-        return {
-            "mean_token_entropy": mean_h,
-            "max_token_entropy": mean_h * float(self.rng.uniform(1.5, 3.0)),
-            "response_length_tokens": float(self.rng.poisson(18) + 5),
-            "attention_to_facts_mean": float(self.rng.beta(4, 4)),
-        }
-
-    def _generation_hallucinated(self) -> dict:
-        # LOW entropy (confident) + LONG response.
+        # Phase 2h recalibration vs v1:
+        #  - response_length: Poisson(18)+5 (~23) → Poisson(35)+8
+        #    (~43; real 42).
+        #  - attention_to_facts: Beta(4,4) (~0.5) → ~0.06 (real 0.06).
+        #  - mean_token_entropy: gamma(3,1) → gamma(2,0.7) (real 1.25).
         mean_h = float(self.rng.gamma(2, 0.7))
         return {
             "mean_token_entropy": mean_h,
-            "max_token_entropy": mean_h * float(self.rng.uniform(1.5, 3.0)),
-            "response_length_tokens": float(self.rng.poisson(30) + 10),
-            # LOW attention to (the little) memory available.
-            "attention_to_facts_mean": float(self.rng.beta(2, 8) * 0.3),
+            "max_token_entropy": mean_h * float(self.rng.uniform(2.0, 4.0)),
+            "response_length_tokens": float(self.rng.poisson(35) + 8),
+            "attention_to_facts_mean": float(self.rng.beta(3, 9) * 0.15 + 0.02),
+        }
+
+    def _generation_hallucinated(self) -> dict:
+        # Phase 2h recalibration vs v1:
+        #  - response_length: Poisson(30)+10 (~40) → Poisson(70)+15
+        #    (~85; real 85 ± 23). Real Qwen confabulations / refusals
+        #    are LONG.
+        #  - attention_to_facts: Beta(2,8)*0.3 (~0.06) → ~0.005 (real
+        #    0.003; even when a fact is in the prompt, the
+        #    confabulating Qwen ignores it).
+        mean_h = float(self.rng.gamma(2, 0.7))
+        return {
+            "mean_token_entropy": mean_h,
+            "max_token_entropy": mean_h * float(self.rng.uniform(2.0, 4.0)),
+            "response_length_tokens": float(self.rng.poisson(70) + 15),
+            "attention_to_facts_mean": float(self.rng.beta(2, 10) * 0.02 + 0.001),
         }
 
     def _alignment_known(self) -> dict:
-        max_c = float(self.rng.beta(8, 2) * 0.25 + 0.7)
-        mean_c = max_c * float(self.rng.uniform(0.7, 0.9))
+        # Phase 2h recalibration vs v1:
+        #  - alignment_max_cosine: 0.7-0.95 → 0.40-0.65 (real 0.54).
+        #    Qwen's filler dilutes the embedding match.
+        #  - alignment_novel_token_ratio: ~0.06 → ~0.80 (real 0.81).
+        #    Qwen's verbose answers introduce many novel tokens.
+        max_c = float(self.rng.beta(5, 5) * 0.25 + 0.40)
+        mean_c = max_c * float(self.rng.uniform(0.95, 1.0))
         return {
             "alignment_max_cosine": max_c,
             "alignment_mean_cosine": mean_c,
-            "alignment_novel_token_ratio": float(self.rng.beta(2, 8) * 0.3),
+            "alignment_novel_token_ratio": float(
+                self.rng.beta(7, 3) * 0.2 + 0.70
+            ),
         }
 
     def _alignment_zero(self) -> dict:
@@ -375,28 +473,71 @@ class SyntheticDataGenerator:
             "alignment_novel_token_ratio": 0.0,
         }
 
-    def _alignment_uncertain(self) -> dict:
-        max_c = float(self.rng.beta(4, 5) * 0.4 + 0.3)  # ~0.3-0.7
-        mean_c = max_c * float(self.rng.uniform(0.6, 0.85))
+    def _alignment_unknown_with_facts(self) -> dict:
+        """Phase 2h NEW: real Qwen produces non-zero alignment for
+        polite refusals when irrelevant facts are in memory — the
+        refusal text shares some embedding space with the fact text,
+        and the refusal words don't appear in the fact (high novelty).
+
+        Real (n=5 cases with facts):
+          - alignment_max/mean_cosine ≈ 0.28 (with substantial std)
+          - alignment_novel_token_ratio ≈ 0.59
+        """
+        max_c = float(self.rng.beta(4, 7) * 0.4 + 0.10)  # ~0.20-0.50
+        mean_c = max_c * float(self.rng.uniform(0.90, 1.0))
         return {
             "alignment_max_cosine": max_c,
             "alignment_mean_cosine": mean_c,
-            "alignment_novel_token_ratio": float(self.rng.beta(3, 4) * 0.4),
+            "alignment_novel_token_ratio": float(
+                self.rng.beta(5, 4) * 0.4 + 0.40
+            ),
+        }
+
+    def _alignment_uncertain(self) -> dict:
+        # Phase 2h recalibration vs v1:
+        #  - alignment_novel_token_ratio: ~0.17 → ~0.92 (real 0.93).
+        #  - alignment_max_cosine: kept around 0.40-0.60 (real 0.51).
+        max_c = float(self.rng.beta(5, 5) * 0.3 + 0.35)  # ~0.35-0.65
+        mean_c = max_c * float(self.rng.uniform(0.92, 1.0))
+        return {
+            "alignment_max_cosine": max_c,
+            "alignment_mean_cosine": mean_c,
+            "alignment_novel_token_ratio": float(
+                self.rng.beta(9, 2) * 0.15 + 0.82
+            ),
         }
 
     def _alignment_hallucinated(self, has_facts: bool) -> dict:
+        # Phase 2h recalibration vs v1: the "hallucinated" cohort
+        # observed in real data is a BIMODAL mix of:
+        #   (a) true confabulations  (60% of with-facts cases): the
+        #       model invents content, alignment_novel is HIGH.
+        #   (b) safety-trained polite refusals (40% of with-facts
+        #       cases AND 100% of no-facts cases): the model says
+        #       "I'm sorry, I don't have that information" — alignment_
+        #       novel is LOW because the refusal vocabulary is sparse.
+        # Modelling both modes so the metacog learns to route both to
+        # ``admit_ignorance`` rather than over-fit one mode.
         if not has_facts:
-            # No facts → alignment slots are all zero per the empty-
-            # facts contract. The diagnostic signal here is the
-            # combination with LOW attention + LONG response (set by
-            # _generation_hallucinated) + memory empty.
+            # No facts → empty-facts gate zeroes alignment. Real
+            # behaviour confirmed (80% of real hallucinated cases).
             return self._alignment_zero()
-        # Has facts but the response ignores them.
+        # With facts — pick the mode.
+        is_refusal = self.rng.random() < 0.55
+        if is_refusal:
+            return {
+                "alignment_max_cosine": float(self.rng.beta(3, 8) * 0.3 + 0.05),
+                "alignment_mean_cosine": float(self.rng.beta(3, 8) * 0.25 + 0.05),
+                "alignment_novel_token_ratio": float(
+                    self.rng.beta(2, 8) * 0.3
+                ),
+            }
         return {
             "alignment_max_cosine": float(self.rng.beta(2, 6) * 0.4),
             "alignment_mean_cosine": float(self.rng.beta(2, 6) * 0.3),
-            # HIGH novel-token ratio — the signature hallucination tell.
-            "alignment_novel_token_ratio": float(self.rng.beta(8, 2) * 0.3 + 0.6),
+            "alignment_novel_token_ratio": float(
+                self.rng.beta(7, 3) * 0.3 + 0.55
+            ),
         }
 
     # ---------- combine + assemble ----------
