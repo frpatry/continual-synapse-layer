@@ -1,239 +1,182 @@
-# Session handoff — 2026-05-27 (longer-training hypothesis)
+# Session handoff — Phase 1.0 AGI architecture COMPLETE
 
 ## TL;DR — read this first
 
-**The previous session closed the architectural-search line with a
-null result.** Seven architecturally distinct attempts on
-Permuted-MNIST T=15 small-MLP; only one (`cs_gated_cosine_functional`,
-DER-equivalent at ACC=0.904, Task-0=0.908) ties the literature, none
-surpasses it.
+**Major pivot completed last session.** The repo now has two parallel
+tracks:
 
-**New hypothesis for this session: every config we've run uses
-`epochs_per_task=1`.** Models may simply be undertrained. Longer
-training per task could (a) lift the DER-equivalent ceiling on
-`cs_gated_cosine_functional`, and (b) give the memory-augmented
-architecture's access heads (`query_proj`, `context_combiner`,
-`memory_gate`) enough gradient signal to escape the bad local
-optimum that produced the null verdict last session.
+1. **Legacy** (`src/continual_synapse/`, `experiments/[01-49]*.py`,
+   `tests/test_*.py`) — the continual-learning work. Final empirical
+   conclusion: input-replay (DER / CLS-CI v2) matches the literature
+   at ~0.86 on Split-MNIST CI and ~0.86 on Permuted-MNIST T=50.
+   Prototype-only memory (Phase 5.7) failed to transfer (0.193 final
+   ACC on Split-MNIST CI — see commit `65059cb`). **Do not extend
+   this code** — it's reference-only.
 
-**Goal of this session: characterize the
-ceiling-vs-epochs-per-task curve.** Sweep `--epochs-per-task` ∈
-{1, 3, 5, 10} on the two configs that matter
-(`cs_gated_cosine_functional` and `memory_augmented_native`) and
-see whether more epochs raises the ceiling, leaves it flat, or
-breaks things.
+2. **AGI** (`src/agi/`, `experiments/agi/`, `tests/agi/`) — the new
+   project. Phase 1.0 wired up at commit `610c250`: frozen
+   Qwen-0.5B-Instruct + structured-fact extractor + privacy-preserving
+   episodic memory + observe/respond pipeline. Four-scenario demo
+   PASSED all user-defined criteria. **This is the active line.**
 
-## Current state of the codebase
-
-- Last commit `5a291b5` (clean working tree, **461 tests passing**).
-- All seven prior architectural lines committed and reproducible.
-- The memory-augmented loader-guard patch (`89380e9`) prevents
-  silent maturity_target mismatches.
-
-## Why this hypothesis is worth testing
-
-Three concrete reasons the existing 1-epoch-per-task results may
-be misleading:
-
-1. **`cs_gated_cosine_functional` audit numbers showed
-   under-convergence.** The audit (commit referenced in the prior
-   handoff) reported per-task `task_loss` in the 0.5-0.9 range —
-   notably above the 0.1-0.3 that fully-converged MNIST hits. The
-   gating-induced slowdown was offered as the explanation, but
-   undertraining is the simpler one. If we just need to train more,
-   the DER-equivalent ceiling might rise meaningfully.
-
-2. **The memory-augmented gate failure mode is consistent with
-   undertraining.** The gate trained DOWN to ~0.16 in the
-   pre-floor run, and even with the maturity floor forcing
-   engagement, the access heads (`query_proj`, `context_combiner`)
-   may simply not have seen enough gradient updates to learn a
-   useful query/combine policy. 1 epoch × 938 batches × 15 tasks
-   = 14,070 batches total for an architecture that needs to
-   simultaneously learn the classification task AND learn how to
-   use external memory. That's tight.
-
-3. **The control config also showed Task-N collapse on Task-0
-   (forgetting signature)**. `memory_augmented_no_memory` got
-   Task-N=0.961 but Task-0=0.235 — classic naive-finetune
-   catastrophic forgetting. More epochs per task makes catastrophic
-   forgetting *worse* for unprotected models, but should make the
-   protected/memory-using configs *relatively* better — widening
-   the gap if memory is genuinely helping at all.
-
-## Concrete experiment plan
-
-### Step 1 — characterize the trend on the breakthrough cell
+## Where to start
 
 ```bash
+git checkout main && git pull
+# Verify environment:
 source .venv/bin/activate
-
-# Reproduce the existing 1-epoch baseline (sanity — should hit ACC≈0.904)
-# Already in results/logs/functional/; skip if you trust the prior audit.
-
-# 3 epochs (~18 min — fits the harness 50-min cap comfortably)
-python experiments/30_functional_regularization_eval.py \
-    --T 15 --n_seeds 3 \
-    --configs cs_gated_cosine_functional \
-    --epochs-per-task 3
-
-# 5 epochs (~30 min — still fits)
-python experiments/30_functional_regularization_eval.py \
-    --T 15 --n_seeds 3 \
-    --configs cs_gated_cosine_functional \
-    --epochs-per-task 5
-
-# 10 epochs (~60 min — likely hits the harness cap; run as 3 separate
-# single-seed jobs if so)
-python experiments/30_functional_regularization_eval.py \
-    --T 15 --n_seeds 1 --seed-base 0 \
-    --configs cs_gated_cosine_functional \
-    --epochs-per-task 10
-# Repeat with --seed-base 1, then 2.
+python -m pytest tests/agi/ -q          # 27 pass, 2 skipped (Qwen-load gated)
+# Replay the demo (uses cached Qwen-0.5B; ~30s on CPU after first run):
+python experiments/agi/phase_1_0_fact_retention.py
 ```
 
-**Important:** exp 30's checkpoint loader will refuse to load
-stale `phase_f/` checkpoints under a different
-`--epochs-per-task` — actually, the loader doesn't currently
-check this. You'll need to either (a) `rm` the relevant
-checkpoints before each new-epoch run, or (b) the smarter
-patch: add `epochs_per_task` to the exp 30 checkpoint
-metadata + loader guard, mirroring the exp 31 fix in commit
-`89380e9`. The patch is small and removes a footgun.
+## Repo layout (post-pivot)
 
-### Step 2 — same sweep on `memory_augmented_native`
+```
+src/
+├── agi/                                # NEW — Phase 1.0 onwards
+│   ├── __init__.py                     # lazy: exports memory + extractor only
+│   ├── foundation.py                   # FrozenFoundation (Qwen-0.5B wrapper)
+│   ├── extraction.py                   # FactExtractor (regex, FR+EN)
+│   ├── integration.py                  # AGISystem (observe/respond)
+│   └── memory/
+│       ├── __init__.py
+│       └── xray_episodic.py            # XRayEpisodicMemory, EpisodicEntry
+└── continual_synapse/                  # LEGACY — reference only
 
-```bash
-# 3 epochs
-rm results/checkpoints/phase_g/memory_augmented_native_T15_seed*.pt
-python experiments/31_memory_augmented_eval.py \
-    --T 15 --n_seeds 3 \
-    --configs memory_augmented_native \
-    --epochs-per-task 3 \
-    --maturity-target 750
+experiments/
+├── agi/
+│   ├── __init__.py
+│   └── phase_1_0_fact_retention.py     # Phase 1.0 demo (PASS)
+├── 01_*.py … 49_*.py                   # LEGACY CL experiments
 
-# 5 epochs
-rm results/checkpoints/phase_g/memory_augmented_native_T15_seed*.pt
-python experiments/31_memory_augmented_eval.py \
-    --T 15 --n_seeds 3 \
-    --configs memory_augmented_native \
-    --epochs-per-task 5 \
-    --maturity-target 750
+tests/
+├── agi/
+│   ├── test_extraction.py              # 10 tests
+│   ├── test_episodic_memory.py         # 10 tests
+│   ├── test_integration.py             # 6 tests (uses MockFoundation)
+│   └── test_foundation.py              # 3 tests; 2 gated by AGI_FOUNDATION_TESTS=1
+└── test_*.py                           # LEGACY CL tests (still pass)
 
-# 10 epochs (likely needs single-seed splits)
-rm results/checkpoints/phase_g/memory_augmented_native_T15_seed*.pt
-python experiments/31_memory_augmented_eval.py \
-    --T 15 --n_seeds 1 --seed-base 0 \
-    --configs memory_augmented_native \
-    --epochs-per-task 10 \
-    --maturity-target 750
-# Repeat for seeds 1, 2.
+colab/
+└── cifar100_cls_pilot.ipynb            # LEGACY (CIFAR pilot infra)
 ```
 
-Exp 31's loader does check `maturity_target` (commit `89380e9`)
-but NOT `epochs_per_task`. Same patch opportunity as above.
+## Phase 1.0 — what landed
 
-### Step 3 — interpret
+Commit `610c250`. Four-scenario demo on `Qwen/Qwen2-0.5B-Instruct`,
+frozen, CPU (fp32) or CUDA (fp16):
 
-For each config, build a small table:
+| Scenario | Result |
+|---|---|
+| 1. Introduction `"Mon nom est Francois..."` | Extracted `{name: Francois, location: Montréal}`; memory size 1 |
+| 2. **Retrieval test** `"Comment je m'appelle?"` | Assistant: **"Je m'appelle François."** ← memory_used=True, sim=0.816 ✓ |
+| 3. Control (no memory) `"Comment je m'appelle?"` | Assistant deflects, does NOT fabricate ✓ |
+| 4. Multi-fact retrieval + summary | Retrieval+merge worked; summarisation deflected (Qwen-0.5B quality limit, NOT mechanism failure) |
 
-| epochs_per_task | ACC | Task-0 | Task-N | wall_time |
-|---:|---:|---:|---:|---:|
-| 1 | (existing) | (existing) | (existing) | (existing) |
-| 3 | ... | ... | ... | ... |
-| 5 | ... | ... | ... | ... |
-| 10 | ... | ... | ... | ... |
+**Privacy verified programmatically**: every `EpisodicEntry` exposes
+only `(key, facts, timestamp, access_count, creation_session)` — no
+`raw_text`, `original_input`, `raw`, `samples`, or `utterance`
+fields. The unit test suite asserts the same.
 
-Three possible patterns:
+## Key architectural decisions made in Phase 1.0
 
-- **Monotonic improvement**: ceiling was undertraining-limited.
-  The architectural ceiling thesis was wrong. The breakthrough is
-  to retrain everything at the saturation epochs-per-task.
-- **Saturation by 3-5 epochs, then flat**: 1 epoch was indeed
-  under-converged but the architectural ceiling is real. The
-  saturated number is the honest version of each cell.
-- **Improvement then degradation**: the model overfits the current
-  task at high epochs-per-task, which makes catastrophic
-  forgetting worse. There's a sweet spot.
+1. **`src/agi/__init__.py` does NOT eagerly import `FrozenFoundation`
+   or `AGISystem`.** That keeps pure-memory tests fast and offline.
+   Import them explicitly: `from agi.foundation import FrozenFoundation`.
 
-The most interesting cell to watch is `memory_augmented_native` at
-high epochs — if Task-0 rises from 0.19 (current) to anywhere
-above ~0.30, the architectural pivot wasn't dead, it was just
-undertrained. If it stays flat, the seven-attempts null was the
-right read.
+2. **Device + dtype auto-picked**: CUDA + fp16 when available, else
+   CPU + fp32. Apple Silicon MPS NOT auto-selected (HF generation
+   paths flaky on MPS for small models). Pass `device="mps"`
+   explicitly to override.
 
-## Wall-clock budget
+3. **`transformers==4.57.1` was pinned in `pyproject.toml` already
+   but not installed in the .venv** — fixed during 1.0 work.
+   `dtype=` (not `torch_dtype=`) is the load kwarg.
 
-The harness background-task cap is ~50 minutes per invocation
-(established empirically across this project — path-A succeeded
-at 19 min, path-C got killed at ~50 min, T=50 baseline got killed
-at ~60 min into seed 1). Plan accordingly:
+4. **FactExtractor uses scoped inline `(?i:...)` flags** so trigger
+   phrases match case-insensitively while place-name captures stay
+   case-sensitive (avoids extracting common nouns as locations).
 
-| config | 1 epoch / seed | 3 epochs | 5 epochs | 10 epochs |
-|---|---:|---:|---:|---:|
-| cs_gated_cosine_functional | ~6 min | ~18 min | ~30 min | ~60 min ⚠ |
-| memory_augmented_native | ~30 sec | ~90 sec | ~3 min | ~6 min |
+5. **`AGISystem._format_facts_as_context`** uses hand-crafted Qwen
+   chat tokens (`<|im_start|>...`). A polish pass could switch to
+   `tokenizer.apply_chat_template`; not blocking.
 
-For exp 30 at 10 epochs, n=3 in one invocation would be ~3 hours
-— far over the cap. Split into single-seed jobs. exp 31 is small
-enough that n=3 at 10 epochs (~18 min) fits comfortably.
+## Phase 1.1 — natural next steps (USER-DECIDED, not yet specified)
 
-## Pre-flight: add `epochs_per_task` to both loader guards
+Phase 1.0 only proves the foundation + memory pipeline works on a
+toy demo. The user has explicitly indicated this is a 9-12 month
+project; Phase 1.0 is one milestone of many. Plausible Phase 1.1
+directions (do NOT pre-commit to one — wait for user spec):
 
-Recommended ~10-line patch to exp 30 and exp 31 before doing the
-sweep, mirroring the maturity_target guard in commit `89380e9`.
-Without it, the second invocation in each sweep will silently
-load the first invocation's checkpoint (different epochs) and
-just re-evaluate it — exactly the bug that wasted the last
-maturity-target sweep.
+- **Foundation-LLM-driven fact extraction.** Replace the regex
+  `FactExtractor` with prompting the foundation to extract structured
+  facts from arbitrary text. Generalises beyond name/age/location.
+- **Multi-session persistence.** Pickle the memory to disk between
+  runs; reload at session start. Tests session_id behaviour the
+  Phase 1.0 code already tracks via `new_session()`.
+- **Negative-fact handling.** User says "I'm NOT from Paris" — the
+  current extractor would falsely store `location=Paris`.
+- **Larger foundation.** Qwen-0.5B is too small to summarise across
+  retrieved facts (Scenario 4). Try Qwen-1.5B-Instruct or similar.
+- **Phase 2.0** (per the user's roadmap): reward-modulated plasticity.
 
-The change for exp 30: in `_save_functional_checkpoint`'s payload,
-add `"epochs_per_task": int(args.epochs_per_task)`; in the load
-path, check it matches and raise a clear error if not. Same
-shape as the exp 31 maturity guard.
+## CL legacy snapshot — preserve, don't extend
 
-## What stays from the prior session
+The legacy CL track ended with:
+- **CLS-CI v2 on Split-MNIST CI** (n=10): NEO ACC = **0.861 ± 0.020**
+  (commit `fa8b88c`). Matches/approaches DER (0.879).
+- **CIFAR-100 CI pilot** (CLS-CI v2 + DER) stalled at ~0.17-0.19 final
+  ACC across multiple lambda/lr/architecture pivots
+  (commits `513c0fb` through `a19d157`). The Colab notebook
+  `colab/cifar100_cls_pilot.ipynb` has the launchers.
+- **Prototype-based XRay attempt** (Phase 5.7) failed on Split-MNIST
+  CI at the same 0.193 plateau (commit `65059cb`). Root cause
+  diagnosed in that commit message: prototypes go stale as the
+  encoder drifts. The AGI pivot preserved the XRay name in the new
+  `XRayEpisodicMemory` (which works because the foundation is frozen,
+  so keys don't drift).
 
-The prior session's three-option decision is **deferred, not
-cancelled**:
+## Open todos (carried forward, lowest priority)
 
-- Option 1 (change benchmark to Split-CIFAR-10/100)
-- Option 2 (scale to transformer)
-- Option 3 (stop and write up)
+- **Suppress the `temperature/top_p/top_k may be ignored` warning**
+  from Qwen generation when `do_sample=False`. Pass an explicit
+  `GenerationConfig` to silence cleanly.
+- **Optionally migrate `_format_facts_as_context`** to
+  `tokenizer.apply_chat_template` for robustness across HF versions.
 
-If the epochs-per-task sweep shows monotonic improvement on either
-config, the project is back in active research mode and the
-three options become re-relevant *with new data*. If the sweep
-saturates flat (the architectural ceiling thesis was right), the
-three options are exactly the same decision as before — and option
-3 (write up) becomes the stronger choice because we'll have ruled
-out one more confounder.
+## Important — pyproject.toml / environment
 
-## Files of interest
+- `transformers==4.57.1` is in `pyproject.toml` but is **NOT** in
+  the default install path; if a fresh venv is set up, run
+  `pip install transformers==4.57.1` explicitly (or run a full
+  `pip install -e .[dev]` once the project is properly packaged).
+- `scikit-learn==1.8.0` was added earlier for Phase 3.0 CL work.
+  Phase 1.0 AGI does not depend on it.
 
-- `experiments/30_functional_regularization_eval.py` — exposes
-  `--epochs-per-task` (default 1).
-- `experiments/31_memory_augmented_eval.py` — exposes
-  `--epochs-per-task` (default 1).
-- `decisions_log.md` — full narrative for every prior pivot. The
-  memory-augmented null verdict still needs to land here (see
-  open todos).
+## Most recent commits (for fast-forward)
 
-## Open todos (carried from prior session)
-
-- **Memory-augmented null verdict in decisions_log.** Pivot entry
-  exists (`dda0881`); the verdict entry doesn't. Should cover the
-  three sweep numbers, the parasitic-memory diagnosis, the
-  seven-attempts pattern.
-- **Add `epochs_per_task` to exp 30 + exp 31 loader guards.**
-  ~10 lines each, prevents the silent-stale-checkpoint footgun
-  during the sweep.
-- **n=10 validation at T=50** (still deferred).
-- **T=50 n=3 functional reg pilot** (started, hit harness
-  timeout — resumable in chunks).
-- **README decay-subsystem honesty note** (still deferred).
+```
+610c250 feat: Phase 1.0 AGI architecture — Foundation + X-Ray Episodic Memory   ← HEAD
+65059cb exp: Phase 5.7.2 — XRay validation on Split-MNIST CI (FAILURE, kept)
+374c20a feat: Phase 5.7.1 — integrate X-Ray Memory into training pipeline
+afc98ed feat: Phase 5.7.0 XRayMemory — prototype-based memory with refinement
+fa8b88c exp: Phase 5.5.6 — CLS-CI v2 n=10 confirmation + ablation
+41a114b exp: Phase 5.5.6 — CLS-CI v2 with interleaved replay
+```
 
 ## Suite status
 
-**461 tests passing** at end of prior session. No changes this
-session beyond the handoff rewrite.
+- **Legacy tests** (continual_synapse/): all pass.
+- **AGI tests** (tests/agi/): 27 pass, 2 skipped (Qwen-load gated by
+  `AGI_FOUNDATION_TESTS=1` env var).
+- Combined: clean `pytest` run is fast (~5-10 s) when foundation
+  tests are skipped.
+
+---
+
+*Generated by Claude Code (executor role) at the end of the Phase 1.0
+session. The conversational-Claude handoff (separate file:
+`results/CLAUDE_CONVERSATION_HANDOFF.md`, untracked) covers the
+strategic discussion arc. This file covers the codebase state for
+the next executor session.*
