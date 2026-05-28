@@ -8,9 +8,13 @@ features summarising:
 - **Query**   — 3 features describing the query itself (length,
   entity presence, lexical specificity).
 - **Generation** — 4 features describing the LLM's generation
-  process (placeholder in Phase 2a; zero-filled).
+  process. Phase 2b populates these from
+  :class:`agi.foundation.GenerationInfo`; the pre-layer path
+  still passes ``None`` and gets zeros.
 - **Alignment**  — 3 features comparing the generated response
-  to retrieved facts (placeholder in Phase 2a; zero-filled).
+  to retrieved facts. Phase 2b populates these from cosine
+  similarity (response vs each fact's stringified form) plus a
+  novelty signal.
 - **Reserved** — 2 padding slots so the post-layer input vector
   is a clean ``18`` rather than ``16``; reserved for features
   added in subsequent phases.
@@ -19,6 +23,15 @@ The pre-layer reads the first ``9`` (memory + query); the
 post-layer reads all ``18``. Both feature orderings are fixed
 constants in this module so a trained network's input mapping
 stays stable across releases.
+
+The three ``ALIGNMENT_FEATURE_NAMES`` slot labels describe
+exactly what they compute:
+
+    alignment_max_cosine         ← max  cosine(response, fact)
+    alignment_mean_cosine        ← mean cosine(response, fact)
+    alignment_novel_token_ratio  ← novel-token ratio
+                                   (response tokens absent
+                                    from any fact)
 """
 
 from __future__ import annotations
@@ -27,9 +40,13 @@ import math
 import re
 import statistics
 from datetime import datetime
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, List, Optional, TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
+
+if TYPE_CHECKING:  # avoid a hard transformers dependency at import time
+    from agi.foundation import FrozenFoundation, GenerationInfo
 
 
 # Fixed feature names + ordering. Changing these breaks any
@@ -51,16 +68,16 @@ QUERY_FEATURE_NAMES: tuple[str, ...] = (
 )
 
 GENERATION_FEATURE_NAMES: tuple[str, ...] = (
-    "gen_perplexity",
-    "gen_token_entropy",
-    "gen_max_token_prob",
-    "gen_repetition_score",
+    "mean_token_entropy",
+    "max_token_entropy",
+    "response_length_tokens",
+    "attention_to_facts_mean",
 )
 
 ALIGNMENT_FEATURE_NAMES: tuple[str, ...] = (
-    "align_semantic_similarity",
-    "align_entity_overlap",
-    "align_contradiction_score",
+    "alignment_max_cosine",
+    "alignment_mean_cosine",
+    "alignment_novel_token_ratio",
 )
 
 # 2 padding slots so post-mode totals an even 18 — reserved for
@@ -183,39 +200,181 @@ def extract_query_features(query: str, foundation: Optional[Any] = None) -> dict
 
 
 # ----------------------------------------------------------------------
-# Generation features (placeholder — zero-filled)
+# Generation features
 # ----------------------------------------------------------------------
 
-def extract_generation_features(generation_output: Any = None) -> dict:
-    """Generation-time signals — placeholder.
+def extract_generation_features(
+    gen_info: Optional["GenerationInfo"] = None,
+) -> dict:
+    """Surface the metacognition-relevant fields of a
+    :class:`agi.foundation.GenerationInfo`.
 
-    Will eventually surface: average per-token perplexity,
-    per-token entropy, max softmax probability, simple
-    repetition score. Phase 2a returns zeros for all four so the
-    feature vector has a stable shape across the placeholder /
-    real-implementation transition.
+    ``gen_info`` is ``None`` in the pre-evaluation path (the
+    response hasn't been generated yet) and on any caller that
+    used the legacy plain ``generate()`` API — in both cases we
+    return zeros so the feature vector keeps a stable shape.
+
+    No ``transformers`` import happens here — the function only
+    reads attribute values; we duck-type so a dict-shaped stub
+    works too (useful for tests that don't want to import
+    ``GenerationInfo`` to build a mock).
     """
-    return {name: 0.0 for name in GENERATION_FEATURE_NAMES}
+    if gen_info is None:
+        return {name: 0.0 for name in GENERATION_FEATURE_NAMES}
+
+    def _read(name: str) -> float:
+        if isinstance(gen_info, dict):
+            value = gen_info.get(name, 0.0)
+        else:
+            value = getattr(gen_info, name, 0.0)
+        return _coerce_to_float(value)
+
+    return {
+        "mean_token_entropy": _read("mean_token_entropy"),
+        "max_token_entropy": _read("max_token_entropy"),
+        "response_length_tokens": _read("response_length_tokens"),
+        "attention_to_facts_mean": _read("attention_to_facts_mean"),
+    }
 
 
 # ----------------------------------------------------------------------
-# Alignment features (placeholder — zero-filled)
+# Alignment features
 # ----------------------------------------------------------------------
 
 def extract_alignment_features(
     response: Optional[str] = None,
     facts: Any = None,
-    foundation: Optional[Any] = None,
+    foundation: Optional["FrozenFoundation"] = None,
 ) -> dict:
-    """Response-vs-facts alignment signals — placeholder.
+    """Compute response-vs-facts alignment from foundation
+    embeddings + a lexical novelty signal.
 
-    Will eventually surface: semantic similarity (embedding
-    cosine) between the response and the retrieved fact summary,
-    entity overlap, a contradiction score. Phase 2a returns
-    zeros so post-layer training data can be generated without
-    a real foundation in the loop yet.
+    Returns the three ``ALIGNMENT_FEATURE_NAMES`` slots:
+
+    - ``alignment_max_cosine``  — best cosine similarity between
+      the response embedding and each fact's stringified
+      embedding.
+    - ``alignment_mean_cosine`` — mean cosine similarity over
+      the same set.
+    - ``alignment_novel_token_ratio`` — fraction of response
+      tokens that don't appear (case-insensitively) in any
+      fact.
+
+    **Empty-facts behaviour** (architectural decision): when
+    ``facts`` is empty / ``None``, **all three** alignment
+    features fold to ``0.0`` — including the novel-token ratio,
+    even though the lexical formula would otherwise give 1.0.
+
+    Rationale: alignment features measure "does the generated
+    response stay consistent with the information we retrieved".
+    When no information was retrieved, the question is
+    *undefined* rather than "maximally violated". The
+    hallucination case — "the model spoke confidently with no
+    supporting memory" — is the orchestrator's job to detect
+    via the conjunction ``memory_coverage == 0`` AND
+    ``response_length_tokens > 0``. Keeping memory features and
+    alignment features architecturally orthogonal lets the
+    metacognitive layer learn each signal cleanly rather than
+    having a derived novelty score double-count the
+    "memory-empty" signal.
+
+    Missing ``foundation`` keeps the same shape but the cosine
+    pair stay at ``0.0`` (we can't embed without it) — the
+    lexical novelty signal still flows because it doesn't need
+    embeddings.
+
+    ``facts`` is intentionally lenient: it may be a list of
+    fact dicts (the spec's primary type), the orchestrator's
+    raw retrieval list of ``(entry, sim)`` tuples, or any
+    iterable of strings. Each item is normalised to a string
+    before embedding lookup.
     """
-    return {name: 0.0 for name in ALIGNMENT_FEATURE_NAMES}
+    normalised_facts = _normalise_facts(facts)
+
+    # Empty facts → no alignment signal is defined. See the
+    # architectural-decision note in the docstring above.
+    if not normalised_facts or not response or not response.strip():
+        return {
+            "alignment_max_cosine": 0.0,
+            "alignment_mean_cosine": 0.0,
+            "alignment_novel_token_ratio": 0.0,
+        }
+
+    if foundation is None:
+        return {
+            "alignment_max_cosine": 0.0,
+            "alignment_mean_cosine": 0.0,
+            "alignment_novel_token_ratio": _novel_token_ratio(
+                response, normalised_facts,
+            ),
+        }
+
+    response_emb = foundation.get_key(response).unsqueeze(0)
+    fact_embs = [foundation.get_key(f).unsqueeze(0) for f in normalised_facts]
+    alignments: List[float] = []
+    for fe in fact_embs:
+        sim = F.cosine_similarity(response_emb, fe, dim=-1)
+        alignments.append(float(sim.item()))
+
+    novel_ratio = _novel_token_ratio(response, normalised_facts)
+    return {
+        "alignment_max_cosine": float(max(alignments)),
+        "alignment_mean_cosine": float(sum(alignments) / len(alignments)),
+        "alignment_novel_token_ratio": novel_ratio,
+    }
+
+
+def _normalise_facts(facts: Any) -> List[str]:
+    """Coerce a heterogeneous facts argument into a list of
+    non-empty strings.
+
+    Accepts (in priority order):
+
+    - ``None`` / falsy → ``[]``
+    - iterables of ``(entry, sim)`` tuples — pull ``entry.facts``
+      (or ``entry`` itself if no such attribute) and stringify.
+    - iterables of dicts — stringify each via ``str(fact)``.
+    - iterables of plain strings — pass through after a strip.
+    - anything else iterable — stringify each.
+    """
+    if not facts:
+        return []
+    out: List[str] = []
+    for item in facts:
+        # (entry, sim) tuple from the retrieval list.
+        if isinstance(item, tuple) and len(item) == 2:
+            entry = item[0]
+            payload = getattr(entry, "facts", entry)
+            text = str(payload).strip()
+        elif isinstance(item, str):
+            text = item.strip()
+        else:
+            text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+_TOKEN_RE = re.compile(r"[\wÀ-ÖØ-öø-ÿ]+")
+
+
+def _novel_token_ratio(response: str, facts: Iterable[str]) -> float:
+    """Fraction of response tokens that don't appear in any
+    fact (case-insensitive).
+
+    Empty response yields ``1.0`` — a response that doesn't
+    exist can't recycle any fact tokens, but the metacognitive
+    layer treats max-novelty as a "fully novel / nothing to
+    align with" signal, which matches the empty-response case.
+    """
+    response_tokens = set(_TOKEN_RE.findall(response.lower()))
+    if not response_tokens:
+        return 1.0
+    fact_tokens: set[str] = set()
+    for f in facts:
+        fact_tokens.update(_TOKEN_RE.findall(str(f).lower()))
+    novel = response_tokens - fact_tokens
+    return len(novel) / float(len(response_tokens))
 
 
 # ----------------------------------------------------------------------

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+import pytest
 import torch
 
 from agi.metacognition.features import (
@@ -103,20 +104,182 @@ def test_query_features_first_word_capitalisation_does_not_flag_entity():
     assert feats["has_named_entity"] == 0.0
 
 
-# ---------- Generation + alignment placeholders ----------
+# ---------- Generation features (Phase 2b) ----------
 
-def test_generation_features_placeholder_zero_filled():
+def test_generation_features_none_returns_zeros():
+    """The pre-evaluation path and any legacy caller pass
+    ``gen_info=None``; the extractor must return a zero-valued
+    dict so the feature vector keeps a stable shape."""
     feats = extract_generation_features(None)
     assert set(feats) == set(GENERATION_FEATURE_NAMES)
     assert all(v == 0.0 for v in feats.values())
 
 
-def test_alignment_features_placeholder_zero_filled():
-    feats = extract_alignment_features(
-        response="anything", facts=[], foundation=None,
+def test_generation_features_reads_genination_info_fields():
+    """A real-ish GenerationInfo populates each slot from the
+    matching attribute on the dataclass."""
+    from agi.foundation import GenerationInfo
+    info = GenerationInfo(
+        response_text="hello world",
+        generated_token_ids=[1, 2, 3, 4, 5],
+        response_length_tokens=5,
+        mean_token_entropy=1.234,
+        max_token_entropy=2.5,
+        attention_to_facts_mean=0.42,
+        attention_to_facts_max=0.7,
+        generation_time_seconds=0.01,
     )
-    assert set(feats) == set(ALIGNMENT_FEATURE_NAMES)
-    assert all(v == 0.0 for v in feats.values())
+    feats = extract_generation_features(info)
+    assert feats["mean_token_entropy"] == 1.234
+    assert feats["max_token_entropy"] == 2.5
+    assert feats["response_length_tokens"] == 5.0
+    assert feats["attention_to_facts_mean"] == 0.42
+
+
+def test_generation_features_accepts_dict_stub():
+    """A dict with the right keys also works — handy for tests
+    that don't want to import GenerationInfo."""
+    feats = extract_generation_features({
+        "mean_token_entropy": 0.5,
+        "max_token_entropy": 1.0,
+        "response_length_tokens": 8,
+        "attention_to_facts_mean": 0.1,
+    })
+    assert feats["mean_token_entropy"] == 0.5
+    assert feats["response_length_tokens"] == 8.0
+
+
+# ---------- Alignment features (Phase 2b) ----------
+
+class _StubFoundationDirected:
+    """Foundation stub whose embeddings are *directed* — each
+    distinct text gets a deterministic unit vector, so a self-
+    match gives cosine ≈ 1 and a different text gives cosine
+    close to 0. Lets us assert alignment behaviour without
+    loading a real model.
+    """
+
+    def __init__(self, dim: int = 32):
+        self._dim = dim
+
+    def get_key(self, text: str) -> torch.Tensor:
+        # Seed from the text's hash so identical strings map to
+        # identical vectors and different strings map to nearly
+        # orthogonal ones (with high probability at dim=32).
+        h = abs(hash(text)) & 0xFFFFFFFF
+        g = torch.Generator()
+        g.manual_seed(h)
+        v = torch.randn(self._dim, generator=g)
+        return v / v.norm()
+
+
+def test_alignment_features_empty_facts_returns_all_zeros():
+    """Empty facts → ALL three alignment slots fold to 0.0,
+    including ``alignment_novel_token_ratio``.
+
+    The hallucination case ("response generated with no
+    supporting memory") is the orchestrator's job to detect via
+    ``memory_coverage == 0`` AND ``response_length_tokens > 0``,
+    NOT via a derived novelty score. Returning 0.0 across the
+    alignment slots keeps memory features and alignment features
+    architecturally orthogonal — see the module docstring on
+    ``extract_alignment_features``."""
+    feats = extract_alignment_features(
+        response="the cat sat on the mat",
+        facts=[],
+        foundation=_StubFoundationDirected(),
+    )
+    assert feats["alignment_max_cosine"] == 0.0
+    assert feats["alignment_mean_cosine"] == 0.0
+    assert feats["alignment_novel_token_ratio"] == 0.0
+
+
+def test_alignment_features_perfect_match_high_similarity():
+    """Response identical to the only fact → max + mean cosine
+    ≈ 1. Novelty ≈ 0 (every response token appears in the fact)."""
+    f = _StubFoundationDirected()
+    fact_text = "name=Francois location=Montreal"
+    feats = extract_alignment_features(
+        response=fact_text,
+        facts=[fact_text],
+        foundation=f,
+    )
+    assert feats["alignment_max_cosine"] == pytest.approx(1.0, abs=1e-5)
+    assert feats["alignment_mean_cosine"] == pytest.approx(1.0, abs=1e-5)
+    assert feats["alignment_novel_token_ratio"] == 0.0
+
+
+def test_alignment_features_novel_token_ratio_simple_case():
+    """3 of 5 response tokens overlap with facts → novelty = 2/5.
+
+    Novelty arithmetic on the non-empty path is unchanged from
+    the pre-refactor behaviour — only the empty-facts edge case
+    was modified."""
+    f = _StubFoundationDirected()
+    feats = extract_alignment_features(
+        response="alpha beta gamma delta epsilon",
+        facts=["alpha beta gamma"],
+        foundation=f,
+    )
+    # 2 novel (delta, epsilon) out of 5 → 0.4.
+    assert feats["alignment_novel_token_ratio"] == pytest.approx(0.4)
+
+
+def test_alignment_features_accepts_retrieval_tuples():
+    """The orchestrator passes ``[(entry, sim), ...]`` rather than
+    a list of dicts. The extractor must transparently pull the
+    facts out via the ``entry.facts`` attribute (or fall back to
+    str() of the entry)."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Entry:
+        facts: dict
+
+    f = _StubFoundationDirected()
+    retrieval = [
+        (_Entry(facts={"name": "Francois"}), 0.95),
+        (_Entry(facts={"location": "Montreal"}), 0.80),
+    ]
+    feats = extract_alignment_features(
+        response="Francois Montreal",
+        facts=retrieval,
+        foundation=f,
+    )
+    # At least one alignment value should be finite / non-NaN.
+    assert -1.0 <= feats["alignment_max_cosine"] <= 1.0
+    assert -1.0 <= feats["alignment_mean_cosine"] <= 1.0
+    # Novelty: 0 out of 2 unique response tokens are novel
+    # (both Francois and Montreal appear in the facts).
+    assert feats["alignment_novel_token_ratio"] == 0.0
+
+
+def test_alignment_features_missing_foundation_returns_only_novelty():
+    """Without a foundation we can't compute cosine, but the
+    novelty signal is purely lexical so it stays meaningful —
+    as long as facts is non-empty (the empty-facts gate fires
+    BEFORE the foundation check)."""
+    feats = extract_alignment_features(
+        response="alpha beta gamma",
+        facts=["alpha"],
+        foundation=None,
+    )
+    assert feats["alignment_max_cosine"] == 0.0
+    assert feats["alignment_mean_cosine"] == 0.0
+    assert feats["alignment_novel_token_ratio"] == pytest.approx(2.0 / 3.0)
+
+
+def test_alignment_features_empty_response_returns_all_zeros():
+    """An empty response also routes through the empty-input
+    gate (no signal to extract → all zeros)."""
+    feats = extract_alignment_features(
+        response="",
+        facts=["something"],
+        foundation=_StubFoundationDirected(),
+    )
+    assert feats["alignment_max_cosine"] == 0.0
+    assert feats["alignment_mean_cosine"] == 0.0
+    assert feats["alignment_novel_token_ratio"] == 0.0
 
 
 # ---------- Vector assembly ----------

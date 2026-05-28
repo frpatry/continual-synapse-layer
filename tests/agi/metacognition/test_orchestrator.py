@@ -114,8 +114,12 @@ def test_post_evaluate_returns_state_with_generation_alignment_field():
         gen_info=None,
     )
     assert isinstance(state, MetacognitiveState)
-    # generation_alignment is the mean of the (currently zero)
-    # alignment placeholder slots → 0.0 (not None) in post mode.
+    # generation_alignment is the mean of the 3 alignment slots.
+    # Phase 2b refactor: when ``retrieval`` is empty, ALL three
+    # alignment features fold to 0.0 (including
+    # ``alignment_novel_token_ratio``) — see the docstring on
+    # ``extract_alignment_features`` for the architectural
+    # rationale. Mean of (0, 0, 0) → 0.0.
     assert state.generation_alignment == 0.0
 
 
@@ -127,10 +131,13 @@ def test_post_evaluate_carries_full_18_features_in_raw():
         response="anything",
     )
     # Memory + query + generation + alignment names must all
-    # appear in raw_features.
+    # appear in raw_features. Phase 2b renamed both the
+    # generation slots (to match GenerationInfo field names) and
+    # the alignment slots (to describe what they actually
+    # compute).
     for name in (
         "n_facts_retrieved", "query_length_tokens",
-        "gen_perplexity", "align_semantic_similarity",
+        "mean_token_entropy", "alignment_max_cosine",
     ):
         assert name in state.raw_features
 
