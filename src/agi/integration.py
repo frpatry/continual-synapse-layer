@@ -99,7 +99,15 @@ class AGISystem:
         state = {
             "entries": [
                 {
-                    "key": entry.key.tolist(),
+                    # ``effective_key`` is always Float32, even when
+                    # the entry has been compressed to a higher
+                    # precision level — the save format thus stays
+                    # stable across the Phase 2c bis precision
+                    # ladder. Loaded entries default to L0; the
+                    # precision history is intentionally NOT
+                    # persisted (a fresh session restarts the decay
+                    # clock).
+                    "key": entry.effective_key.tolist(),
                     "facts": entry.facts,
                     "timestamp": entry.timestamp.isoformat(),
                     "access_count": entry.access_count,

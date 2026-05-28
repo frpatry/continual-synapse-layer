@@ -32,6 +32,7 @@ class _MockEntry:
     timestamp: datetime
     access_count: int = 0
     facts: dict = field(default_factory=dict)
+    precision_level: int = 0  # Phase 2c bis — default L0
 
 
 # ---------- Memory features ----------
@@ -73,6 +74,51 @@ def test_memory_features_multiple_entries_distributional():
     assert feats["similarity_variance"] > 0.0
     assert feats["max_recency_days"] >= 9.99  # 10-day-old entry
     assert feats["mean_access_count"] == 2.0  # (5+1+0)/3
+
+
+# ---------- precision_quality (Phase 2c bis) ----------
+
+def test_extract_memory_features_includes_precision_quality():
+    """The memory-feature dict must surface ``precision_quality``
+    so the metacog layer can consume it via the assembled
+    feature vector."""
+    e = _MockEntry(
+        timestamp=datetime.now(), access_count=1, precision_level=0,
+    )
+    feats = extract_memory_features([(e, 0.9)])
+    assert "precision_quality" in feats
+
+
+def test_precision_quality_value_for_L0_facts():
+    """All-L0 retrieval scores 1.0 (best possible)."""
+    e1 = _MockEntry(timestamp=datetime.now(), precision_level=0)
+    e2 = _MockEntry(timestamp=datetime.now(), precision_level=0)
+    feats = extract_memory_features([(e1, 0.9), (e2, 0.8)])
+    assert feats["precision_quality"] == 1.0
+
+
+def test_precision_quality_value_for_L3_facts():
+    """All-L3 retrieval: mean level = 3, quality = 1 - 3/5 = 0.4."""
+    e1 = _MockEntry(timestamp=datetime.now(), precision_level=3)
+    e2 = _MockEntry(timestamp=datetime.now(), precision_level=3)
+    feats = extract_memory_features([(e1, 0.9), (e2, 0.8)])
+    assert feats["precision_quality"] == pytest.approx(0.4)
+
+
+def test_precision_quality_value_for_mixed_levels():
+    """Mean of L0 and L4 is 2 → quality = 1 - 2/5 = 0.6."""
+    e1 = _MockEntry(timestamp=datetime.now(), precision_level=0)
+    e2 = _MockEntry(timestamp=datetime.now(), precision_level=4)
+    feats = extract_memory_features([(e1, 0.9), (e2, 0.8)])
+    assert feats["precision_quality"] == pytest.approx(0.6)
+
+
+def test_precision_quality_zero_when_retrieval_empty():
+    """Empty retrieval → all-zero feature dict including
+    precision_quality (consistent with every other memory
+    feature being zero in this branch)."""
+    feats = extract_memory_features([])
+    assert feats["precision_quality"] == 0.0
 
 
 # ---------- Query features ----------
@@ -332,9 +378,11 @@ def test_assemble_drops_nans_and_infs():
 # ---------- Cardinality sanity ----------
 
 def test_feature_dimensions_match_spec():
-    assert PRE_FEATURE_DIM == 9
+    # Phase 2c bis: precision_quality added to memory features
+    # (replaces reserved_0). PRE grows 9 → 10; POST stays 18.
+    assert PRE_FEATURE_DIM == 10
     assert POST_FEATURE_DIM == 18
-    assert len(MEMORY_FEATURE_NAMES) == 6
+    assert len(MEMORY_FEATURE_NAMES) == 7
     assert len(QUERY_FEATURE_NAMES) == 3
     assert len(GENERATION_FEATURE_NAMES) == 4
     assert len(ALIGNMENT_FEATURE_NAMES) == 3

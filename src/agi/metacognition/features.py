@@ -3,8 +3,10 @@
 The metacognitive layer reads a small vector of hand-engineered
 features summarising:
 
-- **Memory**  — 6 features describing the retrieval result
-  (count, similarity distribution, recency, access patterns).
+- **Memory**  — 7 features describing the retrieval result
+  (count, similarity distribution, recency, access patterns,
+  plus a precision-quality scalar derived from the precision
+  levels of the retrieved entries — see Phase 2c bis).
 - **Query**   — 3 features describing the query itself (length,
   entity presence, lexical specificity).
 - **Generation** — 4 features describing the LLM's generation
@@ -15,11 +17,11 @@ features summarising:
   to retrieved facts. Phase 2b populates these from cosine
   similarity (response vs each fact's stringified form) plus a
   novelty signal.
-- **Reserved** — 2 padding slots so the post-layer input vector
-  is a clean ``18`` rather than ``16``; reserved for features
-  added in subsequent phases.
+- **Reserved** — 1 padding slot (``reserved_1`` — Phase 2c bis
+  consumed ``reserved_0`` for ``precision_quality``). Reserved
+  for a future internal_consistency_score feature.
 
-The pre-layer reads the first ``9`` (memory + query); the
+The pre-layer reads the first ``10`` (memory + query); the
 post-layer reads all ``18``. Both feature orderings are fixed
 constants in this module so a trained network's input mapping
 stays stable across releases.
@@ -59,6 +61,7 @@ MEMORY_FEATURE_NAMES: tuple[str, ...] = (
     "similarity_variance",
     "max_recency_days",
     "mean_access_count",
+    "precision_quality",
 )
 
 QUERY_FEATURE_NAMES: tuple[str, ...] = (
@@ -80,11 +83,11 @@ ALIGNMENT_FEATURE_NAMES: tuple[str, ...] = (
     "alignment_novel_token_ratio",
 )
 
-# 2 padding slots so post-mode totals an even 18 — reserved for
-# features that will be added in a later phase (e.g. session-level
-# confidence drift). Currently zero-filled.
+# 1 padding slot (was 2 in Phase 2b — ``precision_quality``
+# consumed ``reserved_0`` in Phase 2c bis). Currently zero-filled;
+# slated to hold an internal-consistency / self-coherence signal
+# in a later phase.
 RESERVED_FEATURE_NAMES: tuple[str, ...] = (
-    "reserved_0",
     "reserved_1",
 )
 
@@ -106,7 +109,7 @@ POST_FEATURE_DIM: int = len(POST_FEATURE_ORDER)  # 18
 # ----------------------------------------------------------------------
 
 def extract_memory_features(retrieval_result: Iterable[tuple[Any, float]]) -> dict:
-    """Summarise a memory-retrieval result as 6 scalar features.
+    """Summarise a memory-retrieval result as 7 scalar features.
 
     ``retrieval_result`` is the list returned by
     :meth:`XRayEpisodicMemory.retrieve` —
@@ -121,6 +124,15 @@ def extract_memory_features(retrieval_result: Iterable[tuple[Any, float]]) -> di
     backup retrieval" signal. ``mean_access_count`` is the mean
     of the entries' ``access_count`` attribute, a proxy for
     how-often-this-memory-has-been-useful.
+
+    Phase 2c bis adds ``precision_quality`` — a ``[0, 1]`` scalar
+    summarising the precision of the retrieved entries.
+    Computation: ``1 - mean(precision_level) / 5``. All-L0
+    retrieval scores 1.0 (best); all-L5 would be 0.0 (worst, but
+    L5 entries are skipped by ``retrieve`` so this is degenerate
+    in practice). Entries without a ``precision_level`` attribute
+    are treated as L0 — keeps the function dual-compatible with
+    mocks that don't include the field.
     """
     items = list(retrieval_result)
     if not items:
@@ -130,6 +142,7 @@ def extract_memory_features(retrieval_result: Iterable[tuple[Any, float]]) -> di
     now = datetime.now()
     ages_days: list[float] = []
     access_counts: list[float] = []
+    precision_levels_int: list[int] = []
     for entry, _sim in items:
         ts = getattr(entry, "timestamp", None)
         if isinstance(ts, datetime):
@@ -137,10 +150,14 @@ def extract_memory_features(retrieval_result: Iterable[tuple[Any, float]]) -> di
         else:
             ages_days.append(0.0)
         access_counts.append(float(getattr(entry, "access_count", 0)))
+        lvl = getattr(entry, "precision_level", 0)
+        precision_levels_int.append(int(lvl))
 
     sim_var = (
         statistics.pvariance(sims) if len(sims) > 1 else 0.0
     )
+    mean_level = sum(precision_levels_int) / len(precision_levels_int)
+    precision_quality = max(0.0, min(1.0, 1.0 - mean_level / 5.0))
 
     return {
         "n_facts_retrieved": float(len(items)),
@@ -149,6 +166,7 @@ def extract_memory_features(retrieval_result: Iterable[tuple[Any, float]]) -> di
         "similarity_variance": float(sim_var),
         "max_recency_days": max(ages_days),
         "mean_access_count": statistics.fmean(access_counts),
+        "precision_quality": float(precision_quality),
     }
 
 

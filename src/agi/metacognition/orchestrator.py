@@ -76,7 +76,16 @@ class MetacognitiveOrchestrator:
         Reads memory + query features only. The result tells the
         chat loop whether to bother generating at all (deferral
         avoids a wasted foundation call when memory is empty).
+
+        Phase 2c bis side-effect: if a memory instance was wired
+        in at construction time, opportunistically trigger
+        :meth:`maybe_consolidate` here. This is the natural place
+        — the orchestrator already runs once per user turn, and
+        the consolidation guards (idle / size thresholds) make
+        per-call invocation cheap when no work is due.
         """
+        if self.memory is not None and hasattr(self.memory, "maybe_consolidate"):
+            self.memory.maybe_consolidate()
         memory_feats = extract_memory_features(retrieval)
         query_feats = extract_query_features(query, foundation)
         combined = {**memory_feats, **query_feats}

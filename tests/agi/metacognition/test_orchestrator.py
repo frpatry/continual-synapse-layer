@@ -62,6 +62,62 @@ def test_constructor_accepts_optional_memory_arg():
     assert orch.memory == "sentinel"
 
 
+# ---------- maybe_consolidate hook (Phase 2c bis) ----------
+
+class _MemorySpy:
+    """Minimal stand-in: tracks ``maybe_consolidate`` calls so the
+    orchestrator-side hook can be observed without spinning up a
+    real XRayEpisodicMemory."""
+
+    def __init__(self) -> None:
+        self.calls: int = 0
+
+    def maybe_consolidate(self) -> bool:
+        self.calls += 1
+        return False
+
+
+def test_pre_evaluate_calls_maybe_consolidate_when_memory_present():
+    """If a memory is wired in, every pre_evaluate gets one
+    cheap ``maybe_consolidate`` poke before running."""
+    spy = _MemorySpy()
+    orch = MetacognitiveOrchestrator(
+        pre_layer=MetacognitiveLayer(mode="pre"),
+        post_layer=MetacognitiveLayer(mode="post"),
+        templates=ResponseTemplates(),
+        memory=spy,
+    )
+    orch.pre_evaluate("Quel est mon nom?", retrieval=[])
+    assert spy.calls == 1
+    orch.pre_evaluate("encore une question?", retrieval=[])
+    assert spy.calls == 2
+
+
+def test_pre_evaluate_does_not_crash_without_memory():
+    """The default constructor (no memory) must still be safe to
+    use — the hook is opt-in."""
+    orch = MetacognitiveOrchestrator(
+        pre_layer=MetacognitiveLayer(mode="pre"),
+        post_layer=MetacognitiveLayer(mode="post"),
+        templates=ResponseTemplates(),
+    )
+    # No exception.
+    orch.pre_evaluate("Quel est mon nom?", retrieval=[])
+
+
+def test_pre_evaluate_skips_hook_when_memory_lacks_method():
+    """A memory object without ``maybe_consolidate`` (e.g. an
+    old mock) shouldn't blow up the orchestrator — the hook
+    uses ``hasattr`` to feature-detect."""
+    orch = MetacognitiveOrchestrator(
+        pre_layer=MetacognitiveLayer(mode="pre"),
+        post_layer=MetacognitiveLayer(mode="post"),
+        templates=ResponseTemplates(),
+        memory="just-a-sentinel-string",  # no methods
+    )
+    orch.pre_evaluate("Quel est mon nom?", retrieval=[])
+
+
 # ---------- pre_evaluate ----------
 
 def test_pre_evaluate_returns_metacognitive_state():
