@@ -30,10 +30,12 @@ them explicitly:
     from agi.integration import AGISystem
 """
 
+from .conversation import ConversationManager
 from .extraction import FactExtractor
 from .memory.xray_episodic import EpisodicEntry, XRayEpisodicMemory
 
 __all__ = [
+    "ConversationManager",
     "FactExtractor",
     "XRayEpisodicMemory",
     "EpisodicEntry",

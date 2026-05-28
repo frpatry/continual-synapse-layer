@@ -157,13 +157,26 @@ class XRayEpisodicMemory:
         similarity entry wins on conflicting scalar keys
         (name/age/location). List-valued keys (preferences) are
         unioned across entries while preserving order of first
-        appearance."""
+        appearance.
+
+        ``preferences`` may arrive as a string (from the
+        LLM-driven extractor — e.g. ``"coffee"``) or as a list
+        (from the regex extractor — e.g. ``["coffee", "short
+        answers"]``). The naive ``for p in v`` loop iterates a
+        string as individual characters, which corrupted the
+        merged record in Phase 1.1's demo. Coerce a bare string
+        to a single-element list before unioning.
+        """
         merged: dict = {}
         for entry, _sim in retrieved:
             for k, v in entry.facts.items():
                 if k == "preferences":
                     existing = merged.setdefault("preferences", [])
-                    for p in v:
+                    if isinstance(v, str):
+                        v_iter: list = [v]
+                    else:
+                        v_iter = list(v)
+                    for p in v_iter:
                         if p not in existing:
                             existing.append(p)
                 elif k not in merged:

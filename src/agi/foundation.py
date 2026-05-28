@@ -1,9 +1,15 @@
 """Frozen-LLM foundation wrapper for the AGI architecture.
 
-Wraps a pretrained instruct-tuned LLM (Qwen2-0.5B-Instruct by
-default) as a *frozen* stable substrate. Phase 1.0 does not
-update any foundation parameters — the foundation's job is to
-provide:
+Wraps a pretrained instruct-tuned LLM (Qwen2.5-1.5B-Instruct by
+default) as a *frozen* stable substrate. Phase 1.0 used the
+smaller Qwen2-0.5B-Instruct; Phase 1.2 upgraded to Qwen2.5-1.5B
+after the Phase 1.1 demo showed Qwen-0.5B couldn't reliably
+follow the JSON-only extraction instruction (it confabulated a
+full fact schema on every input). Qwen2.5-1.5B is large enough
+to follow few-shot extraction prompts cleanly while still fitting
+in fp16 on a T4/L4 (the model is ~3 GB on disk, ~1.5 GB on GPU).
+Override with ``model_name=...`` to revert to 0.5B for
+comparison runs. The foundation's job is to provide:
 
 1. **Stable key vectors** via mean-pooled last-hidden-state.
    Used to index :class:`XRayEpisodicMemory`. Stable because
@@ -46,7 +52,7 @@ class FrozenFoundation:
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2-0.5B-Instruct",
+        model_name: str = "Qwen/Qwen2.5-1.5B-Instruct",
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> None:

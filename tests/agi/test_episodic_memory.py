@@ -92,6 +92,67 @@ def test_merge_facts_higher_sim_wins_on_conflict():
     assert merged["name"] == "Marie"
 
 
+def test_merge_preferences_handles_str_or_list():
+    """``preferences`` may arrive as a ``str`` (LLM extractor) or a
+    ``list[str]`` (regex extractor). The merge must treat both as
+    single units rather than iterating characters of the string.
+
+    This guards against the Phase 1.1 bug where the demo's
+    on-disk record showed
+    ``preferences: ['T', 'e', 'c', 'h', 'n', 'o', 'l', ...]``
+    instead of ``['Technology']`` — the merge loop ate the
+    string letter by letter.
+    """
+    now = __import__("datetime").datetime.now()
+    # LLM-style: one entry's prefs as a string, another's as a string.
+    e_llm_a = EpisodicEntry(
+        key=torch.zeros(4),
+        facts={"preferences": "coffee in the morning"},
+        timestamp=now,
+    )
+    e_llm_b = EpisodicEntry(
+        key=torch.zeros(4),
+        facts={"preferences": "short answers"},
+        timestamp=now,
+    )
+    merged = XRayEpisodicMemory(key_dim=4).merge_facts(
+        [(e_llm_a, 0.95), (e_llm_b, 0.90)]
+    )
+    assert merged["preferences"] == ["coffee in the morning", "short answers"]
+
+    # Regex-style: both entries with lists.
+    e_rx_a = EpisodicEntry(
+        key=torch.zeros(4),
+        facts={"preferences": ["coffee", "tea"]},
+        timestamp=now,
+    )
+    e_rx_b = EpisodicEntry(
+        key=torch.zeros(4),
+        facts={"preferences": ["short answers", "coffee"]},
+        timestamp=now,
+    )
+    merged = XRayEpisodicMemory(key_dim=4).merge_facts(
+        [(e_rx_a, 0.95), (e_rx_b, 0.90)]
+    )
+    assert merged["preferences"] == ["coffee", "tea", "short answers"]
+
+    # Mixed: one entry str, one list — should still concatenate cleanly.
+    e_mix_str = EpisodicEntry(
+        key=torch.zeros(4),
+        facts={"preferences": "coffee"},
+        timestamp=now,
+    )
+    e_mix_list = EpisodicEntry(
+        key=torch.zeros(4),
+        facts={"preferences": ["tea"]},
+        timestamp=now,
+    )
+    merged = XRayEpisodicMemory(key_dim=4).merge_facts(
+        [(e_mix_str, 0.95), (e_mix_list, 0.90)]
+    )
+    assert merged["preferences"] == ["coffee", "tea"]
+
+
 def test_merge_facts_unions_preferences():
     """Preference lists across entries should union (preserving
     first-appearance order), not overwrite."""
