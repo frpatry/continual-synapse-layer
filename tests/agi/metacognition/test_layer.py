@@ -150,27 +150,75 @@ def test_predict_with_zeros_returns_valid_state_at_random_init():
 
 @pytest.mark.xfail(
     reason=(
-        "Random-init network has no reason to pick admit_ignorance "
-        "for zero input — this becomes meaningful only after the "
-        "Phase 2b training pass."
+        "OBSOLETED in Phase 2d — random-init network can't be "
+        "expected to pick admit_ignorance. The trained-checkpoint "
+        "version of this assertion is now "
+        "``test_trained_pre_layer_predicts_unknown_for_empty_memory_features`` "
+        "below. Kept as xfail for archaeological reference."
     ),
     strict=False,
 )
 def test_predict_zeros_tends_toward_admit_ignorance_after_training():
-    """Heuristic: an empty-memory input should be classified as
-    ``unknown`` (→ admit_ignorance). Marked xfail because the
-    random-init layer hasn't learned this yet — flips to a real
-    assertion in Phase 2b."""
+    """Heuristic — random-init layer can't satisfy this. The trained
+    version is below as a strict assert."""
     torch.manual_seed(0)
     layer = MetacognitiveLayer(mode="pre")
     hits = 0
     trials = 16
     for seed in range(trials):
         torch.manual_seed(seed)
-        # Re-init each iteration to sample over the random-init
-        # distribution, not a single fixed network.
         layer = MetacognitiveLayer(mode="pre")
         state = layer.predict(torch.zeros(PRE_FEATURE_DIM))
         if state.recommended_action == "admit_ignorance":
             hits += 1
     assert hits > trials // 2
+
+
+# ---------- Phase 2d: strict assertion against the trained checkpoint ----------
+
+from pathlib import Path  # noqa: E402
+
+_PRE_CKPT = (
+    Path(__file__).resolve().parents[3]
+    / "data" / "metacog" / "checkpoints" / "pre_layer.pt"
+)
+
+
+@pytest.mark.skipif(
+    not _PRE_CKPT.exists(),
+    reason=(
+        f"Trained PRE checkpoint not present at {_PRE_CKPT}; run "
+        "scripts/train_metacog.py to produce it."
+    ),
+)
+def test_trained_pre_layer_predicts_unknown_for_empty_memory_features():
+    """Phase 2d strict assertion (replaces the xfail above).
+
+    Empty-memory features — n_facts=0, all similarities=0,
+    precision_quality=0, with a plausible non-degenerate query —
+    must classify as ``unknown`` and recommend
+    ``admit_ignorance``. The committed PRE checkpoint trained on
+    Phase 2c synthetic data should clear this trivially.
+    """
+    from agi.metacognition.training import load_checkpoint
+    model = load_checkpoint(_PRE_CKPT, mode="pre")
+    empty_memory_with_query = torch.tensor(
+        [
+            0.0,   # n_facts_retrieved
+            0.0,   # max_similarity
+            0.0,   # mean_similarity
+            0.0,   # similarity_variance
+            0.0,   # max_recency_days
+            0.0,   # mean_access_count
+            0.0,   # precision_quality
+            10.0,  # query_length_tokens (realistic)
+            1.0,   # has_named_entity
+            0.5,   # query_specificity
+        ]
+    )
+    state = model.predict(empty_memory_with_query)
+    assert state.epistemic_status == "unknown", (
+        f"expected unknown, got {state.epistemic_status} "
+        f"(confidence={state.confidence:.3f})"
+    )
+    assert state.recommended_action == "admit_ignorance"

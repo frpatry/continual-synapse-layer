@@ -1,0 +1,59 @@
+{
+  "pre": {
+    "config": {
+      "mode": "pre",
+      "epochs": 30,
+      "batch_size": 128,
+      "learning_rate": 0.001,
+      "weight_decay": 1e-05,
+      "confidence_loss_weight": 0.2,
+      "early_stopping_patience": 5,
+      "lr_scheduler_patience": 3,
+      "lr_scheduler_factor": 0.5,
+      "seed": 42
+    },
+    "best_epoch": 11,
+    "best_val_accuracy": 1.0,
+    "best_per_class_f1": {
+      "known": 0.9999999949950049,
+      "unknown": 0.9999999949950076,
+      "uncertain": 0.9999999949949876
+    },
+    "best_calibration_error": 0.0024020116031169517,
+    "final_train_loss": 0.004700903642612199,
+    "final_val_loss": 0.0006122878203944613,
+    "epochs_trained": 17,
+    "wall_seconds": 4.398703542072326
+  },
+  "post": {
+    "config": {
+      "mode": "post",
+      "epochs": 30,
+      "batch_size": 128,
+      "learning_rate": 0.001,
+      "weight_decay": 1e-05,
+      "confidence_loss_weight": 0.2,
+      "early_stopping_patience": 5,
+      "lr_scheduler_patience": 3,
+      "lr_scheduler_factor": 0.5,
+      "seed": 42
+    },
+    "best_epoch": 15,
+    "best_val_accuracy": 0.997625,
+    "best_per_class_f1": {
+      "known": 0.99999999499501,
+      "unknown": 0.995284184620314,
+      "uncertain": 0.9999999949948322,
+      "hallucinated": 0.9953579231652189
+    },
+    "best_calibration_error": 0.0010049302503466473,
+    "final_train_loss": 0.006452376652334351,
+    "final_val_loss": 0.007373695570509881,
+    "epochs_trained": 21,
+    "wall_seconds": 7.379885957809165
+  },
+  "_meta": {
+    "loss_function_version": "phase_2d.1_bce_on_correctness",
+    "notes": "Confidence head trained on P(correct) via BCE; TrainingExample.confidence (synthetic) is ignored during training."
+  }
+}
