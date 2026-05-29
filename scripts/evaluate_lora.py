@@ -56,14 +56,26 @@ def _build_memory(foundation, facts: list[dict]) -> XRayEpisodicMemory:
 
 
 def _build_prompt(query: str, retrieval) -> str:
-    """Raw prompt — no admission scaffolding. Mirrors what the
-    LoRA student saw during training."""
+    """Qwen chat template — mirrors what the LoRA student saw
+    during training (the teacher pipeline switched to chat
+    template in commit 547083e). Naked prompts make Qwen-Instruct
+    degenerate into repetitive output."""
     if not retrieval:
-        return f"Question: {query}\n\nRéponse:"
-    facts_str = "\n".join(
-        f"- {serialize_facts(entry.facts)}" for entry, _sim in retrieval
+        sys = "You are a helpful assistant. Answer concisely."
+    else:
+        facts_str = "\n".join(
+            f"- {serialize_facts(entry.facts)}" for entry, _sim in retrieval
+        )
+        sys = (
+            "You have the following information about the user:\n"
+            f"{facts_str}\n"
+            "Use this information naturally when relevant."
+        )
+    return (
+        f"<|im_start|>system\n{sys}\n<|im_end|>\n"
+        f"<|im_start|>user\n{query}\n<|im_end|>\n"
+        "<|im_start|>assistant\n"
     )
-    return f"Contexte connu:\n{facts_str}\n\nQuestion: {query}\n\nRéponse:"
 
 
 def _evaluate_one(
