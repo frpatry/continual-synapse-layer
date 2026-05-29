@@ -230,7 +230,27 @@ class TeacherPipeline:
         )
         response_text = gen_info.response_text
 
-        # 5. Post-evaluate safety check.
+        # 5. Post-evaluate — kept ONLY as telemetry (epistemic
+        # status + confidence flow into TeacherOutput for
+        # downstream debugging). We deliberately do NOT use POST
+        # as an override gate for distillation data:
+        #
+        #   - POST was trained on synthetic distributions; on
+        #     real Qwen-1.5B outputs through the teacher's
+        #     ``Contexte connu:`` prompt format (no chat
+        #     template), POST classifies ~100% of cases as
+        #     hallucinated, producing a monoculture training
+        #     set that just teaches the student to always defer.
+        #   - For SFT distillation, we WANT the student to
+        #     learn Qwen's natural behaviour conditioned on
+        #     (query, facts). Hallucinations in training data
+        #     are fine — the student would behave like Qwen
+        #     either way, since it can't detect its own
+        #     hallucinations at inference without the metacog
+        #     scaffolding.
+        #   - POST stays valuable at INFERENCE time (real safety
+        #     gate after the student generates), just not as a
+        #     filter on the SFT training data itself.
         post_state = self.orchestrator.post_evaluate(
             query=query,
             retrieval=retrieval,
@@ -239,21 +259,7 @@ class TeacherPipeline:
             foundation=self.foundation,
         )
 
-        # 6. Override if post-eval detected hallucination.
-        if post_state.epistemic_status == "hallucinated":
-            response_text = self.templates.retrieve(self.template_key)
-            return TeacherOutput(
-                query=query,
-                facts_in_context=facts,
-                response=response_text,
-                epistemic_status="hallucinated",
-                action_taken="admit_ignorance_override",
-                used_template=True,
-                metacog_confidence=float(post_state.confidence),
-            )
-
         # Pre-eval picked the posture (answer vs answer_with_caveat).
-        # POST didn't flag hallucination, so we keep what Qwen produced.
         action = (
             pre_state.recommended_action
             if pre_state.recommended_action in ("answer", "answer_with_caveat")

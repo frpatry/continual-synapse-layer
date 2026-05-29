@@ -145,25 +145,31 @@ def test_teacher_uses_foundation_for_known_branch():
     assert "François" in foundation.last_prompt  # facts injected
 
 
-def test_teacher_overrides_on_post_hallucination():
-    """pre_evaluate → answer, foundation generates, post_evaluate
-    classifies as hallucinated → teacher overrides with the
-    template."""
+def test_teacher_does_not_override_on_post_hallucination():
+    """Phase 2e (revised again): POST hallucination is recorded
+    as telemetry on the TeacherOutput but does NOT override the
+    response. The earlier override behaviour caused a 100 %
+    monoculture training set (POST trained on synthetic data
+    flagged 100 % of real Qwen outputs on the simpler
+    ``Contexte connu`` prompt as hallucinated). POST stays
+    useful at inference time, just not as a distillation-data
+    filter."""
     foundation = _MockFoundation(scripted_response="I made this up")
     orch = _build_orchestrator()
     _pin_action(orch.pre_layer, status_idx=0)   # known → call foundation
-    _pin_action(orch.post_layer, status_idx=3)  # hallucinated → override
+    _pin_action(orch.post_layer, status_idx=3)  # hallucinated (telemetry only)
     teacher = TeacherPipeline(foundation, orch, ResponseTemplates())
 
     memory = XRayEpisodicMemory(key_dim=16, retrieval_threshold=-1.0)
-    key = foundation.get_key("x")
-    memory.add_entry(key, {"x": "y"})
+    memory.add_entry(foundation.get_key("x"), {"x": "y"})
 
     out = teacher.respond("anything", memory)
-    assert out.used_template is True
-    assert out.action_taken == "admit_ignorance_override"
-    assert out.response != "I made this up"
+    # Response is preserved despite POST flagging it as hallucinated.
+    assert out.used_template is False
+    assert out.response == "I made this up"
+    # Telemetry still reports what POST thought.
     assert out.epistemic_status == "hallucinated"
+    assert out.action_taken != "admit_ignorance_override"
 
 
 def test_teacher_caveated_branch_uses_caveat_prompt():
