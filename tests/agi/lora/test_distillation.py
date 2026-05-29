@@ -81,12 +81,12 @@ def _build_orchestrator(memory_obj=None) -> MetacognitiveOrchestrator:
 
 # ---------- Teacher pipeline ----------
 
-def test_teacher_returns_template_for_admit_ignorance_branch():
-    """When pre_evaluate fires admit_ignorance, teacher uses the
-    template and NEVER calls the foundation."""
+def test_teacher_defers_on_empty_memory():
+    """Phase 2e (revised): the teacher defers immediately when
+    retrieval is empty — bypasses metacog pre_evaluate entirely
+    on this path. The foundation is NOT called."""
     foundation = _MockFoundation(scripted_response="should-not-be-used")
     orch = _build_orchestrator()
-    _pin_action(orch.pre_layer, status_idx=2)  # unknown → admit_ignorance
     teacher = TeacherPipeline(foundation, orch, ResponseTemplates())
 
     out = teacher.respond("Quel est mon code postal?", memory=None)
@@ -96,6 +96,32 @@ def test_teacher_returns_template_for_admit_ignorance_branch():
     assert "should-not-be-used" not in out.response
     # Foundation was not called for generation.
     assert foundation.last_prompt is None
+
+
+def test_teacher_does_not_defer_on_unknown_pre_when_memory_has_facts():
+    """Phase 2e (revised): even if PRE says ``unknown`` /
+    ``admit_ignorance``, the teacher STILL generates via Qwen
+    when memory has facts (the previous behaviour caused 100% of
+    training rows to be templates because PRE's real-Qwen recall
+    on ``known`` is only 0.24). PRE's decision now only picks the
+    posture (answer vs answer_with_caveat) on the generate path,
+    not whether to defer."""
+    foundation = _MockFoundation(scripted_response="Vous habitez à Lyon.")
+    orch = _build_orchestrator()
+    # Pin PRE to ``unknown`` (status_idx=2) — would previously have
+    # caused immediate template defer; now the teacher must still
+    # generate because memory has facts.
+    _pin_action(orch.pre_layer, status_idx=2)
+    _pin_action(orch.post_layer, status_idx=0)  # known → keep
+    teacher = TeacherPipeline(foundation, orch, ResponseTemplates())
+
+    memory = XRayEpisodicMemory(key_dim=16, retrieval_threshold=-1.0)
+    memory.add_entry(foundation.get_key("city=Lyon"), {"city": "Lyon"})
+
+    out = teacher.respond("Où je vis?", memory)
+    assert out.used_template is False
+    assert out.response == "Vous habitez à Lyon."
+    assert foundation.last_prompt is not None
 
 
 def test_teacher_uses_foundation_for_known_branch():

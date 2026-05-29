@@ -148,20 +148,50 @@ class TeacherPipeline:
         template_key: str = "ignorance_polite_fr",
         max_new_tokens: int = 96,
         temperature: float = 0.0,
+        defer_on_empty_memory: bool = True,
     ) -> None:
+        """``defer_on_empty_memory``: when ``True`` (default), the
+        teacher returns the template immediately when ``retrieval``
+        is empty — no foundation call. When ``False`` it still
+        tries to generate (the post-eval will usually flag it as
+        hallucinated and override anyway, but for some bf16-stable
+        question types Qwen may produce a clean refusal worth
+        learning from). Distinct from the metacog ``pre_evaluate``
+        decision, which was previously the *primary* defer gate
+        but caused 100 % of training rows to be templates on real
+        Qwen because PRE's recall on ``known`` is only ~0.24."""
         self.foundation = foundation
         self.orchestrator = orchestrator
         self.templates = templates
         self.template_key = template_key
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
+        self.defer_on_empty_memory = defer_on_empty_memory
 
     def respond(
         self,
         query: str,
         memory: Optional["XRayEpisodicMemory"] = None,
     ) -> TeacherOutput:
-        """Run one query through the protected pipeline."""
+        """Run one query through the protected pipeline.
+
+        Phase 2e (revised): the teacher no longer defers on
+        :meth:`MetacognitiveOrchestrator.pre_evaluate`. Instead:
+
+        - Empty memory → defer immediately to template (cheap,
+          and PRE would say admit_ignorance anyway with very
+          high precision on this case).
+        - Non-empty memory → always generate via Qwen, then run
+          ``post_evaluate``; override with template only if the
+          POST layer flags ``hallucinated``.
+
+        Rationale: PRE's real-Qwen recall on the ``known`` cohort
+        was 0.24 in Phase 2h.1 — using PRE as the primary defer
+        gate caused 100 % of training rows to become templates,
+        which would teach the student "always defer". Bypassing
+        PRE on the answer path restores the diversity needed for
+        a useful distillation dataset.
+        """
         # 1. Retrieve from memory (or empty if no memory).
         retrieval = (
             memory.retrieve(self.foundation.get_key(query), top_k=5)
@@ -170,23 +200,24 @@ class TeacherPipeline:
         )
         facts: List[dict] = [entry.facts for entry, _sim in retrieval]
 
-        # 2. Pre-evaluate.
-        pre_state = self.orchestrator.pre_evaluate(query, retrieval)
-
-        # 3. Pre-deferral path: use template instead of calling Qwen.
-        if pre_state.recommended_action == "admit_ignorance":
+        # 2. Empty-memory short-circuit (cheap defer).
+        if self.defer_on_empty_memory and not retrieval:
             response_text = self.templates.retrieve(self.template_key)
             return TeacherOutput(
                 query=query,
                 facts_in_context=facts,
                 response=response_text,
-                epistemic_status=pre_state.epistemic_status,
+                epistemic_status="unknown",
                 action_taken="admit_ignorance",
                 used_template=True,
-                metacog_confidence=float(pre_state.confidence),
+                metacog_confidence=1.0,
             )
 
-        # 4. Answer path: generate via Qwen with facts in context.
+        # 3. Non-empty memory: pre-eval gives us posture only
+        # (answer vs answer_with_caveat) but not deferral.
+        pre_state = self.orchestrator.pre_evaluate(query, retrieval)
+
+        # 4. Generate via Qwen with facts in context.
         if pre_state.recommended_action == "answer_with_caveat":
             prompt = build_caveated_prompt(query, retrieval)
         else:
@@ -221,12 +252,19 @@ class TeacherPipeline:
                 metacog_confidence=float(post_state.confidence),
             )
 
+        # Pre-eval picked the posture (answer vs answer_with_caveat).
+        # POST didn't flag hallucination, so we keep what Qwen produced.
+        action = (
+            pre_state.recommended_action
+            if pre_state.recommended_action in ("answer", "answer_with_caveat")
+            else "answer"
+        )
         return TeacherOutput(
             query=query,
             facts_in_context=facts,
             response=response_text,
             epistemic_status=post_state.epistemic_status,
-            action_taken=pre_state.recommended_action,
+            action_taken=action,
             used_template=False,
             metacog_confidence=float(post_state.confidence),
         )

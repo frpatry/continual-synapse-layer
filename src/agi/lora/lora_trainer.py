@@ -192,20 +192,24 @@ def setup_lora_model(config: LoRAConfig):
     # Phase 2e: fp32 on CUDA (was fp16). Qwen-1.5B LoRA on
     # T4 (Turing — no bf16 support) with naked fp16 attention
     # in eager mode reliably overflows to NaN in softmax on the
-    # very first forward pass. Without autocast + GradScaler +
-    # LayerNorm-fp32 promotion (the whole HF mixed-precision
-    # song-and-dance), the cleanest fix is to just train in fp32.
-    # The model fits in T4 16 GB at fp32 (~6 GB params + ~3-4 GB
-    # activations at bs=4, seq=256). ~2× slower per step than
-    # fp16 would be — acceptable for a one-off ~30-min run.
-    # If you're on bf16-capable hardware (Ampere+), override
-    # by editing this line to torch.bfloat16 — that's stable.
-    dtype = torch.float32
+    # very first forward pass.
+    #
+    # IMPORTANT — explicit ``.to(torch.float32)`` after load:
+    # Qwen2.5-1.5B-Instruct's ``config.json`` ships
+    # ``torch_dtype="float16"``. On some transformers/peft
+    # version combinations the ``dtype=`` kwarg to
+    # ``from_pretrained`` is silently overridden by the config's
+    # own ``torch_dtype``, so the model comes back as fp16 even
+    # when we asked for fp32. The explicit cast below is
+    # belt-and-suspenders: regardless of what the loader gave
+    # us, the model + LoRA train in fp32 from here on.
     model = AutoModelForCausalLM.from_pretrained(
         config.base_model_name,
-        dtype=dtype,
+        dtype=torch.float32,
+        torch_dtype=torch.float32,  # alias for older transformers
         attn_implementation="eager",
     )
+    model = model.to(torch.float32)
 
     peft_config = LoraConfig(
         r=config.lora_rank,
