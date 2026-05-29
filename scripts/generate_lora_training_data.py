@@ -75,9 +75,23 @@ def main() -> int:
     args = parser.parse_args()
 
     t_load = time.perf_counter()
-    print("Loading Qwen2.5-1.5B foundation ...")
-    foundation = FrozenFoundation()
-    print(f"  Loaded in {time.perf_counter() - t_load:.1f}s")
+    print("Loading Qwen2.5-1.5B foundation (fp32) ...")
+    # IMPORTANT: force fp32 even on CUDA. FrozenFoundation defaults
+    # to fp16 on CUDA, but Qwen2.5-1.5B + eager attention on T4
+    # (Turing, no bf16) overflows in fp16 — produces NaN logits,
+    # softmax(NaN) → uniform, greedy decode picks the same token
+    # every step. Empirical symptom: 100% of teacher outputs become
+    # '!!!!!!!!!!!!!!!!!'. Same symptom we fixed in the LoRA trainer
+    # via model.to(fp32); the teacher needs the same treatment.
+    # ~2x slower per query (estimated 100-120 min for 1000 queries
+    # on Colab T4) but produces real Qwen text. Mac CPU is unaffected
+    # — it defaults to fp32 already.
+    import torch as _torch
+    foundation = FrozenFoundation(dtype=_torch.float32)
+    print(
+        f"  Loaded in {time.perf_counter() - t_load:.1f}s "
+        f"(device={foundation.device}, dtype={foundation.dtype})"
+    )
 
     print("Loading metacog checkpoints ...")
     pre_layer = load_checkpoint(
