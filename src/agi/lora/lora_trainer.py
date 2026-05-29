@@ -189,11 +189,18 @@ def setup_lora_model(config: LoRAConfig):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dtype = (
-        torch.float16
-        if config.device == "cuda"
-        else torch.float32
-    )
+    # Phase 2e: fp32 on CUDA (was fp16). Qwen-1.5B LoRA on
+    # T4 (Turing — no bf16 support) with naked fp16 attention
+    # in eager mode reliably overflows to NaN in softmax on the
+    # very first forward pass. Without autocast + GradScaler +
+    # LayerNorm-fp32 promotion (the whole HF mixed-precision
+    # song-and-dance), the cleanest fix is to just train in fp32.
+    # The model fits in T4 16 GB at fp32 (~6 GB params + ~3-4 GB
+    # activations at bs=4, seq=256). ~2× slower per step than
+    # fp16 would be — acceptable for a one-off ~30-min run.
+    # If you're on bf16-capable hardware (Ampere+), override
+    # by editing this line to torch.bfloat16 — that's stable.
+    dtype = torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         config.base_model_name,
         dtype=dtype,
@@ -308,6 +315,10 @@ def train_lora(
             loss = out.loss / max(config.gradient_accumulation_steps, 1)
             loss.backward()
             if (step + 1) % max(config.gradient_accumulation_steps, 1) == 0:
+                # Clip gradient norm to 1.0 — cheap insurance
+                # against any remaining numerical spikes (added
+                # alongside the Phase 2e fp32 switch).
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
