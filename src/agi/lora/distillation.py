@@ -56,19 +56,45 @@ class StudentInput:
 # Prompt builders
 # ----------------------------------------------------------------------
 
+def _facts_block(retrieval_or_facts) -> str:
+    """Render the fact bullets — works on both retrieval tuples
+    ``[(entry, sim), ...]`` and bare ``[dict, ...]`` lists."""
+    out: list[str] = []
+    for item in retrieval_or_facts:
+        if isinstance(item, tuple) and len(item) >= 1:
+            entry = item[0]
+            facts = getattr(entry, "facts", entry)
+        else:
+            facts = item
+        if isinstance(facts, dict):
+            out.append(f"- {serialize_facts(facts)}")
+    return "\n".join(out)
+
+
 def build_normal_prompt(
     query: str,
     retrieval: List[tuple],
 ) -> str:
-    """Memory-aware prompt for the answer / answer_with_caveat path."""
-    if not retrieval:
-        return f"Question: {query}\n\nRéponse:"
-    facts_str = "\n".join(
-        f"- {serialize_facts(entry.facts)}" for entry, _ in retrieval
+    """Qwen chat-template prompt for the answer path.
+
+    Uses Qwen2.5's ``<|im_start|>...<|im_end|>`` chat format
+    because Qwen-Instruct was fine-tuned on that template and
+    degenerates badly (repetitive ``!!!!`` output) on naked
+    prompts. Mirrors the Phase 2d.2 validation pipeline's
+    builder, which is the proven-working prompt format on this
+    model.
+    """
+    sys_content = (
+        "You have the following information about the user:\n"
+        + _facts_block(retrieval)
+        + "\nUse this information naturally when relevant."
+        if retrieval
+        else "You are a helpful assistant. Answer concisely."
     )
     return (
-        f"Contexte connu:\n{facts_str}\n\n"
-        f"Question: {query}\n\nRéponse:"
+        f"<|im_start|>system\n{sys_content}\n<|im_end|>\n"
+        f"<|im_start|>user\n{query}\n<|im_end|>\n"
+        f"<|im_start|>assistant\n"
     )
 
 
@@ -76,20 +102,25 @@ def build_caveated_prompt(
     query: str,
     retrieval: List[tuple],
 ) -> str:
-    """Prompt variant when the pre-layer recommends
-    ``answer_with_caveat`` — explicitly tells the model to hedge."""
-    if not retrieval:
-        return (
-            f"Question: {query}\n\n"
-            f"Réponse (avec nuance d'incertitude):"
-        )
-    facts_str = "\n".join(
-        f"- {serialize_facts(entry.facts)}" for entry, _ in retrieval
+    """Chat-template variant for the ``answer_with_caveat`` path —
+    system message instructs the model to hedge."""
+    facts_part = (
+        "\n".join([
+            "You have the following information about the user:",
+            _facts_block(retrieval),
+        ])
+        if retrieval
+        else ""
     )
+    sys_content = (
+        f"{facts_part}\n"
+        "The information is incomplete or ambiguous. "
+        "Answer if you can, but acknowledge the uncertainty."
+    ).strip()
     return (
-        f"Contexte (incertain):\n{facts_str}\n\n"
-        f"Question: {query}\n\n"
-        f"Réponse (avec nuance d'incertitude):"
+        f"<|im_start|>system\n{sys_content}\n<|im_end|>\n"
+        f"<|im_start|>user\n{query}\n<|im_end|>\n"
+        f"<|im_start|>assistant\n"
     )
 
 
@@ -97,25 +128,16 @@ def build_student_input(teacher_output: TeacherOutput) -> StudentInput:
     """Format a ``TeacherOutput`` as a ``(prompt, target)``
     distillation example.
 
-    The student sees the same input shape as the teacher does
-    on the answer path — fact bullets + query + ``Réponse:``
-    prompt — and learns to produce the teacher's response
-    autoregressively. When the teacher used a template (deferral),
-    the student still learns to produce that template text from
-    the same (query, facts) input — so at inference time it
-    learns *when to defer* implicitly.
+    Same chat-template format as the teacher's input — so the
+    student LoRA learns to produce the teacher's response
+    autoregressively from the same prompt shape. When the
+    teacher used a template (deferral), the student still
+    learns to produce that template text from the same
+    (query, facts) input → learns *when to defer* implicitly.
     """
-    facts = teacher_output.facts_in_context
-    if facts:
-        facts_str = "\n".join(
-            f"- {serialize_facts(f)}" for f in facts
-        )
-        prompt = (
-            f"Contexte connu:\n{facts_str}\n\n"
-            f"Question: {teacher_output.query}\n\nRéponse:"
-        )
-    else:
-        prompt = f"Question: {teacher_output.query}\n\nRéponse:"
+    prompt = build_normal_prompt(
+        teacher_output.query, teacher_output.facts_in_context,
+    )
     return StudentInput(
         prompt=prompt,
         target=teacher_output.response,

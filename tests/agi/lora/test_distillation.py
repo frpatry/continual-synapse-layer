@@ -187,7 +187,8 @@ def test_teacher_caveated_branch_uses_caveat_prompt():
 
     out = teacher.respond("Quel sport je pratique?", memory)
     assert out.action_taken == "answer_with_caveat"
-    assert "incertain" in (foundation.last_prompt or "").lower()
+    last = (foundation.last_prompt or "").lower()
+    assert "uncertainty" in last or "incomplete" in last
 
 
 # ---------- Prompt builders ----------
@@ -197,23 +198,31 @@ class _Entry:
     facts: dict
 
 
-def test_build_normal_prompt_with_facts():
+def test_build_normal_prompt_uses_chat_template_with_facts():
+    """Phase 2e: chat-template prompts (Qwen-Instruct degenerates
+    on naked prompts — produces repetitive `!!!!` output)."""
     prompt = build_normal_prompt(
         "Comment je m'appelle?",
         [(_Entry(facts={"name": "François"}), 0.9)],
     )
-    assert "Contexte connu:" in prompt
+    assert "<|im_start|>system" in prompt
+    assert "<|im_start|>user" in prompt
+    assert "<|im_start|>assistant" in prompt
+    assert "<|im_end|>" in prompt
     assert "François" in prompt
-    assert prompt.endswith("Réponse:")
+    assert "Comment je m'appelle?" in prompt
+    assert prompt.endswith("<|im_start|>assistant\n")
 
 
-def test_build_normal_prompt_without_facts():
+def test_build_normal_prompt_without_facts_uses_generic_system():
     prompt = build_normal_prompt("Quel est mon code postal?", [])
-    assert "Contexte" not in prompt
-    assert prompt.endswith("Réponse:")
+    assert "<|im_start|>system" in prompt
+    assert "<|im_start|>user" in prompt
+    # No "You have the following information" line in the empty case.
+    assert "information about the user" not in prompt
 
 
-def test_build_caveated_prompt_marks_uncertainty():
+def test_build_caveated_prompt_marks_uncertainty_in_system():
     prompt = build_caveated_prompt(
         "Quel sport je pratique?",
         [
@@ -221,14 +230,15 @@ def test_build_caveated_prompt_marks_uncertainty():
             (_Entry(facts={"sport": "vélo"}), 0.6),
         ],
     )
-    assert "incertain" in prompt.lower()
+    assert "<|im_start|>system" in prompt
+    assert "uncertainty" in prompt.lower() or "incomplete" in prompt.lower()
     assert "natation" in prompt
     assert "vélo" in prompt
 
 
 # ---------- build_student_input ----------
 
-def test_build_student_input_includes_facts_in_prompt():
+def test_build_student_input_includes_facts_in_chat_template():
     out = TeacherOutput(
         query="Comment je m'appelle?",
         facts_in_context=[{"name": "François"}],
@@ -240,12 +250,13 @@ def test_build_student_input_includes_facts_in_prompt():
     )
     si = build_student_input(out)
     assert isinstance(si, StudentInput)
-    assert "Contexte connu:" in si.prompt
+    assert "<|im_start|>system" in si.prompt
     assert "François" in si.prompt
+    assert si.prompt.endswith("<|im_start|>assistant\n")
     assert si.target == "Vous vous appelez François."
 
 
-def test_build_student_input_no_facts_uses_simple_prompt():
+def test_build_student_input_no_facts_still_chat_template():
     out = TeacherOutput(
         query="Quel est mon code postal?",
         facts_in_context=[],
@@ -256,5 +267,8 @@ def test_build_student_input_no_facts_uses_simple_prompt():
         metacog_confidence=0.99,
     )
     si = build_student_input(out)
-    assert "Contexte" not in si.prompt
+    # Still chat template — student must respond to the same shape
+    # at inference time whether or not memory has facts.
+    assert "<|im_start|>system" in si.prompt
+    assert "<|im_start|>user" in si.prompt
     assert si.target.startswith("Je n'ai pas")
