@@ -18,6 +18,7 @@ from agi.metacognition.features import (
     PRE_FEATURE_ORDER,
     QUERY_FEATURE_NAMES,
     assemble_feature_vector,
+    compute_verbatim_fact_match,
     extract_alignment_features,
     extract_generation_features,
     extract_memory_features,
@@ -220,16 +221,14 @@ class _StubFoundationDirected:
 
 
 def test_alignment_features_empty_facts_returns_all_zeros():
-    """Empty facts → ALL three alignment slots fold to 0.0,
-    including ``alignment_novel_token_ratio``.
+    """Empty facts → ALL four alignment slots fold to 0.0
+    (Phase 2h.1: includes ``verbatim_fact_match``).
 
-    The hallucination case ("response generated with no
-    supporting memory") is the orchestrator's job to detect via
-    ``memory_coverage == 0`` AND ``response_length_tokens > 0``,
-    NOT via a derived novelty score. Returning 0.0 across the
-    alignment slots keeps memory features and alignment features
-    architecturally orthogonal — see the module docstring on
-    ``extract_alignment_features``."""
+    Architectural rationale: see ``extract_alignment_features``
+    docstring — alignment is undefined when there's nothing to
+    align against; the "model spoke with no memory support" tell
+    is the orchestrator's to detect via memory + length, not via
+    a derived score that would conflate the two."""
     feats = extract_alignment_features(
         response="the cat sat on the mat",
         facts=[],
@@ -238,6 +237,7 @@ def test_alignment_features_empty_facts_returns_all_zeros():
     assert feats["alignment_max_cosine"] == 0.0
     assert feats["alignment_mean_cosine"] == 0.0
     assert feats["alignment_novel_token_ratio"] == 0.0
+    assert feats["verbatim_fact_match"] == 0.0
 
 
 def test_alignment_features_perfect_match_high_similarity():
@@ -326,6 +326,113 @@ def test_alignment_features_empty_response_returns_all_zeros():
     assert feats["alignment_max_cosine"] == 0.0
     assert feats["alignment_mean_cosine"] == 0.0
     assert feats["alignment_novel_token_ratio"] == 0.0
+    assert feats["verbatim_fact_match"] == 0.0
+
+
+# ---------- verbatim_fact_match (Phase 2h.1) ----------
+
+def test_compute_verbatim_fact_match_perfect_string_match():
+    """Fact value appears verbatim → score 1.0."""
+    assert compute_verbatim_fact_match(
+        "Vous habitez à Lyon.",
+        [{"city": "Lyon"}],
+    ) == 1.0
+
+
+def test_compute_verbatim_fact_match_int_value():
+    """Numeric values stringify cleanly before comparison."""
+    assert compute_verbatim_fact_match(
+        "Vous avez 32 ans. Comment puis-je vous aider?",
+        [{"age": 32}],
+    ) == 1.0
+
+
+def test_compute_verbatim_fact_match_no_match():
+    """Refusal that doesn't mention the fact value → score 0.0."""
+    assert compute_verbatim_fact_match(
+        "Je ne sais pas.",
+        [{"name": "François"}],
+    ) == 0.0
+
+
+def test_compute_verbatim_fact_match_partial_facts_ratio():
+    """Two fact values, one matches in response → 1/2 = 0.5."""
+    score = compute_verbatim_fact_match(
+        "Vous habitez à Lyon.",
+        [{"city": "Lyon"}, {"age": 32}],
+    )
+    assert score == pytest.approx(0.5)
+
+
+def test_compute_verbatim_fact_match_list_value_flattens():
+    """List-valued facts are flattened into individual values."""
+    score = compute_verbatim_fact_match(
+        "Vous parlez français et anglais.",
+        [{"languages": ["français", "anglais", "espagnol"]}],
+    )
+    # 2 of 3 listed values appear → 2/3.
+    assert score == pytest.approx(2 / 3)
+
+
+def test_compute_verbatim_fact_match_accepts_retrieval_tuples():
+    """List of (entry, sim) — entry.facts is the source."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Entry:
+        facts: dict
+
+    retrieval = [
+        (_Entry(facts={"city": "Lyon"}), 0.95),
+        (_Entry(facts={"name": "François"}), 0.80),
+    ]
+    score = compute_verbatim_fact_match(
+        "Vous habitez à Lyon et vous vous appelez François.",
+        retrieval,
+    )
+    assert score == 1.0
+
+
+def test_compute_verbatim_fact_match_empty_inputs_return_zero():
+    """Empty response or facts → 0.0 (no division)."""
+    assert compute_verbatim_fact_match("", [{"a": "b"}]) == 0.0
+    assert compute_verbatim_fact_match("hello", []) == 0.0
+    assert compute_verbatim_fact_match("", []) == 0.0
+
+
+def test_compute_verbatim_fact_match_case_insensitive():
+    """Matching is case-insensitive."""
+    assert compute_verbatim_fact_match(
+        "VOUS HABITEZ À LYON",
+        [{"city": "lyon"}],
+    ) == 1.0
+
+
+def test_compute_verbatim_fact_match_empty_value_skipped():
+    """A fact value that's empty after lowercase+strip is skipped
+    rather than counted as a free-match."""
+    # "" would match every response if not skipped.
+    assert compute_verbatim_fact_match(
+        "Hello world",
+        [{"junk": "   "}, {"name": "absent"}],
+    ) == 0.0
+
+
+def test_extract_alignment_features_includes_verbatim_key():
+    """The returned dict has exactly 4 keys including
+    ``verbatim_fact_match``."""
+    feats = extract_alignment_features(
+        response="Vous avez 32 ans.",
+        facts=[{"age": 32}],
+        foundation=_StubFoundationDirected(),
+    )
+    assert set(feats.keys()) == {
+        "alignment_max_cosine",
+        "alignment_mean_cosine",
+        "alignment_novel_token_ratio",
+        "verbatim_fact_match",
+    }
+    assert feats["verbatim_fact_match"] == 1.0
 
 
 # ---------- Vector assembly ----------
@@ -385,4 +492,4 @@ def test_feature_dimensions_match_spec():
     assert len(MEMORY_FEATURE_NAMES) == 7
     assert len(QUERY_FEATURE_NAMES) == 3
     assert len(GENERATION_FEATURE_NAMES) == 4
-    assert len(ALIGNMENT_FEATURE_NAMES) == 3
+    assert len(ALIGNMENT_FEATURE_NAMES) == 4  # Phase 2h.1 added verbatim_fact_match

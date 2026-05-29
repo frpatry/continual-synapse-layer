@@ -456,6 +456,10 @@ class SyntheticDataGenerator:
         #    Qwen's filler dilutes the embedding match.
         #  - alignment_novel_token_ratio: ~0.06 → ~0.80 (real 0.81).
         #    Qwen's verbose answers introduce many novel tokens.
+        # Phase 2h.1:
+        #  - verbatim_fact_match: Beta(8,2) → ~0.80. Qwen, even when
+        #    wrapping the answer in filler, almost always uses the
+        #    exact fact value verbatim ("Vous avez 32 ans …").
         max_c = float(self.rng.beta(5, 5) * 0.25 + 0.40)
         mean_c = max_c * float(self.rng.uniform(0.95, 1.0))
         return {
@@ -464,6 +468,7 @@ class SyntheticDataGenerator:
             "alignment_novel_token_ratio": float(
                 self.rng.beta(7, 3) * 0.2 + 0.70
             ),
+            "verbatim_fact_match": float(self.rng.beta(8, 2)),
         }
 
     def _alignment_zero(self) -> dict:
@@ -471,6 +476,7 @@ class SyntheticDataGenerator:
             "alignment_max_cosine": 0.0,
             "alignment_mean_cosine": 0.0,
             "alignment_novel_token_ratio": 0.0,
+            "verbatim_fact_match": 0.0,
         }
 
     def _alignment_unknown_with_facts(self) -> dict:
@@ -482,6 +488,10 @@ class SyntheticDataGenerator:
         Real (n=5 cases with facts):
           - alignment_max/mean_cosine ≈ 0.28 (with substantial std)
           - alignment_novel_token_ratio ≈ 0.59
+
+        Phase 2h.1:
+          - verbatim_fact_match: Beta(2,8)*0.3 → ~0.06. The refusal
+            text rarely quotes the irrelevant facts back at the user.
         """
         max_c = float(self.rng.beta(4, 7) * 0.4 + 0.10)  # ~0.20-0.50
         mean_c = max_c * float(self.rng.uniform(0.90, 1.0))
@@ -491,12 +501,17 @@ class SyntheticDataGenerator:
             "alignment_novel_token_ratio": float(
                 self.rng.beta(5, 4) * 0.4 + 0.40
             ),
+            "verbatim_fact_match": float(self.rng.beta(2, 8) * 0.3),
         }
 
     def _alignment_uncertain(self) -> dict:
         # Phase 2h recalibration vs v1:
         #  - alignment_novel_token_ratio: ~0.17 → ~0.92 (real 0.93).
         #  - alignment_max_cosine: kept around 0.40-0.60 (real 0.51).
+        # Phase 2h.1:
+        #  - verbatim_fact_match: Beta(4,4)*0.6 → ~0.30. With
+        #    multiple competing facts, the response may quote one
+        #    of them — but rarely all. Wide spread captures that.
         max_c = float(self.rng.beta(5, 5) * 0.3 + 0.35)  # ~0.35-0.65
         mean_c = max_c * float(self.rng.uniform(0.92, 1.0))
         return {
@@ -505,6 +520,7 @@ class SyntheticDataGenerator:
             "alignment_novel_token_ratio": float(
                 self.rng.beta(9, 2) * 0.15 + 0.82
             ),
+            "verbatim_fact_match": float(self.rng.beta(4, 4) * 0.6),
         }
 
     def _alignment_hallucinated(self, has_facts: bool) -> dict:
@@ -523,6 +539,13 @@ class SyntheticDataGenerator:
             # behaviour confirmed (80% of real hallucinated cases).
             return self._alignment_zero()
         # With facts — pick the mode.
+        # Phase 2h.1:
+        #  - verbatim_fact_match: very low in both modes (Beta(2,8)*0.2,
+        #    mean ~0.04). Both refusals and confabulations rarely echo
+        #    the actual fact value back at the user. This is the
+        #    diagnostic signal separating hallucination from "correct
+        #    answer + filler" (KNOWN class, where verbatim ~0.8).
+        verbatim = float(self.rng.beta(2, 8) * 0.2)
         is_refusal = self.rng.random() < 0.55
         if is_refusal:
             return {
@@ -531,6 +554,7 @@ class SyntheticDataGenerator:
                 "alignment_novel_token_ratio": float(
                     self.rng.beta(2, 8) * 0.3
                 ),
+                "verbatim_fact_match": verbatim,
             }
         return {
             "alignment_max_cosine": float(self.rng.beta(2, 6) * 0.4),
@@ -538,6 +562,7 @@ class SyntheticDataGenerator:
             "alignment_novel_token_ratio": float(
                 self.rng.beta(7, 3) * 0.3 + 0.55
             ),
+            "verbatim_fact_match": verbatim,
         }
 
     # ---------- combine + assemble ----------

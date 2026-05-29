@@ -17,16 +17,17 @@ features summarising:
   to retrieved facts. Phase 2b populates these from cosine
   similarity (response vs each fact's stringified form) plus a
   novelty signal.
-- **Reserved** — 1 padding slot (``reserved_1`` — Phase 2c bis
-  consumed ``reserved_0`` for ``precision_quality``). Reserved
-  for a future internal_consistency_score feature.
+- **Reserved** — none (Phase 2c bis consumed ``reserved_0`` for
+  ``precision_quality``; Phase 2h.1 consumed ``reserved_1`` for
+  ``verbatim_fact_match``, which moved into the alignment cluster
+  for semantic coherence).
 
 The pre-layer reads the first ``10`` (memory + query); the
 post-layer reads all ``18``. Both feature orderings are fixed
 constants in this module so a trained network's input mapping
 stays stable across releases.
 
-The three ``ALIGNMENT_FEATURE_NAMES`` slot labels describe
+The four ``ALIGNMENT_FEATURE_NAMES`` slot labels describe
 exactly what they compute:
 
     alignment_max_cosine         ← max  cosine(response, fact)
@@ -34,6 +35,13 @@ exactly what they compute:
     alignment_novel_token_ratio  ← novel-token ratio
                                    (response tokens absent
                                     from any fact)
+    verbatim_fact_match          ← fraction of fact values that
+                                   appear verbatim in the
+                                   response — added in Phase 2h.1
+                                   to separate "correct answer
+                                   wrapped in filler" (high
+                                   verbatim) from "hedged or
+                                   hallucinated" (low verbatim)
 """
 
 from __future__ import annotations
@@ -81,15 +89,12 @@ ALIGNMENT_FEATURE_NAMES: tuple[str, ...] = (
     "alignment_max_cosine",
     "alignment_mean_cosine",
     "alignment_novel_token_ratio",
+    "verbatim_fact_match",
 )
 
-# 1 padding slot (was 2 in Phase 2b — ``precision_quality``
-# consumed ``reserved_0`` in Phase 2c bis). Currently zero-filled;
-# slated to hold an internal-consistency / self-coherence signal
-# in a later phase.
-RESERVED_FEATURE_NAMES: tuple[str, ...] = (
-    "reserved_1",
-)
+# Reserved padding (Phase 2c bis used reserved_0, Phase 2h.1 used
+# reserved_1). The 18-slot post-feature dim is now fully consumed.
+RESERVED_FEATURE_NAMES: tuple[str, ...] = ()
 
 PRE_FEATURE_ORDER: tuple[str, ...] = MEMORY_FEATURE_NAMES + QUERY_FEATURE_NAMES
 POST_FEATURE_ORDER: tuple[str, ...] = (
@@ -265,9 +270,10 @@ def extract_alignment_features(
     foundation: Optional["FrozenFoundation"] = None,
 ) -> dict:
     """Compute response-vs-facts alignment from foundation
-    embeddings + a lexical novelty signal.
+    embeddings + a lexical novelty signal + a verbatim-match
+    signal.
 
-    Returns the three ``ALIGNMENT_FEATURE_NAMES`` slots:
+    Returns the four ``ALIGNMENT_FEATURE_NAMES`` slots:
 
     - ``alignment_max_cosine``  — best cosine similarity between
       the response embedding and each fact's stringified
@@ -277,11 +283,15 @@ def extract_alignment_features(
     - ``alignment_novel_token_ratio`` — fraction of response
       tokens that don't appear (case-insensitively) in any
       fact.
+    - ``verbatim_fact_match`` — fraction of fact *values* that
+      appear verbatim in the response (Phase 2h.1; separates
+      "correct answer + filler" from "hedged / hallucinated").
 
     **Empty-facts behaviour** (architectural decision): when
-    ``facts`` is empty / ``None``, **all three** alignment
-    features fold to ``0.0`` — including the novel-token ratio,
-    even though the lexical formula would otherwise give 1.0.
+    ``facts`` is empty / ``None``, **all four** alignment
+    features fold to ``0.0`` — including the novel-token ratio
+    and the verbatim score, even though the lexical formulae
+    would otherwise give 1.0 / N/A respectively.
 
     Rationale: alignment features measure "does the generated
     response stay consistent with the information we retrieved".
@@ -298,8 +308,8 @@ def extract_alignment_features(
 
     Missing ``foundation`` keeps the same shape but the cosine
     pair stay at ``0.0`` (we can't embed without it) — the
-    lexical novelty signal still flows because it doesn't need
-    embeddings.
+    lexical novelty signal and verbatim score still flow because
+    they don't need embeddings.
 
     ``facts`` is intentionally lenient: it may be a list of
     fact dicts (the spec's primary type), the orchestrator's
@@ -316,7 +326,10 @@ def extract_alignment_features(
             "alignment_max_cosine": 0.0,
             "alignment_mean_cosine": 0.0,
             "alignment_novel_token_ratio": 0.0,
+            "verbatim_fact_match": 0.0,
         }
+
+    verbatim = compute_verbatim_fact_match(response, facts)
 
     if foundation is None:
         return {
@@ -325,6 +338,7 @@ def extract_alignment_features(
             "alignment_novel_token_ratio": _novel_token_ratio(
                 response, normalised_facts,
             ),
+            "verbatim_fact_match": verbatim,
         }
 
     response_emb = foundation.get_key(response).unsqueeze(0)
@@ -339,7 +353,67 @@ def extract_alignment_features(
         "alignment_max_cosine": float(max(alignments)),
         "alignment_mean_cosine": float(sum(alignments) / len(alignments)),
         "alignment_novel_token_ratio": novel_ratio,
+        "verbatim_fact_match": verbatim,
     }
+
+
+def compute_verbatim_fact_match(response: str, facts: Any) -> float:
+    """Fraction of fact *values* that appear verbatim
+    (case-insensitively) in ``response``.
+
+    The motivating problem: Qwen wraps correct answers in
+    conversational filler ("Vous avez 32 ans. Comment puis-je
+    vous aider aujourd'hui?"). The cosine + novelty signals score
+    this as "weakly aligned" because most response tokens aren't
+    in the fact dict, even though the answer is fully right. The
+    verbatim score is high (1.0 — "32" appears) for this case
+    but low (~0) for hedged answers ("Vous avez environ trente
+    ans peut-être"), giving the metacog a clean separating
+    signal.
+
+    Accepts the same ``facts`` shapes as
+    :func:`extract_alignment_features` — list of dicts, list of
+    ``(entry, sim)`` tuples, or any iterable. Values inside the
+    dicts may themselves be scalars or lists; lists are flattened
+    into individual value matches.
+
+    Edge cases:
+      * Empty ``response`` or ``facts`` → ``0.0``.
+      * Fact value that is the empty string after lowercasing →
+        skipped (a no-op match would otherwise give ``1.0`` for
+        free).
+      * Numeric values are stringified before comparison so
+        ``{"age": 32}`` matches a response containing ``"32"``.
+    """
+    if not facts or not response or not response.strip():
+        return 0.0
+    response_lower = response.lower()
+
+    fact_values: List[str] = []
+    for item in facts:
+        payload = item
+        # (entry, sim) tuple from XRayEpisodicMemory.retrieve().
+        if isinstance(item, tuple) and len(item) >= 1:
+            payload = item[0]
+            if hasattr(payload, "facts"):
+                payload = payload.facts
+        if isinstance(payload, dict):
+            for v in payload.values():
+                if isinstance(v, (str, int, float, bool)):
+                    fact_values.append(str(v).lower().strip())
+                elif isinstance(v, (list, tuple)):
+                    for vv in v:
+                        if isinstance(vv, (str, int, float, bool)):
+                            fact_values.append(str(vv).lower().strip())
+        # Any other shape — try str(payload). Avoids the bare
+        # str path that would compare e.g. EpisodicEntry's repr.
+
+    fact_values = [v for v in fact_values if v]
+    if not fact_values:
+        return 0.0
+
+    matched = sum(1 for v in fact_values if v in response_lower)
+    return matched / len(fact_values)
 
 
 def _normalise_facts(facts: Any) -> List[str]:

@@ -169,6 +169,45 @@ def test_classes_are_distinguishable_novel_token_ratio():
     assert _welch_pvalue(halluc_with_facts, uncertain) < 1e-3
 
 
+def test_classes_are_distinguishable_verbatim_fact_match():
+    """Phase 2h.1: ``verbatim_fact_match`` should cleanly separate
+    KNOWN (high — Qwen quotes the value) from HALLUCINATED (low
+    — confabulation rarely echoes the fact). Welch's t-test on
+    n=500 per class."""
+    g = SyntheticDataGenerator(seed=15)
+    known = [
+        g.generate_known_example().features["verbatim_fact_match"]
+        for _ in range(500)
+    ]
+    halluc = [
+        g.generate_hallucinated_example().features["verbatim_fact_match"]
+        for _ in range(500)
+    ]
+    res = stats.ttest_ind(known, halluc, equal_var=False)
+    assert float(res.pvalue) < 1e-3
+    assert sum(known) / len(known) > sum(halluc) / len(halluc)
+
+
+def test_known_examples_have_high_verbatim_match():
+    """KNOWN: mean verbatim score should clear 0.5."""
+    g = SyntheticDataGenerator(seed=16)
+    scores = [
+        g.generate_known_example().features["verbatim_fact_match"]
+        for _ in range(200)
+    ]
+    assert sum(scores) / len(scores) > 0.5
+
+
+def test_hallucinated_examples_have_low_verbatim_match():
+    """HALLUCINATED: mean verbatim score should stay under 0.2."""
+    g = SyntheticDataGenerator(seed=17)
+    scores = [
+        g.generate_hallucinated_example().features["verbatim_fact_match"]
+        for _ in range(200)
+    ]
+    assert sum(scores) / len(scores) < 0.2
+
+
 def test_classes_are_distinguishable_attention_to_facts():
     """``attention_to_facts_mean`` is high for known, low for
     hallucinated."""
