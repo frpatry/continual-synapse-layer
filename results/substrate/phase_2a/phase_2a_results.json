@@ -1,0 +1,108 @@
+{
+  "config": {
+    "n_neurons": 200,
+    "k_connectivity": 30,
+    "pattern_size": 10,
+    "K_repeats": 100,
+    "T_present": 15,
+    "T_rest": 60,
+    "seed": 42
+  },
+  "pattern_n": [
+    3,
+    8,
+    14,
+    34,
+    52,
+    60,
+    98,
+    122,
+    162,
+    199
+  ],
+  "pattern_pairs_max": 45,
+  "history": [
+    {
+      "K": 10,
+      "step": 750,
+      "p_total": 10,
+      "p_in_pattern": 10,
+      "p_half_in_pattern": 0,
+      "p_off_pattern": 0
+    },
+    {
+      "K": 20,
+      "step": 1500,
+      "p_total": 11,
+      "p_in_pattern": 11,
+      "p_half_in_pattern": 0,
+      "p_off_pattern": 0
+    },
+    {
+      "K": 30,
+      "step": 2250,
+      "p_total": 11,
+      "p_in_pattern": 11,
+      "p_half_in_pattern": 0,
+      "p_off_pattern": 0
+    },
+    {
+      "K": 40,
+      "step": 3000,
+      "p_total": 11,
+      "p_in_pattern": 11,
+      "p_half_in_pattern": 0,
+      "p_off_pattern": 0
+    },
+    {
+      "K": 50,
+      "step": 3750,
+      "p_total": 11,
+      "p_in_pattern": 11,
+      "p_half_in_pattern": 0,
+      "p_off_pattern": 0
+    },
+    {
+      "K": 60,
+      "step": 4500,
+      "p_total": 11,
+      "p_in_pattern": 11,
+      "p_half_in_pattern": 0,
+      "p_off_pattern": 0
+    },
+    {
+      "K": 70,
+      "step": 5250,
+      "p_total": 11,
+      "p_in_pattern": 11,
+      "p_half_in_pattern": 0,
+      "p_off_pattern": 0
+    },
+    {
+      "K": 80,
+      "step": 6000,
+      "p_total": 11,
+      "p_in_pattern": 11,
+      "p_half_in_pattern": 0,
+      "p_off_pattern": 0
+    },
+    {
+      "K": 90,
+      "step": 6750,
+      "p_total": 11,
+      "p_in_pattern": 11,
+      "p_half_in_pattern": 0,
+      "p_off_pattern": 0
+    },
+    {
+      "K": 100,
+      "step": 7500,
+      "p_total": 11,
+      "p_in_pattern": 11,
+      "p_half_in_pattern": 0,
+      "p_off_pattern": 0
+    }
+  ],
+  "final_p_count": 11,
+  "emergence_event_count": 11
+}
