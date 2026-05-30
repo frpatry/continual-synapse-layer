@@ -28,7 +28,10 @@ from .dynamics import (
     soft_threshold,
 )
 from .neuron import N
+from .p_connectivity import PConnectivity
+from .p_dynamics import compute_p_input, propagate_p_activations
 from .p_entity import PEntity
+from .p_plasticity import apply_pp_plasticity
 from .pass_tracker import PassTracker
 from .plasticity import (
     age_modulated_decay,
@@ -42,13 +45,17 @@ __all__ = [
     "ConnectivityMatrix",
     "GlobalBackground",
     "N",
+    "PConnectivity",
     "PEntity",
     "PassTracker",
     "Substrate",
     "age_modulated_decay",
     "apply_plasticity",
+    "apply_pp_plasticity",
+    "compute_p_input",
     "covariance_hebbian_update",
     "k_winners_take_all",
     "propagate_activation",
+    "propagate_p_activations",
     "soft_threshold",
 ]

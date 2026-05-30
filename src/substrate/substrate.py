@@ -1,4 +1,4 @@
-"""Substrate — unified orchestrator for Phase 1 + 2a dynamics.
+"""Substrate — unified orchestrator for Phase 1 + 2a + 2b dynamics.
 
 Per H1 (unified substrate), this is the single container that
 holds both *computation* (current activations) and *memory*
@@ -20,9 +20,16 @@ Phase 2a scope (observational P):
   emerged and tracked in ``self.p_entities``.
 - P weights grow with use, decay with age, and dissolve when they
   fall below ``p_viability_threshold``.
-- P does NOT yet influence N-level dynamics — that arrives in
-  Phase 2b. Here P is purely observational: we measure whether
-  emergence concentrates correctly on pattern-pair structure (P2).
+
+Phase 2b scope (P-level dynamics + P-P connections):
+- Each step, after N-level work and emergence, every live P entity
+  gets its own activation update via :func:`propagate_p_activations`
+  (soft-threshold + k-WTA on P-P input + N components + small noise).
+- P-P connections form / strengthen / decay via
+  :func:`apply_pp_plasticity` (covariance Hebbian with a creation
+  gate so noise-floor co-activations don't seed edges).
+- When a P dissolves, every P-P connection touching it is removed.
+- Still no P → N feedback (that arrives in Phase 2c).
 """
 
 from __future__ import annotations
@@ -35,7 +42,10 @@ import numpy as np
 from .connectivity import ConnectivityMatrix
 from .dynamics import DEFAULT_SPARSITY_TARGET, GlobalBackground, propagate_activation
 from .neuron import N
+from .p_connectivity import PConnectivity
+from .p_dynamics import propagate_p_activations
 from .p_entity import PEntity
+from .p_plasticity import apply_pp_plasticity
 from .pass_tracker import PassTracker
 from .plasticity import apply_plasticity
 
@@ -78,6 +88,14 @@ class Substrate:
         pass_theta_low: float = 0.05,
         p_weight_decay: float = 0.005,
         p_viability_threshold: float = 0.1,
+        # ---- Phase 2b P-level dynamics + P-P plasticity ----
+        alpha_n_to_p: float = 0.3,
+        p_threshold: float = 0.3,
+        p_sparsity_target: float = DEFAULT_SPARSITY_TARGET,
+        p_background_noise_sigma: float = 0.01,
+        eta_pp: float = 0.005,
+        lambda_pp_decay: float = 0.001,
+        min_coactivation_to_create_pp: float = 0.1,
         # -----------------------------------------
         seed: int = 42,
     ) -> None:
@@ -134,6 +152,25 @@ class Substrate:
         # every emergence event — observed by experiments / tests.
         self.p_emergence_history: List[dict] = []
 
+        # ---------- Phase 2b P-level dynamics + P-P plasticity ----------
+        self.alpha_n_to_p: float = float(alpha_n_to_p)
+        self.p_threshold: float = float(p_threshold)
+        self.p_sparsity_target: float = float(p_sparsity_target)
+        self.p_background_noise_sigma: float = float(p_background_noise_sigma)
+        self.eta_pp: float = float(eta_pp)
+        self.lambda_pp_decay: float = float(lambda_pp_decay)
+        self.min_coactivation_to_create_pp: float = float(
+            min_coactivation_to_create_pp,
+        )
+
+        # Dynamic, dict-backed P-P connection store. Starts empty;
+        # grows only when co-active P entities clear the creation gate.
+        self.p_connectivity = PConnectivity()
+
+        # Independent RNG so P-level noise is reproducible *and*
+        # decoupled from the GlobalBackground draw sequence.
+        self.p_rng: np.random.Generator = np.random.default_rng(self.seed + 2)
+
     # ---------- core update ----------
 
     def step(self, external_input: Optional[np.ndarray] = None) -> np.ndarray:
@@ -141,15 +178,19 @@ class Substrate:
 
         Order:
           1. Generate background drive.
-          2. Propagate activations.
+          2. Propagate N activations.
           3. Apply N-level plasticity (H3 — every step).
-          4. Update P-level pass tracker on the new activations.
-          5. Check for new P emergences.
-          6. Update P activations (derived from components in 2a).
-          7. Decay P weights, dissolve non-viable.
-          8. Advance age + step counter.
+          4. Update P-level pass tracker on the new N activations.
+          5. Check for new P emergences (Phase 2a).
+          6. Propagate P activations using P-P channel + N components
+             (Phase 2b) — synchronous update, neighbours read OLD state.
+          7. Apply P-P Hebbian plasticity on the freshly-updated P
+             activations (Phase 2b).
+          8. Decay P weights, dissolve non-viable (cleanup removes
+             every P-P connection touching a dissolved P).
+          9. Advance age + step counter.
 
-        Returns a copy of the new activations so the caller can
+        Returns a copy of the new N activations so the caller can
         store snapshots without seeing later steps' mutations.
         """
         bg = self.background.step(self.n_neurons)
@@ -171,7 +212,7 @@ class Substrate:
             lambda_base=self.lambda_decay,
         )
 
-        # ---------- Phase 2a: P-level pass ----------
+        # ---------- Phase 2a: emergence detection ----------
         self.pass_tracker.update(self.activations)
         candidates = self.pass_tracker.find_emergence_candidates(
             connectivity_W=self.connectivity.W,
@@ -181,12 +222,34 @@ class Substrate:
         )
         for (i, j) in candidates:
             self._emerge_p(i, j)
-        # P activations are purely derived from components in 2a.
-        for p in self.p_entities.values():
-            i, j = p.components
-            p.activation = float(
-                (self.activations[i] + self.activations[j]) / 2.0,
+
+        # ---------- Phase 2b: P-level dynamics ----------
+        # Synchronous update: each P sees its neighbours' OLD activations.
+        if self.p_entities:
+            new_p_activations = propagate_p_activations(
+                p_entities=self.p_entities,
+                p_connectivity=self.p_connectivity,
+                n_activations=self.activations,
+                alpha_n_to_p=self.alpha_n_to_p,
+                p_threshold=self.p_threshold,
+                p_sparsity_target=self.p_sparsity_target,
+                p_background_noise_sigma=self.p_background_noise_sigma,
+                rng=self.p_rng,
             )
+            for p_id, new_act in new_p_activations.items():
+                self.p_entities[p_id].activation = new_act
+
+        # ---------- Phase 2b: P-P plasticity (Hebbian + creation gate) ----
+        apply_pp_plasticity(
+            p_entities=self.p_entities,
+            p_connectivity=self.p_connectivity,
+            system_age=self.system_age,
+            eta_pp=self.eta_pp,
+            lambda_pp_decay=self.lambda_pp_decay,
+            min_coactivation_to_create=self.min_coactivation_to_create_pp,
+        )
+
+        # ---------- P weight decay + dissolution ----------
         self._decay_and_dissolve_p()
 
         self.system_age += 1.0
@@ -240,6 +303,9 @@ class Substrate:
         for p_id in to_dissolve:
             p = self.p_entities[p_id]
             self.p_pairs_emerged.discard(p.components)
+            # Phase 2b: cleanup every P-P connection touching this id
+            # so the dynamic connectivity doesn't leak references.
+            self.p_connectivity.remove_entity(p_id)
             del self.p_entities[p_id]
 
     # ---------- diagnostics ----------
@@ -257,3 +323,14 @@ class Substrate:
     def p_count(self) -> int:
         """Number of live P entities at this moment."""
         return len(self.p_entities)
+
+    def p_connection_count(self) -> int:
+        """Number of live P-P connections (Phase 2b)."""
+        return self.p_connectivity.connection_count()
+
+    def p_sparsity(self) -> float:
+        """Fraction of live P entities with activation > 0 right now."""
+        if not self.p_entities:
+            return 0.0
+        active = sum(1 for p in self.p_entities.values() if p.activation > 0.0)
+        return active / len(self.p_entities)
