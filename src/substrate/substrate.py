@@ -20,7 +20,7 @@ from typing import List, Optional
 import numpy as np
 
 from .connectivity import ConnectivityMatrix
-from .dynamics import GlobalBackground, propagate_activation
+from .dynamics import DEFAULT_SPARSITY_TARGET, GlobalBackground, propagate_activation
 from .neuron import N
 from .plasticity import apply_plasticity
 
@@ -49,6 +49,7 @@ class Substrate:
         threshold: float = 0.3,
         eta: float = 0.01,
         lambda_decay: float = 0.001,
+        sparsity_target: float = DEFAULT_SPARSITY_TARGET,
         background_base: float = 0.1,
         background_drift_amp: float = 0.05,
         background_drift_rate: float = 0.02,
@@ -59,6 +60,7 @@ class Substrate:
         self.threshold = float(threshold)
         self.eta = float(eta)
         self.lambda_decay = float(lambda_decay)
+        self.sparsity_target = float(sparsity_target)
         self.seed = int(seed)
 
         # Per-N entity objects (mostly carry the id + intrinsic
@@ -105,6 +107,7 @@ class Substrate:
             background=bg,
             external_input=external_input,
             threshold=self.threshold,
+            sparsity_target=self.sparsity_target,
         )
         self.activations = new_acts
         apply_plasticity(

@@ -66,6 +66,8 @@ No single element represents a concept. Each concept is a sparse pattern (small 
 
 **Operationalization:** at any moment, the fraction of elements with activation above some threshold is small (target: 1-5% of substrate). For any given element, the number of distinct concepts whose activation patterns include it is large (target: many).
 
+**Enforcement:** H5 is enforced *structurally* via a k-winners-take-all (k-WTA) operation applied at the end of each activation propagation step (see Section 3.6). It is not merely an emergent property of activation functions or learning rules — those alone allow runaway dynamics in which sparsity is violated. Structural enforcement of H5 is required for the substrate to remain in a useful regime under Hebbian plasticity.
+
 ---
 
 ## 2. Ontology
@@ -218,6 +220,43 @@ This is the formal expression of "critical periods" and adult cognitive stabilit
 ### 3.5 Background dynamics (H4)
 
 The substrate maintains spontaneous activity even without external input. This is implemented as a stochastic drive term in the activation update (Section 3.1). The exact form of background_drive will be determined experimentally; minimum requirement is that it produce non-trivial dynamics in the absence of input.
+
+### 3.6 Sparsity enforcement via k-winners-take-all (k-WTA)
+
+Per H5, the substrate must maintain sparse activation patterns at all times. Phase 1 experimentation demonstrated that local Hebbian plasticity alone — even with covariance subtraction and age-modulated decay — does not reliably maintain sparsity. The substrate is prone to Hebbian runaway: positive feedback between co-activation and weight strengthening drives all elements toward saturation, violating H5.
+
+To enforce H5 structurally, we apply a k-winners-take-all operation at the end of each activation propagation step:
+
+```
+After computing soft_threshold(weighted_input + background + external_input):
+  Determine k = int(sparsity_target × n_elements)
+  Keep the k elements with the highest activation values
+  Set the activation of all other elements to zero
+```
+
+This is a form of global lateral inhibition. It is not as biologically faithful as explicit inhibitory neurons (which would form an additional element type), but it captures the essential functional property: at any moment, only a small fraction of the substrate is active, regardless of the magnitude of structural weights.
+
+**Why this is in the theory, not merely an implementation detail:**
+
+The k-WTA operation is not parameter tuning. It is a structural mechanism without which H5 fails as an empirical property. Theorising H5 without specifying an enforcement mechanism is incomplete: experiment shows the substrate does not self-organize toward sparsity from local rules alone at the substrate sizes we can simulate.
+
+We adopt k-WTA as the minimal-complexity enforcement mechanism. Phase 3+ may revisit this and implement enforcement through explicit inhibitory neurons (which would be biologically more faithful and would emerge from the substrate's own dynamics, rather than being imposed by an external operation).
+
+**Known limitation — tie handling:**
+
+The naive implementation of k-WTA via `np.where(activations >= cutoff, activations, 0)` admits ties at the cutoff value. When the substrate is in or near saturation (many elements at the activation ceiling of 1.0), all ties pass through and the k-WTA constraint is effectively bypassed.
+
+The remediation is to use `np.argpartition` for strict top-k selection:
+
+```
+top_k_indices = np.argpartition(activations, -k)[-k:]
+result = np.zeros_like(activations)
+result[top_k_indices] = activations[top_k_indices]
+```
+
+This guarantees exactly k elements survive but breaks ties arbitrarily (by index). Under normal substrate dynamics with stochastic background, exact ties are vanishingly rare, so the naive implementation suffices. Under pathological saturation conditions (which themselves should not occur if k-WTA is working), the strict implementation is required.
+
+**Status:** Phase 1 uses the naive implementation; the substrate's stochastic background and small per-element noise mean exact ties do not occur in practice. If Phase 2+ produces conditions where saturation pressure is high (e.g., during emergence events that briefly perturb the system), we should migrate to the strict implementation.
 
 ---
 

@@ -1,14 +1,17 @@
-"""Tests for dynamics: soft_threshold, GlobalBackground, propagate."""
+"""Tests for dynamics: soft_threshold, GlobalBackground, propagate, k-WTA."""
 
 from __future__ import annotations
 
 import numpy as np
 
 from substrate.dynamics import (
+    DEFAULT_SPARSITY_TARGET,
     GlobalBackground,
+    k_winners_take_all,
     propagate_activation,
     soft_threshold,
 )
+from substrate.substrate import Substrate
 
 
 # ---------- soft_threshold ----------
@@ -134,3 +137,90 @@ def test_propagate_returns_float32():
     bg = np.zeros(4, dtype=np.float32)
     out = propagate_activation(a, W, nw, bg)
     assert out.dtype == np.float32
+
+
+# ---------- k_winners_take_all (Phase 1.1 H5 enforcement) ----------
+
+def test_kwta_keeps_exactly_k_active_when_no_ties():
+    """With distinct values and sparsity_target=0.5, exactly half
+    the entries must remain non-zero."""
+    activations = np.array(
+        [0.1, 0.5, 0.3, 0.9, 0.2, 0.7, 0.4, 0.6], dtype=np.float32,
+    )
+    result = k_winners_take_all(activations, sparsity_target=0.5)
+    # k = int(0.5 * 8) = 4.
+    n_active = int((result > 0).sum())
+    assert n_active == 4
+
+
+def test_kwta_zeros_below_threshold():
+    """k-WTA keeps the top-k values verbatim and zeros the rest."""
+    activations = np.array([0.1, 0.5, 0.3, 0.9], dtype=np.float32)
+    result = k_winners_take_all(activations, sparsity_target=0.5)
+    # k = int(0.5 * 4) = 2 → keep 0.5 and 0.9.
+    assert result[0] == 0.0
+    assert abs(result[1] - 0.5) < 1e-6
+    assert result[2] == 0.0
+    assert abs(result[3] - 0.9) < 1e-6
+
+
+def test_kwta_handles_all_zero_input():
+    """k-WTA on an all-zero input must return all zeros — it
+    never introduces activity, only suppresses it."""
+    activations = np.zeros(10, dtype=np.float32)
+    result = k_winners_take_all(activations, sparsity_target=0.2)
+    assert (result == 0.0).all()
+
+
+def test_kwta_propagation_integration():
+    """Without k-WTA, propagate would leave ALL 100 neurons active
+    (per-neuron background alone is above threshold). With k-WTA
+    at 5 %, the output is sparsified to ~k winners.
+
+    We use a distinct per-neuron background (no ties) and zero
+    connectivity so soft_threshold doesn't saturate at 1.0 — both
+    those degeneracies would make ``>= cutoff`` admit more than k
+    entries, which is the right semantic but obscures the test."""
+    n = 100
+    rng = np.random.default_rng(0)
+    W = np.zeros((n, n), dtype=np.float32)
+    neuron_weights = np.ones(n, dtype=np.float32)
+    background = rng.uniform(0.4, 0.9, size=n).astype(np.float32)
+    current = np.zeros(n, dtype=np.float32)
+
+    # Sanity: every neuron is above threshold pre-k-WTA.
+    raw = soft_threshold(background, threshold=0.3)
+    assert int((raw > 0).sum()) == n
+
+    result = propagate_activation(
+        current, W, neuron_weights, background,
+        external_input=None, threshold=0.3, sparsity_target=0.05,
+    )
+    n_active = int((result > 0).sum())
+    # k = int(0.05 * 100) = 5; distinct draws → no ties at cutoff.
+    assert n_active == 5
+
+
+def test_kwta_prevents_runaway_in_substrate():
+    """Long simulation with aggressive Hebbian (eta=0.1) and very
+    weak decay must still keep the substrate sparse, because k-WTA
+    structurally caps the active fraction each step.
+
+    Pre-Phase-1.1, these parameters drove every neuron to 1.0
+    within ~100 steps (Hebbian runaway). With k-WTA the sparsity
+    target is a hard structural ceiling."""
+    sub = Substrate(
+        n_neurons=200,
+        eta=0.1,
+        lambda_decay=0.0001,
+        sparsity_target=0.05,
+        seed=0,
+    )
+    rng = np.random.default_rng(1)
+    for _ in range(500):
+        ext = (rng.random(200) > 0.95).astype(np.float32)
+        sub.step(external_input=ext)
+    sparsity = sub.sparsity()
+    assert sparsity <= 0.1, (
+        f"k-WTA failed to bound sparsity: got {sparsity:.3f} (> 0.10)"
+    )

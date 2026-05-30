@@ -20,7 +20,13 @@ Pure NumPy. No PyTorch, no transformers. CPU-only.
 """
 
 from .connectivity import ConnectivityMatrix
-from .dynamics import GlobalBackground, propagate_activation, soft_threshold
+from .dynamics import (
+    DEFAULT_SPARSITY_TARGET,
+    GlobalBackground,
+    k_winners_take_all,
+    propagate_activation,
+    soft_threshold,
+)
 from .neuron import N
 from .plasticity import (
     age_modulated_decay,
@@ -30,6 +36,7 @@ from .plasticity import (
 from .substrate import Substrate
 
 __all__ = [
+    "DEFAULT_SPARSITY_TARGET",
     "ConnectivityMatrix",
     "GlobalBackground",
     "N",
@@ -37,6 +44,7 @@ __all__ = [
     "age_modulated_decay",
     "apply_plasticity",
     "covariance_hebbian_update",
+    "k_winners_take_all",
     "propagate_activation",
     "soft_threshold",
 ]

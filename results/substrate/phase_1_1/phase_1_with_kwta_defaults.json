@@ -1,0 +1,76 @@
+{
+  "label": "defaults",
+  "config": {
+    "n_neurons": 500,
+    "pattern_size": 25,
+    "K_repeats": 50,
+    "T_present": 20,
+    "T_rest": 10,
+    "seed": 42,
+    "eta": 0.01,
+    "lambda_decay": 0.001,
+    "threshold": 0.3,
+    "sparsity_target": 0.05,
+    "external_strength": 1.0
+  },
+  "completion_results": [
+    {
+      "K": 0,
+      "n_cue": 12,
+      "n_target": 13,
+      "target_mean": 0.007471313700079918,
+      "target_max": 0.09712707996368408,
+      "target_above_threshold_frac": 0.0,
+      "background_mean": 0.0033578164875507355,
+      "background_above_threshold_frac": 0.002105263157894737,
+      "completion_score": 0.0041134972125291824
+    },
+    {
+      "K": 10,
+      "n_cue": 12,
+      "n_target": 13,
+      "target_mean": 0.8461538553237915,
+      "target_max": 1.0,
+      "target_above_threshold_frac": 0.8461538461538461,
+      "background_mean": 0.0063157896511256695,
+      "background_above_threshold_frac": 0.00631578947368421,
+      "completion_score": 0.8398380875587463
+    },
+    {
+      "K": 20,
+      "n_cue": 12,
+      "n_target": 13,
+      "target_mean": 0.8461538553237915,
+      "target_max": 1.0,
+      "target_above_threshold_frac": 0.8461538461538461,
+      "background_mean": 0.0063157896511256695,
+      "background_above_threshold_frac": 0.00631578947368421,
+      "completion_score": 0.8398380875587463
+    },
+    {
+      "K": 35,
+      "n_cue": 12,
+      "n_target": 13,
+      "target_mean": 0.8461538553237915,
+      "target_max": 1.0,
+      "target_above_threshold_frac": 0.8461538461538461,
+      "background_mean": 0.0063157896511256695,
+      "background_above_threshold_frac": 0.00631578947368421,
+      "completion_score": 0.8398380875587463
+    },
+    {
+      "K": 50,
+      "n_cue": 12,
+      "n_target": 13,
+      "target_mean": 0.8461538553237915,
+      "target_max": 1.0,
+      "target_above_threshold_frac": 0.8461538461538461,
+      "background_mean": 0.0063157896511256695,
+      "background_above_threshold_frac": 0.00631578947368421,
+      "completion_score": 0.8398380875587463
+    }
+  ],
+  "final_total_weight": 1431.6600341796875,
+  "final_sparsity": 0.05,
+  "final_system_age": 1500.0
+}
