@@ -1,99 +1,99 @@
-# continual-synapse-layer
+# Brain-Aligned Learning Substrate
 
-[![tests](https://github.com/frpatry/continual-synapse-layer/actions/workflows/tests.yml/badge.svg)](https://github.com/frpatry/continual-synapse-layer/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-An exploratory research project investigating whether an additive,
-synapse-inspired memory layer on top of a frozen pre-trained model
-can reduce catastrophic forgetting in continual-learning settings.
-The system observes activations from a frozen base model, maintains
-per-connection state with sparse top-k partner selection and
-evidence-based resistance to change, and emits a correction vector
-that modulates the base model's output. See [DESIGN.md](DESIGN.md)
-for the technical specification and [PROJECT_PLAN.md](PROJECT_PLAN.md)
-for the six-phase roadmap.
+A research investigation into what an artificial system must look like
+if it is to learn the way biological brains learn.
 
-**Status:** Phase 1 in progress — Split-MNIST benchmark, MLP
-baseline, sequential evaluation harness, ACC/forgetting/BWT/FWT
-metrics, and EWC reproduction are in place. The synapse layer
-itself is Phase 2 work. See [decisions_log.md](decisions_log.md)
-for the running design log.
+## Status
 
-## Installation
+Phase 2a complete — Pass entity emergence verified on the P2 test
+(100 % selectivity on pattern pairs in a 200-N substrate).
+
+The full theoretical framework, hypotheses, and predictions live in
+[**THEORY.md**](THEORY.md).
+
+## What this is
+
+A pure research project investigating five hypotheses about
+brain-aligned learning:
+
+- **H1**: Unified substrate — computation and memory live in the same
+  fabric, not in separate "model" + "database" modules.
+- **H2**: Local learning rules — weights update from quantities
+  available at the synapse, not from a global error signal.
+- **H3**: Forward-pass-as-learning — every inference modifies the
+  substrate; there is no separate "train" vs "infer" mode.
+- **H4**: Metastable background dynamics — the substrate is never
+  fully silent, even without external input.
+- **H5**: Sparse distributed representations — at any moment, only a
+  small fraction (≈ 1–5 %) of the substrate is active, structurally
+  enforced via k-winners-take-all.
+
+The investigation is documented in `THEORY.md`. Active implementation
+lives in `src/substrate/`. Experimental validation lives in
+`experiments/substrate/`.
+
+## What this is NOT
+
+This project deliberately excludes:
+
+- Pretrained LLMs as substrate
+- Backpropagation
+- External vector databases
+- RAG-style retrieval-augmented patterns
+- Standard fine-tuning or LoRA adapters
+
+These exclusions are justified in `THEORY.md` Section 8.
+
+## Repository structure
+
+```
+THEORY.md                    Canonical theory document
+README.md                    This file
+
+src/substrate/               Active implementation (Phase 1–2a)
+experiments/substrate/       Active experiments
+tests/substrate/             Active tests (65 green)
+results/substrate/           Experimental outputs
+
+src/legacy/                  Archived: prior research directions
+experiments/legacy/          Archived: prior experiments
+tests/legacy/                Archived: prior tests (skipped by pytest)
+colab/legacy/                Archived: prior Colab notebooks
+docs/archived/               Archived: prior documentation
+```
+
+The `legacy/` trees preserve two earlier directions — a
+continual-learning study (`src/legacy/continual_synapse/`) and an
+AGI-architecture study (`src/legacy/agi/`) — for history and future
+writeups. They are not part of the active investigation.
+
+## Running
 
 ```bash
-git clone https://github.com/frpatry/continual-synapse-layer.git
-cd continual-synapse-layer
-python3.13 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
+pytest tests/substrate/
+
+# Phase 1 — pattern formation through repeated exposure:
+python experiments/substrate/phase_1_pattern_formation.py
+
+# Phase 2a — P (Pass) entity emergence from co-activated N pairs:
+python experiments/substrate/phase_2a_emergence.py
 ```
 
-Requires Python 3.13. See [PROJECT_PLAN.md §5.2](PROJECT_PLAN.md)
-for hardware recommendations. CPU is sufficient for Phase 1.
+The substrate is pure NumPy; no PyTorch / transformers dependency
+in the active code path.
 
-## Quickstart
+## Probability of success
 
-Reproduce the catastrophic-forgetting baseline on Split-MNIST:
-
-```bash
-python experiments/01_baseline_forgetting.py
-```
-
-The script downloads MNIST via HuggingFace `datasets` on first run,
-trains a 3-layer MLP sequentially on five binary digit-pair tasks,
-prints all four standard continual-learning metrics, and writes a
-JSON log to `results/logs/`. Expect ~50% average forgetting with the
-default hyperparameters.
-
-Compare against Elastic Weight Consolidation:
-
-```bash
-python experiments/02_ewc_baseline.py --lam 1000
-```
-
-See [experiments/README.md](experiments/README.md) for the full
-list of scripts, hyperparameters, and the JSON log schema.
-
-## Repository layout
-
-```
-src/continual_synapse/
-├── synapse_layer/     # Additive layer (Phase 2+)
-├── cold_storage/      # Long-term archive (Phase 4)
-├── consolidation/     # Synapse → storage transfer (Phase 4)
-├── reward/            # Reward signal mixer (Phase 3)
-├── base_models/       # HF loaders + hook helpers (Phase 2+)
-├── baselines/         # naive_finetune, ewc, replay, diff_plasticity
-└── evaluation/        # benchmarks, metrics, runner, reporting
-experiments/           # Numbered runnable experiments
-tests/                 # pytest suite (Phase 1: 35 tests)
-results/{logs,figures,tables}/  # Generated artifacts
-```
-
-## Development
-
-```bash
-pip install -r requirements.txt
-python -m pytest tests/
-```
-
-The test suite runs in under two seconds on CPU and has no network
-or dataset dependencies — synthetic tensors stand in for MNIST. CI
-runs the same suite on every push.
+Honest assessment in `THEORY.md` Section 9. The project is high-risk
+fundamental research: most plausible outcomes are failure modes. The
+investigation itself — the careful articulation of what brain-aligned
+learning would require, and the empirical examination of each
+prediction — is the value, independent of whether the substrate
+ultimately scales.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-## References
-
-- Kirkpatrick et al. 2017 — *Overcoming catastrophic forgetting in
-  neural networks* (EWC).
-- Miconi et al. 2018 — *Differentiable Plasticity* (Phase 5 baseline).
-- McClelland, McNaughton, O'Reilly 1995 — *Why there are
-  complementary learning systems* (biological inspiration).
-- Parisi et al. 2019 — *Continual Lifelong Learning with Neural
-  Networks: A Review*.
-
-See [PROJECT_PLAN.md §13](PROJECT_PLAN.md) for the full reading
-list with notes.
+See [LICENSE](LICENSE).
