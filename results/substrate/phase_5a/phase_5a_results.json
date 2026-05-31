@@ -1,0 +1,79 @@
+{
+  "config": {
+    "n_neurons": 300,
+    "pattern_size": 15,
+    "K_per_pattern": 100,
+    "T_present": 15,
+    "T_rest": 60,
+    "T_settle": 30,
+    "recall_p_sparsity": 1.0,
+    "seed": 42
+  },
+  "pattern_a": [
+    0,
+    5,
+    36,
+    70,
+    107,
+    116,
+    128,
+    132,
+    140,
+    168,
+    210,
+    233,
+    266,
+    272,
+    291
+  ],
+  "pattern_b": [
+    31,
+    41,
+    148,
+    149,
+    150,
+    155,
+    162,
+    185,
+    205,
+    209,
+    229,
+    255,
+    277,
+    282,
+    294
+  ],
+  "after_train_A": {
+    "P_A": 11,
+    "P_B": 0,
+    "P_bridge": 0,
+    "total": 11
+  },
+  "after_train_B": {
+    "P_A": 8,
+    "P_B": 8,
+    "P_bridge": 14,
+    "total": 30
+  },
+  "catastrophic_forgetting": {
+    "P_A_before_B_training": 11,
+    "P_A_after_B_training": 8,
+    "retention_fraction": 0.7272727272727273
+  },
+  "compositional_test": {
+    "P_A_activation_fraction": 1.0,
+    "P_A_active": 8,
+    "P_A_count": 8,
+    "P_B_activation_fraction": 1.0,
+    "P_B_active": 8,
+    "P_B_count": 8,
+    "P_bridge_activation_fraction": 1.0,
+    "P_bridge_active": 14,
+    "P_bridge_count": 14,
+    "P_other_activation_fraction": 0.0,
+    "P_other_active": 0,
+    "P_other_count": 0
+  },
+  "verdict": "PASS",
+  "reason": "Both pattern families activate simultaneously under combined cue.\nCompositional generalization demonstrated by the 2-level (N + P + P-P + P\u2192N) architecture \u2014 no S-level needed for the\nspatial form of P5."
+}
