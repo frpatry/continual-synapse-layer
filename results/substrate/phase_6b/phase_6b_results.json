@@ -1,0 +1,269 @@
+{
+  "config": {
+    "n_neurons": 500,
+    "M": 5,
+    "pattern_size": 10,
+    "K_per_pattern": 80,
+    "rho_floor": 0.3,
+    "feedback_during_training": false,
+    "feedback_during_recall": true,
+    "seed": 42
+  },
+  "history": [
+    {
+      "stage": 0,
+      "trained_patterns_so_far": 1,
+      "P_counts": {
+        "P_pattern_0": 4,
+        "P_pattern_1": 0,
+        "P_pattern_2": 0,
+        "P_pattern_3": 0,
+        "P_pattern_4": 0,
+        "P_bridge_0_1": 0,
+        "P_bridge_0_2": 0,
+        "P_bridge_0_3": 0,
+        "P_bridge_0_4": 0,
+        "P_bridge_1_2": 0,
+        "P_bridge_1_3": 0,
+        "P_bridge_1_4": 0,
+        "P_bridge_2_3": 0,
+        "P_bridge_2_4": 0,
+        "P_bridge_3_4": 0,
+        "P_bridges_total": 0,
+        "P_other": 0,
+        "P_total": 4
+      },
+      "recalls": [
+        {
+          "pattern": 0,
+          "completion": 0.6
+        }
+      ],
+      "system_age": 6030.0
+    },
+    {
+      "stage": 1,
+      "trained_patterns_so_far": 2,
+      "P_counts": {
+        "P_pattern_0": 2,
+        "P_pattern_1": 6,
+        "P_pattern_2": 0,
+        "P_pattern_3": 0,
+        "P_pattern_4": 0,
+        "P_bridge_0_1": 0,
+        "P_bridge_0_2": 0,
+        "P_bridge_0_3": 0,
+        "P_bridge_0_4": 0,
+        "P_bridge_1_2": 0,
+        "P_bridge_1_3": 0,
+        "P_bridge_1_4": 0,
+        "P_bridge_2_3": 0,
+        "P_bridge_2_4": 0,
+        "P_bridge_3_4": 0,
+        "P_bridges_total": 0,
+        "P_other": 0,
+        "P_total": 8
+      },
+      "recalls": [
+        {
+          "pattern": 0,
+          "completion": 0.4
+        },
+        {
+          "pattern": 1,
+          "completion": 0.4
+        }
+      ],
+      "system_age": 12090.0
+    },
+    {
+      "stage": 2,
+      "trained_patterns_so_far": 3,
+      "P_counts": {
+        "P_pattern_0": 2,
+        "P_pattern_1": 6,
+        "P_pattern_2": 6,
+        "P_pattern_3": 0,
+        "P_pattern_4": 0,
+        "P_bridge_0_1": 0,
+        "P_bridge_0_2": 0,
+        "P_bridge_0_3": 0,
+        "P_bridge_0_4": 0,
+        "P_bridge_1_2": 4,
+        "P_bridge_1_3": 0,
+        "P_bridge_1_4": 0,
+        "P_bridge_2_3": 0,
+        "P_bridge_2_4": 0,
+        "P_bridge_3_4": 0,
+        "P_bridges_total": 4,
+        "P_other": 0,
+        "P_total": 18
+      },
+      "recalls": [
+        {
+          "pattern": 0,
+          "completion": 0.4
+        },
+        {
+          "pattern": 1,
+          "completion": 0.4
+        },
+        {
+          "pattern": 2,
+          "completion": 0.8
+        }
+      ],
+      "system_age": 18180.0
+    },
+    {
+      "stage": 3,
+      "trained_patterns_so_far": 4,
+      "P_counts": {
+        "P_pattern_0": 2,
+        "P_pattern_1": 3,
+        "P_pattern_2": 3,
+        "P_pattern_3": 5,
+        "P_pattern_4": 0,
+        "P_bridge_0_1": 0,
+        "P_bridge_0_2": 0,
+        "P_bridge_0_3": 0,
+        "P_bridge_0_4": 0,
+        "P_bridge_1_2": 4,
+        "P_bridge_1_3": 6,
+        "P_bridge_1_4": 0,
+        "P_bridge_2_3": 1,
+        "P_bridge_2_4": 0,
+        "P_bridge_3_4": 0,
+        "P_bridges_total": 11,
+        "P_other": 0,
+        "P_total": 24
+      },
+      "recalls": [
+        {
+          "pattern": 0,
+          "completion": 0.4
+        },
+        {
+          "pattern": 1,
+          "completion": 0.2
+        },
+        {
+          "pattern": 2,
+          "completion": 0.6
+        },
+        {
+          "pattern": 3,
+          "completion": 1.0
+        }
+      ],
+      "system_age": 24300.0
+    },
+    {
+      "stage": 4,
+      "trained_patterns_so_far": 5,
+      "P_counts": {
+        "P_pattern_0": 2,
+        "P_pattern_1": 3,
+        "P_pattern_2": 2,
+        "P_pattern_3": 4,
+        "P_pattern_4": 2,
+        "P_bridge_0_1": 0,
+        "P_bridge_0_2": 0,
+        "P_bridge_0_3": 0,
+        "P_bridge_0_4": 0,
+        "P_bridge_1_2": 2,
+        "P_bridge_1_3": 6,
+        "P_bridge_1_4": 3,
+        "P_bridge_2_3": 1,
+        "P_bridge_2_4": 3,
+        "P_bridge_3_4": 15,
+        "P_bridges_total": 30,
+        "P_other": 0,
+        "P_total": 43
+      },
+      "recalls": [
+        {
+          "pattern": 0,
+          "completion": 0.0
+        },
+        {
+          "pattern": 1,
+          "completion": 0.2
+        },
+        {
+          "pattern": 2,
+          "completion": 0.4
+        },
+        {
+          "pattern": 3,
+          "completion": 0.8
+        },
+        {
+          "pattern": 4,
+          "completion": 0.8
+        }
+      ],
+      "system_age": 30450.0
+    }
+  ],
+  "phase_6b_results": {
+    "pattern_p_counts": [
+      2,
+      3,
+      2,
+      4,
+      2
+    ],
+    "pattern_recalls": [
+      0.0,
+      0.2,
+      0.4,
+      0.8,
+      0.8
+    ],
+    "bridges_total": 30,
+    "n_alive": 5,
+    "all_have_p": true,
+    "all_recall": false
+  },
+  "comparison": {
+    "phase_5b": {
+      "label": "5b (no floor)",
+      "pattern_p_counts": [
+        0,
+        3,
+        0,
+        4,
+        2
+      ],
+      "pattern_recalls": [
+        0.0,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ],
+      "bridges_total": 29
+    },
+    "phase_6a": {
+      "label": "6a (floor=0.3, feedback always)",
+      "pattern_p_counts": [
+        2,
+        5,
+        1,
+        5,
+        0
+      ],
+      "pattern_recalls": [
+        0.4,
+        0.2,
+        0.6,
+        1.0,
+        0.2
+      ],
+      "bridges_total": 34
+    }
+  },
+  "verdict": "PARTIAL",
+  "reason": "Improvement over Phase 6a (3 \u2192 5 alive). Patterns [2, 4] recovered; patterns [] still missing. Feedback gating is PART of the fix; remaining gap suggests additional architectural changes (S level, per-pattern age reset, or scheduled replay) may help."
+}
