@@ -46,6 +46,7 @@ from .p_connectivity import PConnectivity
 from .p_dynamics import propagate_p_activations
 from .p_entity import PEntity
 from .p_plasticity import apply_pp_plasticity
+from .p_to_n_feedback import compute_p_to_n_feedback
 from .pass_tracker import PassTracker
 from .plasticity import apply_plasticity
 
@@ -96,6 +97,9 @@ class Substrate:
         eta_pp: float = 0.005,
         lambda_pp_decay: float = 0.001,
         min_coactivation_to_create_pp: float = 0.1,
+        # ---- Phase 2c top-down P→N feedback ----
+        gamma_p_to_n: float = 0.1,
+        enable_feedback_p_to_n: bool = True,
         # -----------------------------------------
         seed: int = 42,
     ) -> None:
@@ -171,14 +175,23 @@ class Substrate:
         # decoupled from the GlobalBackground draw sequence.
         self.p_rng: np.random.Generator = np.random.default_rng(self.seed + 2)
 
+        # ---------- Phase 2c top-down feedback ----------
+        self.gamma_p_to_n: float = float(gamma_p_to_n)
+        self.enable_feedback_p_to_n: bool = bool(enable_feedback_p_to_n)
+
     # ---------- core update ----------
 
     def step(self, external_input: Optional[np.ndarray] = None) -> np.ndarray:
         """One synchronous timestep.
 
         Order:
+          0. (Phase 2c) Compute P → N feedback from the *current* P
+             activations and fold it into ``external_input`` before
+             N propagation. Feedback is computed BEFORE the N
+             propagation step so cause and effect are correctly
+             ordered: P at time t boosts N at time t+1.
           1. Generate background drive.
-          2. Propagate N activations.
+          2. Propagate N activations (sees external_input + feedback).
           3. Apply N-level plasticity (H3 — every step).
           4. Update P-level pass tracker on the new N activations.
           5. Check for new P emergences (Phase 2a).
@@ -193,13 +206,34 @@ class Substrate:
         Returns a copy of the new N activations so the caller can
         store snapshots without seeing later steps' mutations.
         """
+        # ---------- Phase 2c: P → N feedback ----------
+        # Compute from CURRENT (previous step's) P activations so the
+        # boost reaches N before propagation. ``compute_p_to_n_feedback``
+        # short-circuits to zeros for gamma=0 or empty p_entities, so
+        # there's no penalty pre-emergence.
+        if self.enable_feedback_p_to_n and self.p_entities:
+            feedback = compute_p_to_n_feedback(
+                self.p_entities, self.n_neurons, gamma=self.gamma_p_to_n,
+            )
+        else:
+            feedback = None
+
+        if external_input is not None and feedback is not None:
+            effective_input = external_input + feedback
+        elif external_input is not None:
+            effective_input = external_input
+        elif feedback is not None and feedback.any():
+            effective_input = feedback
+        else:
+            effective_input = None
+
         bg = self.background.step(self.n_neurons)
         new_acts = propagate_activation(
             current_activations=self.activations,
             connectivity_W=self.connectivity.W,
             neuron_weights=self.neuron_weights,
             background=bg,
-            external_input=external_input,
+            external_input=effective_input,
             threshold=self.threshold,
             sparsity_target=self.sparsity_target,
         )
