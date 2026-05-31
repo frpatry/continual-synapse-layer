@@ -102,6 +102,8 @@ class Substrate:
         enable_feedback_p_to_n: bool = True,
         # ---- Phase 3 critical periods ----
         starting_age: float = 0.0,
+        # ---- Phase 6a plasticity floor ----
+        rho_floor: float = 0.3,
         # -----------------------------------------
         seed: int = 42,
     ) -> None:
@@ -139,6 +141,14 @@ class Substrate:
         # produce the biological fast-young / slow-mature distinction).
         self.system_age: float = float(starting_age)
         self.step_count: int = 0
+
+        # Phase 6a: floor on the age-modulation factor so plasticity
+        # never collapses to zero, even at very high age. The default
+        # 0.3 was chosen to allow late-life pattern emergence (Phase 5b
+        # bottleneck a) while preserving the critical-period asymmetry
+        # in the substrate's first ~10 steps (where raw ρ > 0.3).
+        # Set rho_floor=0.0 to reproduce pre-Phase-6a behaviour.
+        self.rho_floor: float = float(rho_floor)
 
         # ---------- Phase 2a P-level state ----------
         self.theta_emergence: float = float(theta_emergence)
@@ -252,6 +262,7 @@ class Substrate:
             system_age=self.system_age,
             eta=self.eta,
             lambda_base=self.lambda_decay,
+            rho_floor=self.rho_floor,
         )
 
         # ---------- Phase 2a: emergence detection ----------
@@ -289,6 +300,7 @@ class Substrate:
             eta_pp=self.eta_pp,
             lambda_pp_decay=self.lambda_pp_decay,
             min_coactivation_to_create=self.min_coactivation_to_create_pp,
+            rho_floor=self.rho_floor,
         )
 
         # ---------- P weight decay + dissolution ----------

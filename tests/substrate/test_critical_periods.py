@@ -93,13 +93,18 @@ def test_young_substrate_pattern_decays_faster_than_mature():
     external = np.zeros(n, dtype=np.float32)
     external[pattern] = 0.7
 
+    # Use rho_floor=0.0 to test the underlying age-modulation formula
+    # rather than the Substrate's default 0.3 floor (Phase 6a). With
+    # the default floor, both young and mature share ρ=0.3 during the
+    # idle phase, eliminating the asymmetry this test is designed to
+    # detect at the formula level.
     sub_young = Substrate(
         n_neurons=n, k_connectivity=10,
-        starting_age=0.0, seed=seed,
+        starting_age=0.0, rho_floor=0.0, seed=seed,
     )
     sub_mature = Substrate(
         n_neurons=n, k_connectivity=10,
-        starting_age=10000.0, seed=seed,
+        starting_age=10000.0, rho_floor=0.0, seed=seed,
     )
 
     for _ in range(50):

@@ -45,6 +45,7 @@ def apply_pp_plasticity(
     eta_pp: float = 0.005,
     lambda_pp_decay: float = 0.001,
     min_coactivation_to_create: float = 0.1,
+    rho_floor: float = 0.0,
 ) -> None:
     """One plasticity step on every (a, b) P pair (in-place on ``p_connectivity``).
 
@@ -74,7 +75,9 @@ def apply_pp_plasticity(
     # Phase 3.1: symmetric age modulation. Same ρ scales BOTH the
     # Hebbian (growth) and decay terms. Equilibrium W stays the same;
     # the timescale to reach it slows with age.
-    rho = rho_age(system_age)
+    # Phase 6a: ``rho_floor`` keeps ρ from dropping below a minimum
+    # so substrates aged beyond ~10 can still grow P-P edges.
+    rho = rho_age(system_age, floor=rho_floor)
     eta_effective = eta_pp * rho
 
     for i in range(n_p):
