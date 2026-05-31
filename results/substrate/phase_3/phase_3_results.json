@@ -1,0 +1,306 @@
+{
+  "pattern": [
+    3,
+    8,
+    14,
+    34,
+    52,
+    60,
+    98,
+    122,
+    162,
+    199
+  ],
+  "results_by_age": {
+    "young": {
+      "starting_age": 0.0,
+      "learning_curve": [
+        {
+          "K": 10,
+          "completion": 0.8
+        },
+        {
+          "K": 20,
+          "completion": 0.8
+        },
+        {
+          "K": 30,
+          "completion": 0.8
+        },
+        {
+          "K": 40,
+          "completion": 0.8
+        },
+        {
+          "K": 50,
+          "completion": 0.8
+        },
+        {
+          "K": 60,
+          "completion": 0.8
+        },
+        {
+          "K": 70,
+          "completion": 0.8
+        },
+        {
+          "K": 80,
+          "completion": 0.8
+        },
+        {
+          "K": 90,
+          "completion": 0.8
+        },
+        {
+          "K": 100,
+          "completion": 0.8
+        }
+      ],
+      "retention_curve": [
+        {
+          "step_after_training": 50,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 100,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 150,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 200,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 250,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 300,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 350,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 400,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 450,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 500,
+          "completion": 0.8
+        }
+      ],
+      "post_train_p_count": 12,
+      "post_train_pp_count": 15,
+      "post_train_total_weight": 633.8965454101562,
+      "post_idle_total_weight": 646.5941162109375,
+      "weight_retention_ratio": 1.020030982804245
+    },
+    "middle": {
+      "starting_age": 100.0,
+      "learning_curve": [
+        {
+          "K": 10,
+          "completion": 0.8
+        },
+        {
+          "K": 20,
+          "completion": 0.8
+        },
+        {
+          "K": 30,
+          "completion": 0.8
+        },
+        {
+          "K": 40,
+          "completion": 0.8
+        },
+        {
+          "K": 50,
+          "completion": 0.8
+        },
+        {
+          "K": 60,
+          "completion": 0.8
+        },
+        {
+          "K": 70,
+          "completion": 0.8
+        },
+        {
+          "K": 80,
+          "completion": 0.8
+        },
+        {
+          "K": 90,
+          "completion": 0.8
+        },
+        {
+          "K": 100,
+          "completion": 0.8
+        }
+      ],
+      "retention_curve": [
+        {
+          "step_after_training": 50,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 100,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 150,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 200,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 250,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 300,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 350,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 400,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 450,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 500,
+          "completion": 0.8
+        }
+      ],
+      "post_train_p_count": 12,
+      "post_train_pp_count": 15,
+      "post_train_total_weight": 634.744384765625,
+      "post_idle_total_weight": 647.4366455078125,
+      "weight_retention_ratio": 1.0199958613999776
+    },
+    "mature": {
+      "starting_age": 10000.0,
+      "learning_curve": [
+        {
+          "K": 10,
+          "completion": 0.8
+        },
+        {
+          "K": 20,
+          "completion": 0.8
+        },
+        {
+          "K": 30,
+          "completion": 0.8
+        },
+        {
+          "K": 40,
+          "completion": 0.8
+        },
+        {
+          "K": 50,
+          "completion": 0.8
+        },
+        {
+          "K": 60,
+          "completion": 0.8
+        },
+        {
+          "K": 70,
+          "completion": 0.8
+        },
+        {
+          "K": 80,
+          "completion": 0.8
+        },
+        {
+          "K": 90,
+          "completion": 0.8
+        },
+        {
+          "K": 100,
+          "completion": 0.8
+        }
+      ],
+      "retention_curve": [
+        {
+          "step_after_training": 50,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 100,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 150,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 200,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 250,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 300,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 350,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 400,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 450,
+          "completion": 0.8
+        },
+        {
+          "step_after_training": 500,
+          "completion": 0.8
+        }
+      ],
+      "post_train_p_count": 11,
+      "post_train_pp_count": 10,
+      "post_train_total_weight": 659.363525390625,
+      "post_idle_total_weight": 673.888427734375,
+      "weight_retention_ratio": 1.0220286712631625
+    }
+  },
+  "convergence_K": {
+    "young": 10,
+    "middle": 10,
+    "mature": 10
+  },
+  "retention_completion": {
+    "young": 0.8,
+    "middle": 0.8,
+    "mature": 0.8
+  },
+  "young_learns_faster": false,
+  "mature_retains_better": true,
+  "verdict": "WEAK",
+  "reason": "Only one axis shows the effect: young_learns_faster=False, mature_retains_better=True"
+}

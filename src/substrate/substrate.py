@@ -100,6 +100,8 @@ class Substrate:
         # ---- Phase 2c top-down P→N feedback ----
         gamma_p_to_n: float = 0.1,
         enable_feedback_p_to_n: bool = True,
+        # ---- Phase 3 critical periods ----
+        starting_age: float = 0.0,
         # -----------------------------------------
         seed: int = 42,
     ) -> None:
@@ -129,7 +131,13 @@ class Substrate:
             local_noise_sigma=local_noise_sigma,
             seed=seed + 1,
         )
-        self.system_age: float = 0.0
+        # ``system_age`` is what drives age-modulated decay everywhere in
+        # the substrate. Defaulting it to 0.0 is the canonical "young"
+        # substrate. ``starting_age`` lets experiments instantiate a
+        # substrate as if it had already aged — used by Phase 3 to test
+        # the critical-period prediction P4 (does age-modulated decay
+        # produce the biological fast-young / slow-mature distinction).
+        self.system_age: float = float(starting_age)
         self.step_count: int = 0
 
         # ---------- Phase 2a P-level state ----------
