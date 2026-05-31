@@ -19,35 +19,35 @@
       "learning_curve": [
         {
           "K": 10,
-          "completion": 0.0
+          "completion": 0.2
         },
         {
           "K": 20,
-          "completion": 0.2
+          "completion": 0.8
         },
         {
           "K": 30,
-          "completion": 0.2
+          "completion": 0.8
         },
         {
           "K": 40,
-          "completion": 0.4
+          "completion": 1.0
         },
         {
           "K": 50,
-          "completion": 0.8
+          "completion": 1.0
         },
         {
           "K": 60,
-          "completion": 0.8
+          "completion": 1.0
         },
         {
           "K": 70,
-          "completion": 0.8
+          "completion": 1.0
         },
         {
           "K": 80,
-          "completion": 0.8
+          "completion": 1.0
         },
         {
           "K": 90,
@@ -103,9 +103,9 @@
       "final_completion": 1.0,
       "post_train_p_count": 11,
       "post_train_pp_count": 10,
-      "post_train_total_weight": 42.136253356933594,
-      "post_idle_total_weight": 33.14539337158203,
-      "weight_retention_ratio": 0.7866241236687433
+      "post_train_total_weight": 51.20646667480469,
+      "post_idle_total_weight": 29.24784278869629,
+      "weight_retention_ratio": 0.5711747888101644
     },
     "middle": {
       "starting_age": 100.0,
@@ -114,35 +114,35 @@
       "learning_curve": [
         {
           "K": 10,
-          "completion": 0.0
-        },
-        {
-          "K": 20,
-          "completion": 0.0
-        },
-        {
-          "K": 30,
           "completion": 0.2
         },
         {
+          "K": 20,
+          "completion": 0.8
+        },
+        {
+          "K": 30,
+          "completion": 0.8
+        },
+        {
           "K": 40,
-          "completion": 0.4
+          "completion": 1.0
         },
         {
           "K": 50,
-          "completion": 0.8
+          "completion": 1.0
         },
         {
           "K": 60,
-          "completion": 0.8
+          "completion": 1.0
         },
         {
           "K": 70,
-          "completion": 0.8
+          "completion": 1.0
         },
         {
           "K": 80,
-          "completion": 0.8
+          "completion": 1.0
         },
         {
           "K": 90,
@@ -198,9 +198,9 @@
       "final_completion": 1.0,
       "post_train_p_count": 11,
       "post_train_pp_count": 10,
-      "post_train_total_weight": 42.453895568847656,
-      "post_idle_total_weight": 33.39522933959961,
-      "weight_retention_ratio": 0.7866234391951719
+      "post_train_total_weight": 51.206024169921875,
+      "post_idle_total_weight": 29.24759292602539,
+      "weight_retention_ratio": 0.5711748451504512
     },
     "mature": {
       "starting_age": 10000.0,
@@ -209,35 +209,35 @@
       "learning_curve": [
         {
           "K": 10,
-          "completion": 0.0
-        },
-        {
-          "K": 20,
-          "completion": 0.0
-        },
-        {
-          "K": 30,
           "completion": 0.2
         },
         {
+          "K": 20,
+          "completion": 0.8
+        },
+        {
+          "K": 30,
+          "completion": 0.8
+        },
+        {
           "K": 40,
-          "completion": 0.4
+          "completion": 1.0
         },
         {
           "K": 50,
-          "completion": 0.8
+          "completion": 1.0
         },
         {
           "K": 60,
-          "completion": 0.8
+          "completion": 1.0
         },
         {
           "K": 70,
-          "completion": 0.8
+          "completion": 1.0
         },
         {
           "K": 80,
-          "completion": 0.8
+          "completion": 1.0
         },
         {
           "K": 90,
@@ -293,15 +293,15 @@
       "final_completion": 1.0,
       "post_train_p_count": 11,
       "post_train_pp_count": 10,
-      "post_train_total_weight": 42.453895568847656,
-      "post_idle_total_weight": 33.39522933959961,
-      "weight_retention_ratio": 0.7866234391951719
+      "post_train_total_weight": 51.206024169921875,
+      "post_idle_total_weight": 29.24759292602539,
+      "weight_retention_ratio": 0.5711748451504512
     }
   },
   "convergence_K": {
-    "young": 50,
-    "middle": 50,
-    "mature": 50
+    "young": 20,
+    "middle": 20,
+    "mature": 20
   },
   "post_idle_completion": {
     "young": 1.0,
@@ -309,19 +309,19 @@
     "mature": 1.0
   },
   "weight_retention_ratio": {
-    "young": 0.7866241236687433,
-    "middle": 0.7866234391951719,
-    "mature": 0.7866234391951719
+    "young": 0.5711747888101644,
+    "middle": 0.5711748451504512,
+    "mature": 0.5711748451504512
   },
   "young_learns_faster": false,
   "young_learns_faster_by_K": false,
   "young_learns_faster_by_p_count": false,
-  "mature_retains_better": false,
+  "mature_retains_better": true,
   "p_counts_by_age": {
     "young": 11,
     "middle": 11,
     "mature": 11
   },
-  "verdict": "FAIL",
-  "reason": "No critical-period effect observed even with feedback off."
+  "verdict": "WEAK",
+  "reason": "Only one axis shows the effect: young_learns_faster=False, mature_retains_better=True"
 }

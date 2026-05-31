@@ -103,7 +103,9 @@ class Substrate:
         # ---- Phase 3 critical periods ----
         starting_age: float = 0.0,
         # ---- Phase 6a plasticity floor ----
-        rho_floor: float = 0.3,
+        rho_floor: float = 0.7,
+        # ---- Phase 6f fresh-pattern protection ----
+        k_protect: int = 5000,
         # -----------------------------------------
         seed: int = 42,
     ) -> None:
@@ -143,12 +145,27 @@ class Substrate:
         self.step_count: int = 0
 
         # Phase 6a: floor on the age-modulation factor so plasticity
-        # never collapses to zero, even at very high age. The default
-        # 0.3 was chosen to allow late-life pattern emergence (Phase 5b
-        # bottleneck a) while preserving the critical-period asymmetry
-        # in the substrate's first ~10 steps (where raw ρ > 0.3).
+        # never collapses to zero, even at very high age. The Phase 6a
+        # default 0.3 preserved some critical-period asymmetry in the
+        # substrate's first ~10 steps; Phase 6f raised the default to
+        # 0.7 to fully eliminate artificial late-learning suppression.
+        # Stated tradeoff: Phase 3.1's biological critical-periods
+        # demonstration no longer shows young-vs-mature asymmetry —
+        # acceptable for a Bio-Inspired AI substrate whose goal is
+        # learning + retention rather than developmental fidelity.
         # Set rho_floor=0.0 to reproduce pre-Phase-6a behaviour.
         self.rho_floor: float = float(rho_floor)
+
+        # Phase 6f: fresh-pattern protection window. When a P emerges,
+        # its ``protected_until`` is set to ``step_count + k_protect``.
+        # Inside that window, the P entity is exempt from dissolution
+        # even if its weight drops below ``p_viability_threshold``.
+        # Bio analog: protein-synthesis-dependent LTP late phase +
+        # synaptic tagging in mammalian neurons — newly-potentiated
+        # synapses are actively maintained against competition for
+        # ~30 min – 1 h post-induction. Set ``k_protect=0`` to disable
+        # the protection mechanism.
+        self.k_protect: int = int(k_protect)
 
         # ---------- Phase 2a P-level state ----------
         self.theta_emergence: float = float(theta_emergence)
@@ -313,7 +330,15 @@ class Substrate:
     # ---------- P-level helpers ----------
 
     def _emerge_p(self, i: int, j: int) -> None:
-        """Create a fresh PEntity for the canonical pair (i, j)."""
+        """Create a fresh PEntity for the canonical pair (i, j).
+
+        Phase 6f: the new P starts with ``protected_until = step_count
+        + k_protect``, giving it a guaranteed window during which
+        dissolution is suppressed even if its weight drops below
+        viability. This lets fresh attractors stabilize through
+        subsequent consolidation cycles instead of being out-competed
+        by older, more-established attractors.
+        """
         p = PEntity(
             id=self._next_p_id,
             components=(int(i), int(j)),
@@ -322,6 +347,7 @@ class Substrate:
             ),
             weight=1.0,
             age_at_emergence=self.system_age,
+            protected_until=self.step_count + self.k_protect,
         )
         self.p_entities[self._next_p_id] = p
         self.p_pairs_emerged.add(p.components)
@@ -331,6 +357,7 @@ class Substrate:
                 "p_id": p.id,
                 "components": p.components,
                 "system_age": self.system_age,
+                "protected_until": p.protected_until,
             }
         )
         self._next_p_id += 1
@@ -352,6 +379,12 @@ class Substrate:
             growth = self.eta * p.activation * p.activation
             decay = age_factor * self.p_weight_decay * p.weight
             p.weight = max(0.0, p.weight + growth - decay)
+            # Phase 6f: protected P entities still see weight decay
+            # applied above, but the dissolution check is skipped
+            # until protection ends. Their weight may temporarily dip
+            # below ``p_viability_threshold`` during the window.
+            if p.is_protected(self.step_count):
+                continue
             if p.weight < self.p_viability_threshold:
                 to_dissolve.append(p_id)
         for p_id in to_dissolve:

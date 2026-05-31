@@ -11,8 +11,8 @@
     162,
     199
   ],
-  "trained_p_count": 5,
-  "trained_pp_count": 1,
+  "trained_p_count": 11,
+  "trained_pp_count": 10,
   "gamma_p_to_n_during_training": 1.0,
   "gamma_p_to_n_during_test": 1.0,
   "condition_a_no_feedback": {
@@ -34,7 +34,7 @@
       98
     ],
     "completion_fraction": 0.4,
-    "target_mean_activation": 0.2709027826786041,
+    "target_mean_activation": 0.4000000059604645,
     "target_max_activation": 1.0,
     "cue_mean_activation": 0.8824567794799805,
     "recall_p_sparsity_target": 1.0
@@ -57,13 +57,13 @@
       60,
       98
     ],
-    "completion_fraction": 0.4,
-    "target_mean_activation": 0.4000000059604645,
+    "completion_fraction": 1.0,
+    "target_mean_activation": 0.8353996276855469,
     "target_max_activation": 1.0,
-    "cue_mean_activation": 0.9609611630439758,
+    "cue_mean_activation": 1.0,
     "recall_p_sparsity_target": 1.0
   },
-  "delta_completion_fraction": 0.0,
-  "delta_target_mean_activation": 0.12909722328186035,
-  "verdict": "INCONCLUSIVE"
+  "delta_completion_fraction": 0.6,
+  "delta_target_mean_activation": 0.4353996217250824,
+  "verdict": "PASS"
 }

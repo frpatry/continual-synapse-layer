@@ -1,0 +1,275 @@
+{
+  "config": {
+    "n_neurons": 500,
+    "M": 5,
+    "pattern_size": 10,
+    "K_per_pattern": 80,
+    "K_consolidate": 1500,
+    "rho_floor": 0.7,
+    "k_protect": 5000,
+    "schedule": "Phase 6c-style interleaved: train K=80 with feedback OFF, consolidate K=1500 with feedback ON, advance to next pattern.",
+    "seed": 42
+  },
+  "history": [
+    {
+      "stage": 0,
+      "P_counts": [
+        4,
+        0,
+        0,
+        0,
+        0
+      ],
+      "recalls": [
+        0.6,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "bridges": 0,
+      "protected_count": 2,
+      "step_count": 7650,
+      "system_age": 7650.0
+    },
+    {
+      "stage": 1,
+      "P_counts": [
+        2,
+        6,
+        0,
+        0,
+        0
+      ],
+      "recalls": [
+        0.4,
+        0.4,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "bridges": 0,
+      "protected_count": 3,
+      "step_count": 15300,
+      "system_age": 15300.0
+    },
+    {
+      "stage": 2,
+      "P_counts": [
+        2,
+        3,
+        6,
+        0,
+        0
+      ],
+      "recalls": [
+        0.4,
+        0.2,
+        0.8,
+        0.0,
+        0.0
+      ],
+      "bridges": 5,
+      "protected_count": 7,
+      "step_count": 22950,
+      "system_age": 22950.0
+    },
+    {
+      "stage": 3,
+      "P_counts": [
+        2,
+        3,
+        2,
+        5,
+        0
+      ],
+      "recalls": [
+        0.4,
+        0.2,
+        0.4,
+        1.0,
+        0.0
+      ],
+      "bridges": 12,
+      "protected_count": 10,
+      "step_count": 30600,
+      "system_age": 30600.0
+    },
+    {
+      "stage": 4,
+      "P_counts": [
+        2,
+        3,
+        1,
+        4,
+        2
+      ],
+      "recalls": [
+        0.2,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ],
+      "bridges": 22,
+      "protected_count": 15,
+      "step_count": 38250,
+      "system_age": 38250.0
+    }
+  ],
+  "final": {
+    "P_counts": [
+      2,
+      3,
+      1,
+      4,
+      2
+    ],
+    "recalls": [
+      0.2,
+      0.2,
+      0.4,
+      0.8,
+      0.8
+    ],
+    "bridges": 22,
+    "n_alive": 4,
+    "n_recall": 3
+  },
+  "baselines": {
+    "5b": {
+      "counts": [
+        0,
+        3,
+        0,
+        4,
+        2
+      ],
+      "recalls": [
+        0.0,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ]
+    },
+    "6a": {
+      "counts": [
+        2,
+        5,
+        1,
+        5,
+        0
+      ],
+      "recalls": [
+        0.4,
+        0.2,
+        0.6,
+        1.0,
+        0.2
+      ]
+    },
+    "6b": {
+      "counts": [
+        2,
+        3,
+        2,
+        4,
+        2
+      ],
+      "recalls": [
+        0.0,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ]
+    },
+    "6c": {
+      "counts": [
+        2,
+        3,
+        2,
+        4,
+        1
+      ],
+      "recalls": [
+        0.4,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ]
+    },
+    "6d": {
+      "counts": [
+        2,
+        3,
+        2,
+        4,
+        2
+      ],
+      "recalls": [
+        0.0,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ]
+    },
+    "6e": {
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "recalls": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "6e'": {
+      "counts": [
+        0,
+        5,
+        1,
+        4,
+        0
+      ],
+      "recalls": [
+        0.2,
+        0.4,
+        0.4,
+        0.8,
+        0.4
+      ]
+    }
+  },
+  "n_alive_by_phase": {
+    "5b": 3,
+    "6a": 3,
+    "6b": 5,
+    "6c": 4,
+    "6d": 5,
+    "6e": 0,
+    "6e'": 2,
+    "6f": 4
+  },
+  "n_recall_by_phase": {
+    "5b": 3,
+    "6a": 3,
+    "6b": 3,
+    "6c": 4,
+    "6d": 3,
+    "6e": 0,
+    "6e'": 4,
+    "6f": 3
+  },
+  "verdict": "NO_CHANGE",
+  "reason": "4/3 \u2014 matches some prior phase, no improvement. The Bio-Inspired fix is insufficient at M=5. Empirically motivates either S-level addition or acceptance of the current memory-strength spectrum as intrinsic to this architecture."
+}

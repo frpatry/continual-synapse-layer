@@ -44,32 +44,32 @@
     294
   ],
   "after_train_A": {
-    "P_A": 11,
+    "P_A": 16,
     "P_B": 0,
     "P_bridge": 0,
-    "total": 11
+    "total": 16
   },
   "after_train_B": {
-    "P_A": 8,
-    "P_B": 8,
-    "P_bridge": 14,
-    "total": 30
+    "P_A": 9,
+    "P_B": 2,
+    "P_bridge": 5,
+    "total": 16
   },
   "catastrophic_forgetting": {
-    "P_A_before_B_training": 11,
-    "P_A_after_B_training": 8,
-    "retention_fraction": 0.7272727272727273
+    "P_A_before_B_training": 16,
+    "P_A_after_B_training": 9,
+    "retention_fraction": 0.5625
   },
   "compositional_test": {
     "P_A_activation_fraction": 1.0,
-    "P_A_active": 8,
-    "P_A_count": 8,
+    "P_A_active": 9,
+    "P_A_count": 9,
     "P_B_activation_fraction": 1.0,
-    "P_B_active": 8,
-    "P_B_count": 8,
+    "P_B_active": 2,
+    "P_B_count": 2,
     "P_bridge_activation_fraction": 1.0,
-    "P_bridge_active": 14,
-    "P_bridge_count": 14,
+    "P_bridge_active": 5,
+    "P_bridge_count": 5,
     "P_other_activation_fraction": 0.0,
     "P_other_active": 0,
     "P_other_count": 0

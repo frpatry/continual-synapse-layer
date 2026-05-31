@@ -43,6 +43,19 @@ class PEntity:
     activation: float = 0.0
     weight: float = 1.0
     age_at_emergence: float = 0.0
+    protected_until: int = 0
+    """Step count below which this P entity is exempt from dissolution.
+
+    Phase 6f mechanism: newly-emerged P entities are given a protection
+    window (``K_protect`` steps from :attr:`Substrate.k_protect`) during
+    which their weight can drop below ``p_viability_threshold`` without
+    causing dissolution. This gives a freshly-formed attractor time to
+    consolidate via subsequent training cycles + consolidation phases
+    before being subjected to dissolution competition from older,
+    more-established attractors. Bio-inspired analog: protein-synthesis-
+    dependent LTP late phase + synaptic tagging — newly-potentiated
+    synapses are actively maintained for ~30 min – 1 h post-induction
+    in mammalian neurons."""
 
     def __post_init__(self) -> None:
         # Canonicalise: components are an unordered pair, so we sort
@@ -55,3 +68,15 @@ class PEntity:
     def reset_activation(self) -> None:
         """Zero out the current activation (mirrors :meth:`N.reset_activation`)."""
         self.activation = 0.0
+
+    def is_protected(self, current_step: int) -> bool:
+        """True if this P is currently within its post-emergence
+        protection window.
+
+        Substrate.``_decay_and_dissolve_p`` honours this — protected
+        P entities still see decay applied to their weight, but the
+        check that triggers dissolution at ``weight < viability`` is
+        skipped. Once ``current_step >= protected_until``, normal
+        dissolution dynamics resume.
+        """
+        return current_step < self.protected_until

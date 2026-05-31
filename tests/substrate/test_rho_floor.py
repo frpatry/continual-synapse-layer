@@ -64,9 +64,12 @@ def test_substrate_accepts_rho_floor():
 
 
 def test_substrate_default_rho_floor():
-    """Substrate's default is the Phase 6a recommended floor (0.3)."""
+    """Substrate's default raised to 0.7 in Phase 6f (was 0.3 in 6a).
+    The higher floor eliminates artificial late-learning suppression at
+    the documented cost of compressing Phase 3.1's critical-period
+    asymmetry."""
     sub = Substrate(n_neurons=10, k_connectivity=3)
-    assert sub.rho_floor == 0.3
+    assert sub.rho_floor == 0.7
 
 
 def test_substrate_rho_floor_zero_matches_no_floor():
