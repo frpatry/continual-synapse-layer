@@ -1,0 +1,29 @@
+
+--- Running 6i'-A: baseline Phase 6i defaults — known 4/3, 1 inert S ---
+    knobs: theta_emerge=0.5, theta_growth=0.3, boost=0.1, decay=0.95, gamma_s2p=1.0
+  → 4/3 (alive/recall), S count=1, mean S size=2.00, max S size=2, first-2-S step=None, first-size3 step=None
+
+--- Running 6i'-B: lower emergence threshold — more pairs cross ---
+    knobs: theta_emerge=0.3, theta_growth=0.3, boost=0.1, decay=0.95, gamma_s2p=1.0
+  → 4/3 (alive/recall), S count=1, mean S size=2.00, max S size=2, first-2-S step=None, first-size3 step=None
+
+--- Running 6i'-C: + lower growth threshold — S can grow beyond size=2 ---
+    knobs: theta_emerge=0.3, theta_growth=0.15, boost=0.1, decay=0.95, gamma_s2p=1.0
+  → 4/3 (alive/recall), S count=1, mean S size=2.00, max S size=2, first-2-S step=None, first-size3 step=None
+
+--- Running 6i'-D: + higher pass boost — candidacy builds faster ---
+    knobs: theta_emerge=0.3, theta_growth=0.15, boost=0.2, decay=0.95, gamma_s2p=1.0
+  → 4/3 (alive/recall), S count=1, mean S size=2.00, max S size=2, first-2-S step=None, first-size3 step=None
+
+--- Running 6i'-E: + stronger S→P feedback ---
+    knobs: theta_emerge=0.3, theta_growth=0.15, boost=0.2, decay=0.95, gamma_s2p=1.5
+  → 4/3 (alive/recall), S count=1, mean S size=2.00, max S size=2, first-2-S step=None, first-size3 step=None
+
+--- Running 6i'-F: + even stronger S→P feedback ---
+    knobs: theta_emerge=0.3, theta_growth=0.15, boost=0.2, decay=0.95, gamma_s2p=2.0
+  → 4/3 (alive/recall), S count=1, mean S size=2.00, max S size=2, first-2-S step=None, first-size3 step=None
+
+--- Running 6i'-G: + faster decay → higher steady state via shorter time-constant ---
+    knobs: theta_emerge=0.3, theta_growth=0.15, boost=0.2, decay=0.9, gamma_s2p=2.0
+  → 4/3 (alive/recall), S count=1, mean S size=21.00, max S size=21, first-2-S step=None, first-size3 step=15300
+No config reached 5/5/5. Best: 6i'-A at 4/3 with 1 S (mean size 2.00)

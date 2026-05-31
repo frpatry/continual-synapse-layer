@@ -1,0 +1,1142 @@
+{
+  "sweep_configs": [
+    {
+      "name": "6i'-A",
+      "knobs": {
+        "theta_s_emergence": 0.5,
+        "theta_s_growth": 0.3,
+        "s_pass_boost": 0.1,
+        "s_pass_decay": 0.95,
+        "gamma_s_to_p": 1.0
+      },
+      "notes": "baseline Phase 6i defaults \u2014 known 4/3, 1 inert S"
+    },
+    {
+      "name": "6i'-B",
+      "knobs": {
+        "theta_s_emergence": 0.3,
+        "theta_s_growth": 0.3,
+        "s_pass_boost": 0.1,
+        "s_pass_decay": 0.95,
+        "gamma_s_to_p": 1.0
+      },
+      "notes": "lower emergence threshold \u2014 more pairs cross"
+    },
+    {
+      "name": "6i'-C",
+      "knobs": {
+        "theta_s_emergence": 0.3,
+        "theta_s_growth": 0.15,
+        "s_pass_boost": 0.1,
+        "s_pass_decay": 0.95,
+        "gamma_s_to_p": 1.0
+      },
+      "notes": "+ lower growth threshold \u2014 S can grow beyond size=2"
+    },
+    {
+      "name": "6i'-D",
+      "knobs": {
+        "theta_s_emergence": 0.3,
+        "theta_s_growth": 0.15,
+        "s_pass_boost": 0.2,
+        "s_pass_decay": 0.95,
+        "gamma_s_to_p": 1.0
+      },
+      "notes": "+ higher pass boost \u2014 candidacy builds faster"
+    },
+    {
+      "name": "6i'-E",
+      "knobs": {
+        "theta_s_emergence": 0.3,
+        "theta_s_growth": 0.15,
+        "s_pass_boost": 0.2,
+        "s_pass_decay": 0.95,
+        "gamma_s_to_p": 1.5
+      },
+      "notes": "+ stronger S\u2192P feedback"
+    },
+    {
+      "name": "6i'-F",
+      "knobs": {
+        "theta_s_emergence": 0.3,
+        "theta_s_growth": 0.15,
+        "s_pass_boost": 0.2,
+        "s_pass_decay": 0.95,
+        "gamma_s_to_p": 2.0
+      },
+      "notes": "+ even stronger S\u2192P feedback"
+    },
+    {
+      "name": "6i'-G",
+      "knobs": {
+        "theta_s_emergence": 0.3,
+        "theta_s_growth": 0.15,
+        "s_pass_boost": 0.2,
+        "s_pass_decay": 0.9,
+        "gamma_s_to_p": 2.0
+      },
+      "notes": "+ faster decay \u2192 higher steady state via shorter time-constant"
+    }
+  ],
+  "results": [
+    {
+      "config_name": "6i'-A",
+      "config": {
+        "theta_s_emergence": 0.5,
+        "theta_s_growth": 0.3,
+        "s_pass_boost": 0.1,
+        "s_pass_decay": 0.95,
+        "gamma_s_to_p": 1.0
+      },
+      "notes": "baseline Phase 6i defaults \u2014 known 4/3, 1 inert S",
+      "history": [
+        {
+          "stage": 0,
+          "step_count": 7650,
+          "P_counts": [
+            4,
+            0,
+            0,
+            0,
+            0
+          ],
+          "recalls": [
+            0.6,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "bridges": 0,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 1,
+          "step_count": 15300,
+          "P_counts": [
+            2,
+            6,
+            0,
+            0,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.4,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "bridges": 0,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 2,
+          "step_count": 22950,
+          "P_counts": [
+            2,
+            3,
+            6,
+            0,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.2,
+            0.8,
+            0.0,
+            0.0
+          ],
+          "bridges": 7,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 3,
+          "step_count": 30600,
+          "P_counts": [
+            2,
+            3,
+            3,
+            5,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.2,
+            0.6,
+            1.0,
+            0.0
+          ],
+          "bridges": 13,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 4,
+          "step_count": 38250,
+          "P_counts": [
+            2,
+            3,
+            3,
+            4,
+            0
+          ],
+          "recalls": [
+            0.2,
+            0.2,
+            0.6,
+            0.8,
+            0.4
+          ],
+          "bridges": 24,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        }
+      ],
+      "P_counts_final": [
+        2,
+        3,
+        3,
+        4,
+        0
+      ],
+      "recalls_final": [
+        0.2,
+        0.2,
+        0.6,
+        0.8,
+        0.4
+      ],
+      "n_alive": 4,
+      "n_recall": 3,
+      "bridges_final": 24,
+      "s_count_final": 1,
+      "s_active_final": 1,
+      "mean_s_size_final": 2.0,
+      "max_s_size_final": 2,
+      "first_step_two_s": null,
+      "first_step_size_three": null
+    },
+    {
+      "config_name": "6i'-B",
+      "config": {
+        "theta_s_emergence": 0.3,
+        "theta_s_growth": 0.3,
+        "s_pass_boost": 0.1,
+        "s_pass_decay": 0.95,
+        "gamma_s_to_p": 1.0
+      },
+      "notes": "lower emergence threshold \u2014 more pairs cross",
+      "history": [
+        {
+          "stage": 0,
+          "step_count": 7650,
+          "P_counts": [
+            4,
+            0,
+            0,
+            0,
+            0
+          ],
+          "recalls": [
+            0.6,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "bridges": 0,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 1,
+          "step_count": 15300,
+          "P_counts": [
+            2,
+            6,
+            0,
+            0,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.4,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "bridges": 0,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 2,
+          "step_count": 22950,
+          "P_counts": [
+            2,
+            3,
+            6,
+            0,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.2,
+            0.8,
+            0.0,
+            0.0
+          ],
+          "bridges": 7,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 3,
+          "step_count": 30600,
+          "P_counts": [
+            2,
+            3,
+            3,
+            5,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.2,
+            0.6,
+            1.0,
+            0.0
+          ],
+          "bridges": 13,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 4,
+          "step_count": 38250,
+          "P_counts": [
+            2,
+            3,
+            3,
+            4,
+            0
+          ],
+          "recalls": [
+            0.2,
+            0.2,
+            0.6,
+            0.8,
+            0.4
+          ],
+          "bridges": 24,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        }
+      ],
+      "P_counts_final": [
+        2,
+        3,
+        3,
+        4,
+        0
+      ],
+      "recalls_final": [
+        0.2,
+        0.2,
+        0.6,
+        0.8,
+        0.4
+      ],
+      "n_alive": 4,
+      "n_recall": 3,
+      "bridges_final": 24,
+      "s_count_final": 1,
+      "s_active_final": 1,
+      "mean_s_size_final": 2.0,
+      "max_s_size_final": 2,
+      "first_step_two_s": null,
+      "first_step_size_three": null
+    },
+    {
+      "config_name": "6i'-C",
+      "config": {
+        "theta_s_emergence": 0.3,
+        "theta_s_growth": 0.15,
+        "s_pass_boost": 0.1,
+        "s_pass_decay": 0.95,
+        "gamma_s_to_p": 1.0
+      },
+      "notes": "+ lower growth threshold \u2014 S can grow beyond size=2",
+      "history": [
+        {
+          "stage": 0,
+          "step_count": 7650,
+          "P_counts": [
+            4,
+            0,
+            0,
+            0,
+            0
+          ],
+          "recalls": [
+            0.6,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "bridges": 0,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 1,
+          "step_count": 15300,
+          "P_counts": [
+            2,
+            6,
+            0,
+            0,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.4,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "bridges": 0,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 2,
+          "step_count": 22950,
+          "P_counts": [
+            2,
+            3,
+            6,
+            0,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.2,
+            0.8,
+            0.0,
+            0.0
+          ],
+          "bridges": 7,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 3,
+          "step_count": 30600,
+          "P_counts": [
+            2,
+            3,
+            3,
+            5,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.2,
+            0.6,
+            1.0,
+            0.0
+          ],
+          "bridges": 13,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 4,
+          "step_count": 38250,
+          "P_counts": [
+            2,
+            3,
+            3,
+            4,
+            0
+          ],
+          "recalls": [
+            0.2,
+            0.2,
+            0.6,
+            0.8,
+            0.4
+          ],
+          "bridges": 24,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        }
+      ],
+      "P_counts_final": [
+        2,
+        3,
+        3,
+        4,
+        0
+      ],
+      "recalls_final": [
+        0.2,
+        0.2,
+        0.6,
+        0.8,
+        0.4
+      ],
+      "n_alive": 4,
+      "n_recall": 3,
+      "bridges_final": 24,
+      "s_count_final": 1,
+      "s_active_final": 1,
+      "mean_s_size_final": 2.0,
+      "max_s_size_final": 2,
+      "first_step_two_s": null,
+      "first_step_size_three": null
+    },
+    {
+      "config_name": "6i'-D",
+      "config": {
+        "theta_s_emergence": 0.3,
+        "theta_s_growth": 0.15,
+        "s_pass_boost": 0.2,
+        "s_pass_decay": 0.95,
+        "gamma_s_to_p": 1.0
+      },
+      "notes": "+ higher pass boost \u2014 candidacy builds faster",
+      "history": [
+        {
+          "stage": 0,
+          "step_count": 7650,
+          "P_counts": [
+            4,
+            0,
+            0,
+            0,
+            0
+          ],
+          "recalls": [
+            0.6,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "bridges": 0,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 1,
+          "step_count": 15300,
+          "P_counts": [
+            2,
+            6,
+            0,
+            0,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.4,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "bridges": 0,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 2,
+          "step_count": 22950,
+          "P_counts": [
+            2,
+            3,
+            6,
+            0,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.2,
+            0.8,
+            0.0,
+            0.0
+          ],
+          "bridges": 7,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 3,
+          "step_count": 30600,
+          "P_counts": [
+            2,
+            3,
+            3,
+            5,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.2,
+            0.6,
+            1.0,
+            0.0
+          ],
+          "bridges": 13,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 4,
+          "step_count": 38250,
+          "P_counts": [
+            2,
+            3,
+            3,
+            4,
+            0
+          ],
+          "recalls": [
+            0.2,
+            0.2,
+            0.6,
+            0.8,
+            0.4
+          ],
+          "bridges": 24,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        }
+      ],
+      "P_counts_final": [
+        2,
+        3,
+        3,
+        4,
+        0
+      ],
+      "recalls_final": [
+        0.2,
+        0.2,
+        0.6,
+        0.8,
+        0.4
+      ],
+      "n_alive": 4,
+      "n_recall": 3,
+      "bridges_final": 24,
+      "s_count_final": 1,
+      "s_active_final": 1,
+      "mean_s_size_final": 2.0,
+      "max_s_size_final": 2,
+      "first_step_two_s": null,
+      "first_step_size_three": null
+    },
+    {
+      "config_name": "6i'-E",
+      "config": {
+        "theta_s_emergence": 0.3,
+        "theta_s_growth": 0.15,
+        "s_pass_boost": 0.2,
+        "s_pass_decay": 0.95,
+        "gamma_s_to_p": 1.5
+      },
+      "notes": "+ stronger S\u2192P feedback",
+      "history": [
+        {
+          "stage": 0,
+          "step_count": 7650,
+          "P_counts": [
+            4,
+            0,
+            0,
+            0,
+            0
+          ],
+          "recalls": [
+            0.6,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "bridges": 0,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 1,
+          "step_count": 15300,
+          "P_counts": [
+            2,
+            6,
+            0,
+            0,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.4,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "bridges": 0,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 2,
+          "step_count": 22950,
+          "P_counts": [
+            2,
+            3,
+            6,
+            0,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.2,
+            0.8,
+            0.0,
+            0.0
+          ],
+          "bridges": 7,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 3,
+          "step_count": 30600,
+          "P_counts": [
+            2,
+            3,
+            3,
+            5,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.2,
+            0.6,
+            1.0,
+            0.0
+          ],
+          "bridges": 13,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 4,
+          "step_count": 38250,
+          "P_counts": [
+            2,
+            3,
+            3,
+            4,
+            0
+          ],
+          "recalls": [
+            0.2,
+            0.2,
+            0.6,
+            0.8,
+            0.4
+          ],
+          "bridges": 24,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        }
+      ],
+      "P_counts_final": [
+        2,
+        3,
+        3,
+        4,
+        0
+      ],
+      "recalls_final": [
+        0.2,
+        0.2,
+        0.6,
+        0.8,
+        0.4
+      ],
+      "n_alive": 4,
+      "n_recall": 3,
+      "bridges_final": 24,
+      "s_count_final": 1,
+      "s_active_final": 1,
+      "mean_s_size_final": 2.0,
+      "max_s_size_final": 2,
+      "first_step_two_s": null,
+      "first_step_size_three": null
+    },
+    {
+      "config_name": "6i'-F",
+      "config": {
+        "theta_s_emergence": 0.3,
+        "theta_s_growth": 0.15,
+        "s_pass_boost": 0.2,
+        "s_pass_decay": 0.95,
+        "gamma_s_to_p": 2.0
+      },
+      "notes": "+ even stronger S\u2192P feedback",
+      "history": [
+        {
+          "stage": 0,
+          "step_count": 7650,
+          "P_counts": [
+            4,
+            0,
+            0,
+            0,
+            0
+          ],
+          "recalls": [
+            0.6,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "bridges": 0,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 1,
+          "step_count": 15300,
+          "P_counts": [
+            2,
+            6,
+            0,
+            0,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.4,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "bridges": 0,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 2,
+          "step_count": 22950,
+          "P_counts": [
+            2,
+            3,
+            6,
+            0,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.2,
+            0.8,
+            0.0,
+            0.0
+          ],
+          "bridges": 7,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 3,
+          "step_count": 30600,
+          "P_counts": [
+            2,
+            3,
+            2,
+            5,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.2,
+            0.4,
+            1.0,
+            0.0
+          ],
+          "bridges": 13,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 4,
+          "step_count": 38250,
+          "P_counts": [
+            2,
+            3,
+            2,
+            4,
+            1
+          ],
+          "recalls": [
+            0.2,
+            0.2,
+            0.4,
+            0.8,
+            0.8
+          ],
+          "bridges": 28,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        }
+      ],
+      "P_counts_final": [
+        2,
+        3,
+        2,
+        4,
+        1
+      ],
+      "recalls_final": [
+        0.2,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ],
+      "n_alive": 4,
+      "n_recall": 3,
+      "bridges_final": 28,
+      "s_count_final": 1,
+      "s_active_final": 1,
+      "mean_s_size_final": 2.0,
+      "max_s_size_final": 2,
+      "first_step_two_s": null,
+      "first_step_size_three": null
+    },
+    {
+      "config_name": "6i'-G",
+      "config": {
+        "theta_s_emergence": 0.3,
+        "theta_s_growth": 0.15,
+        "s_pass_boost": 0.2,
+        "s_pass_decay": 0.9,
+        "gamma_s_to_p": 2.0
+      },
+      "notes": "+ faster decay \u2192 higher steady state via shorter time-constant",
+      "history": [
+        {
+          "stage": 0,
+          "step_count": 7650,
+          "P_counts": [
+            4,
+            0,
+            0,
+            0,
+            0
+          ],
+          "recalls": [
+            0.6,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "bridges": 0,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 2.0,
+          "max_s_size": 2
+        },
+        {
+          "stage": 1,
+          "step_count": 15300,
+          "P_counts": [
+            2,
+            6,
+            0,
+            0,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.4,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "bridges": 0,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 4.0,
+          "max_s_size": 4
+        },
+        {
+          "stage": 2,
+          "step_count": 22950,
+          "P_counts": [
+            2,
+            3,
+            6,
+            0,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.2,
+            0.8,
+            0.0,
+            0.0
+          ],
+          "bridges": 7,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 9.0,
+          "max_s_size": 9
+        },
+        {
+          "stage": 3,
+          "step_count": 30600,
+          "P_counts": [
+            2,
+            3,
+            2,
+            5,
+            0
+          ],
+          "recalls": [
+            0.4,
+            0.2,
+            0.4,
+            1.0,
+            0.0
+          ],
+          "bridges": 13,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 13.0,
+          "max_s_size": 13
+        },
+        {
+          "stage": 4,
+          "step_count": 38250,
+          "P_counts": [
+            2,
+            3,
+            2,
+            4,
+            1
+          ],
+          "recalls": [
+            0.2,
+            0.2,
+            0.4,
+            0.8,
+            0.8
+          ],
+          "bridges": 28,
+          "s_count": 1,
+          "s_active": 1,
+          "mean_s_size": 21.0,
+          "max_s_size": 21
+        }
+      ],
+      "P_counts_final": [
+        2,
+        3,
+        2,
+        4,
+        1
+      ],
+      "recalls_final": [
+        0.2,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ],
+      "n_alive": 4,
+      "n_recall": 3,
+      "bridges_final": 28,
+      "s_count_final": 1,
+      "s_active_final": 1,
+      "mean_s_size_final": 21.0,
+      "max_s_size_final": 21,
+      "first_step_two_s": null,
+      "first_step_size_three": 15300
+    }
+  ],
+  "stopping_config": null,
+  "critical_knob": null
+}
