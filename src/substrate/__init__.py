@@ -38,6 +38,7 @@ from .plasticity import (
     age_modulated_decay,
     apply_plasticity,
     covariance_hebbian_update,
+    rho_age,
 )
 from .substrate import Substrate
 
@@ -59,5 +60,6 @@ __all__ = [
     "k_winners_take_all",
     "propagate_activation",
     "propagate_p_activations",
+    "rho_age",
     "soft_threshold",
 ]

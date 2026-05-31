@@ -1,18 +1,22 @@
-"""P-P Hebbian plasticity.
+"""P-P Hebbian plasticity (Phase 3.1: symmetric ρ(age) on growth + decay).
 
-Mirrors the N-level rule (covariance Hebbian + age-modulated decay)
-but operates on the dynamic :class:`PConnectivity` dict instead of a
-fixed matrix:
+Mirrors the N-level rule (covariance Hebbian + age-modulated decay,
+both scaled by ρ(age)) but operates on the dynamic
+:class:`PConnectivity` dict instead of a fixed matrix:
 
-* Existing connections track ``Δw = η · (a_i · a_j − ⟨a⟩²) − age_decay``.
+* Existing connections track
+  ``Δw = ρ · η · (a_i · a_j − ⟨a⟩²) − ρ · λ · w``.
 * Non-existing connections are *created* only when the raw co-activation
   ``a_i · a_j`` exceeds ``min_coactivation_to_create``. This gate
   prevents noise-floor co-activations from spawning a long tail of
   near-zero P-P edges that would have to be tracked and decayed every
-  step.
+  step. The creation gate uses RAW co-activation (independent of ρ)
+  so the gate threshold has consistent meaning across ages.
 
 Per Q2 = A, the same mechanism that grows N-N edges grows P-P edges —
-emergence is hierarchical, not parameterised separately.
+emergence is hierarchical, not parameterised separately. Per the
+Phase 3.1 correction (THEORY.md §3.2), ρ(age) applies symmetrically
+at every plasticity scale.
 
 Covariance baseline note:
     With ``len(p_entities) == 2`` the covariance baseline
@@ -25,13 +29,13 @@ Covariance baseline note:
 
 from __future__ import annotations
 
-import math
 from typing import Dict
 
 import numpy as np
 
 from .p_connectivity import PConnectivity
 from .p_entity import PEntity
+from .plasticity import rho_age
 
 
 def apply_pp_plasticity(
@@ -67,7 +71,11 @@ def apply_pp_plasticity(
     mean_act = float(activations.mean())
     mean_sq = mean_act * mean_act
 
-    age_factor = 1.0 / (1.0 + math.log(1.0 + system_age))
+    # Phase 3.1: symmetric age modulation. Same ρ scales BOTH the
+    # Hebbian (growth) and decay terms. Equilibrium W stays the same;
+    # the timescale to reach it slows with age.
+    rho = rho_age(system_age)
+    eta_effective = eta_pp * rho
 
     for i in range(n_p):
         a_i = float(activations[i])
@@ -77,16 +85,19 @@ def apply_pp_plasticity(
             id_b = p_ids[j]
 
             coact_signal = a_i * a_j - mean_sq
-            delta = eta_pp * coact_signal
+            delta = eta_effective * coact_signal
 
             current_w = p_connectivity.get_weight(id_a, id_b)
             if current_w > 0.0:
-                # Existing connection: Hebbian + age-modulated decay.
-                decay = age_factor * lambda_pp_decay * current_w
+                # Existing connection: Hebbian + age-modulated decay,
+                # both scaled by ρ.
+                decay = rho * lambda_pp_decay * current_w
                 p_connectivity.update_weight(id_a, id_b, delta - decay)
             else:
                 # Creation gate: require BOTH a positive Hebbian delta
-                # (covariance) AND a strong raw co-activation (so we
-                # don't insert edges off the noise floor).
+                # (covariance) AND a strong RAW co-activation (so we
+                # don't insert edges off the noise floor). The gate
+                # uses raw a_i · a_j (independent of ρ) so the
+                # threshold has consistent meaning across ages.
                 if delta > 0.0 and a_i * a_j > min_coactivation_to_create:
                     p_connectivity.update_weight(id_a, id_b, delta)

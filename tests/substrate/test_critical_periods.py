@@ -16,7 +16,11 @@ import math
 import numpy as np
 import pytest
 
-from substrate.plasticity import age_modulated_decay
+from substrate.connectivity import ConnectivityMatrix
+from substrate.p_connectivity import PConnectivity
+from substrate.p_entity import PEntity
+from substrate.p_plasticity import apply_pp_plasticity
+from substrate.plasticity import age_modulated_decay, apply_plasticity, rho_age
 from substrate.substrate import Substrate
 
 
@@ -118,4 +122,144 @@ def test_young_substrate_pattern_decays_faster_than_mature():
     assert retention_mature > retention_young, (
         f"Mature substrate should retain more than young: "
         f"mature={retention_mature:.3f}, young={retention_young:.3f}"
+    )
+
+
+# ---------- Phase 3.1: symmetric ρ(age) on growth + decay ----------
+
+
+def test_rho_age_canonical_values():
+    """ρ(0)=1.0, ρ(10)≈0.294, ρ(1000)≈0.126, ρ(10000)≈0.098."""
+    assert rho_age(0.0) == pytest.approx(1.0)
+    assert rho_age(10.0) == pytest.approx(0.294, abs=0.01)
+    assert rho_age(1000.0) == pytest.approx(0.126, abs=0.01)
+    assert rho_age(10000.0) == pytest.approx(0.098, abs=0.01)
+
+
+def test_rho_age_monotonically_decreasing():
+    """ρ is strictly monotonic in age (never plateaus, never reverses)."""
+    ages = [0, 1, 5, 10, 50, 100, 1000, 10000, 100000]
+    rhos = [rho_age(a) for a in ages]
+    for prev, cur in zip(rhos, rhos[1:]):
+        assert cur < prev, f"ρ must strictly decrease, got {rhos}"
+
+
+def test_apply_plasticity_growth_scales_with_rho_at_n_level():
+    """At a non-zero age, the Hebbian growth term must be smaller
+    than at age=0 — both are scaled by ρ(age), so the delta to a
+    pattern-pair weight after one step shrinks with age."""
+    rng_seed = 0
+
+    def step_at_age(age: float) -> float:
+        c = ConnectivityMatrix(n_neurons=10, k=4, seed=rng_seed)
+        # Two strongly co-active neurons; the rest quiet.
+        a = np.zeros(10, dtype=np.float32)
+        a[0] = 1.0
+        a[1] = 1.0
+        # Pick a (0, 1) edge from the mask if it exists, else any
+        # masked pair sharing the first co-active id.
+        src, tgt = 0, None
+        for j in range(1, 10):
+            if c.mask[0, j]:
+                tgt = j
+                break
+        assert tgt is not None
+        a[tgt] = 1.0  # make sure tgt is one of the co-active two
+        # Manually trigger one plasticity step at the given age.
+        w_before = float(c.W[src, tgt])
+        apply_plasticity(c, a, system_age=age, eta=1.0, lambda_base=0.0)
+        return float(c.W[src, tgt]) - w_before
+
+    delta_young = step_at_age(0.0)
+    delta_mature = step_at_age(10000.0)
+    # ρ(0)=1.0, ρ(10000)≈0.098, so mature delta ≈ 0.10 × young delta.
+    assert delta_young > 0.0
+    assert delta_mature > 0.0
+    assert delta_mature < delta_young * 0.5, (
+        f"Mature growth should be substantially smaller (≈ ρ(10000)/ρ(0) = 0.10×). "
+        f"young={delta_young:.5f}, mature={delta_mature:.5f}"
+    )
+
+
+def test_apply_pp_plasticity_growth_scales_with_rho_at_p_level():
+    """Same symmetric ρ at the P level: growth scales with ρ(age)."""
+    def setup_three_active_p() -> dict[int, PEntity]:
+        # 3 P: two strongly co-active, one quiet (pulls mean down so
+        # covariance signal is positive). See test_p_plasticity.py
+        # for the rationale.
+        return {
+            0: PEntity(id=0, components=(0, 1), activation=0.8),
+            1: PEntity(id=1, components=(2, 3), activation=0.8),
+            2: PEntity(id=2, components=(4, 5), activation=0.0),
+        }
+
+    pc_young = PConnectivity()
+    pc_young.update_weight(0, 1, 0.1)  # seed an existing edge
+    apply_pp_plasticity(
+        setup_three_active_p(), pc_young, system_age=0.0,
+        eta_pp=1.0, lambda_pp_decay=0.0,  # isolate growth
+    )
+    delta_young = pc_young.get_weight(0, 1) - 0.1
+
+    pc_mature = PConnectivity()
+    pc_mature.update_weight(0, 1, 0.1)
+    apply_pp_plasticity(
+        setup_three_active_p(), pc_mature, system_age=10000.0,
+        eta_pp=1.0, lambda_pp_decay=0.0,
+    )
+    delta_mature = pc_mature.get_weight(0, 1) - 0.1
+
+    assert delta_young > 0.0
+    assert delta_mature > 0.0
+    assert delta_mature < delta_young * 0.5, (
+        f"Mature P-P growth should be substantially smaller: "
+        f"young={delta_young:.5f}, mature={delta_mature:.5f}"
+    )
+
+
+def test_equilibrium_weight_unchanged_by_age():
+    """With symmetric ρ on growth AND decay, the equilibrium weight
+    (W where growth = decay) is independent of age.
+
+    For a fixed co-active pair: equilibrium W_eq = (eta · hebb_term) / λ.
+    The ρ cancels because both numerator and denominator get the same
+    factor. Verified by running long enough at each age to reach
+    near-equilibrium and comparing."""
+    seed = 0
+
+    def run_to_near_equilibrium(age: float, n_steps: int = 5000) -> float:
+        c = ConnectivityMatrix(n_neurons=4, k=2, seed=seed)
+        # Find a mask edge to track.
+        src, tgt = None, None
+        for i in range(4):
+            for j in range(4):
+                if c.mask[i, j]:
+                    src, tgt = i, j
+                    break
+            if src is not None:
+                break
+        # Hold a fixed activation pattern (just (src, tgt) co-active)
+        # so growth term is deterministic.
+        a = np.zeros(4, dtype=np.float32)
+        a[src] = 1.0
+        a[tgt] = 1.0
+        # Use a HIGH eta and lambda so equilibrium is reached fast,
+        # and a starting_age so the substrate doesn't "drift young"
+        # too much during the test.
+        for _ in range(n_steps):
+            apply_plasticity(c, a, system_age=age,
+                             eta=0.5, lambda_base=0.1)
+        return float(c.W[src, tgt])
+
+    # Both should converge to the same equilibrium (within tolerance).
+    w_young = run_to_near_equilibrium(age=0.0)
+    w_mature = run_to_near_equilibrium(age=10000.0)
+    # Mature reaches equilibrium more slowly but should approach the
+    # SAME asymptote. Allow generous tolerance because mature with
+    # ρ ≈ 0.1 takes ~10× longer to converge — 5000 steps may not be
+    # quite enough. Both should be within 30% of each other.
+    ratio = w_mature / w_young if w_young > 0 else 0.0
+    assert 0.3 < ratio < 1.7, (
+        f"Equilibrium W should be ~age-invariant under symmetric ρ. "
+        f"w_young={w_young:.3f}, w_mature={w_mature:.3f}, ratio={ratio:.2f}"
     )

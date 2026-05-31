@@ -21,56 +21,56 @@
       "target_mean": 0.0,
       "target_max": 0.0,
       "target_above_threshold_frac": 0.0,
-      "background_mean": 0.00010297831613570452,
+      "background_mean": 8.169274224201217e-05,
       "background_above_threshold_frac": 0.0,
-      "completion_score": -0.00010297831613570452
+      "completion_score": -8.169274224201217e-05
     },
     {
       "K": 10,
       "n_cue": 12,
       "n_target": 13,
-      "target_mean": 0.05387864634394646,
-      "target_max": 0.634509801864624,
-      "target_above_threshold_frac": 0.07692307692307693,
+      "target_mean": 0.0,
+      "target_max": 0.0,
+      "target_above_threshold_frac": 0.0,
       "background_mean": 0.0,
       "background_above_threshold_frac": 0.0,
-      "completion_score": 0.05387864634394646
+      "completion_score": 0.0
     },
     {
       "K": 20,
       "n_cue": 12,
       "n_target": 13,
-      "target_mean": 0.22219589352607727,
-      "target_max": 1.0,
-      "target_above_threshold_frac": 0.3076923076923077,
+      "target_mean": 0.0006603667279705405,
+      "target_max": 0.008584767580032349,
+      "target_above_threshold_frac": 0.0,
       "background_mean": 0.0,
       "background_above_threshold_frac": 0.0,
-      "completion_score": 0.22219589352607727
+      "completion_score": 0.0006603667279705405
     },
     {
       "K": 35,
       "n_cue": 12,
       "n_target": 13,
-      "target_mean": 0.606934666633606,
-      "target_max": 1.0,
-      "target_above_threshold_frac": 0.6923076923076923,
+      "target_mean": 0.0027226002421230078,
+      "target_max": 0.03539380431175232,
+      "target_above_threshold_frac": 0.0,
       "background_mean": 0.0,
       "background_above_threshold_frac": 0.0,
-      "completion_score": 0.606934666633606
+      "completion_score": 0.0027226002421230078
     },
     {
       "K": 50,
       "n_cue": 12,
       "n_target": 13,
-      "target_mean": 0.7662438750267029,
-      "target_max": 1.0,
-      "target_above_threshold_frac": 0.8461538461538461,
+      "target_mean": 0.0017407009145244956,
+      "target_max": 0.022629112005233765,
+      "target_above_threshold_frac": 0.0,
       "background_mean": 0.0,
       "background_above_threshold_frac": 0.0,
-      "completion_score": 0.7662438750267029
+      "completion_score": 0.0017407009145244956
     }
   ],
-  "final_total_weight": 549.1450805664062,
-  "final_sparsity": 0.044,
+  "final_total_weight": 538.6129760742188,
+  "final_sparsity": 0.0,
   "final_system_age": 1500.0
 }

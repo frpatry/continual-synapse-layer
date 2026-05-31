@@ -1,12 +1,23 @@
 """Plasticity rules: covariance Hebbian update + age-modulated decay.
 
-Implements decision D3 in the spec / THEORY.md §3.2:
+Implements decision D3 / THEORY.md §3.2:
 
-    Δw[i, j] = η · cov(a_i, a_j) − g(w[i, j], age)
+    Δw[i, j] = ρ(age) · η · cov(a_i, a_j) − ρ(age) · λ · w[i, j]
 
-where ``cov`` is the mean-subtracted product (allows both
-strengthening and weakening), and ``g`` is a decay term whose
-rate is slowed by ``system_age`` (critical-period dynamics, P4).
+The age modulator ``ρ(age) = 1 / (1 + log(1 + age))`` scales BOTH
+growth and decay (Phase 3.1: symmetric modulation per the corrected
+§3.2). This preserves the equilibrium weight ``W_eq = η·hebb / λ``
+across ages but changes the *timescale* of convergence:
+
+* Young (``age=0``, ρ=1.0): fast plasticity in both directions →
+  fast learning AND fast forgetting (biological volatility).
+* Mature (``age≫1``, ρ≈0.1): slow plasticity in both directions →
+  slow learning AND slow forgetting (biological stability).
+
+Phase 3 (asymmetric — decay-only) produced a WEAK verdict because
+mature substrates had *less* decay competing with the unscaled
+growth, so mature actually reached equilibrium faster. Phase 3.1's
+symmetric formulation produces the biological critical-period story.
 """
 
 from __future__ import annotations
@@ -18,6 +29,20 @@ import numpy as np
 
 if TYPE_CHECKING:
     from .connectivity import ConnectivityMatrix
+
+
+def rho_age(system_age: float) -> float:
+    """Symmetric age modulator (THEORY.md §3.2, Phase 3.1).
+
+    ρ(age) = 1 / (1 + log(1 + age))
+
+    Returns 1.0 at age=0, ≈0.29 at age=10, ≈0.13 at age=1000,
+    ≈0.10 at age=10000. Asymptotes toward 0 but never reaches it.
+
+    Applied SYMMETRICALLY to both Hebbian growth and decay, so:
+        Δw = ρ · (η · hebb_term − λ · w)
+    """
+    return 1.0 / (1.0 + math.log(1.0 + max(0.0, float(system_age))))
 
 
 def covariance_hebbian_update(
@@ -46,19 +71,16 @@ def age_modulated_decay(
     system_age: float,
     lambda_base: float = 0.001,
 ) -> np.ndarray:
-    """Decay term whose rate is slowed by system age.
+    """Decay term whose rate is slowed by system age — ``Δw_decay = −ρ(age) · λ · W``.
 
-    ``Δw_decay = −(1 / (1 + log(1 + age))) · λ_base · W``
+    - Young (``age = 0``): ρ = 1, decay at full ``λ`` rate.
+    - Mature (``age ≫ 1``): ρ → 0, decay rate approaches zero.
 
-    - Young (``age = 0``): factor = 1, decay applied at the full
-      ``λ_base`` rate.
-    - Mature (``age ≫ 1``): factor → 0, decay rate approaches
-      zero, established weights persist (P4 / critical period).
-
-    Returns a non-positive ``(n, n)`` delta.
+    Returns a non-positive ``(n, n)`` delta. (Same as Phase 1.x;
+    unchanged in 3.1 — symmetric modulation is achieved by
+    :func:`apply_plasticity` also scaling ``eta`` by ``ρ``.)
     """
-    age_factor = 1.0 / (1.0 + math.log(1.0 + max(0.0, float(system_age))))
-    return (-age_factor * lambda_base * W).astype(np.float32)
+    return (-rho_age(system_age) * lambda_base * W).astype(np.float32)
 
 
 def apply_plasticity(
@@ -68,11 +90,14 @@ def apply_plasticity(
     eta: float = 0.01,
     lambda_base: float = 0.001,
 ) -> None:
-    """Combined plasticity step — Hebbian growth + age decay.
+    """Combined plasticity step — Hebbian growth + age decay,
+    BOTH scaled by ρ(age) (Phase 3.1, symmetric modulation).
 
-    Modifies ``connectivity`` in place. Per H3, this runs every
-    timestep (forward-pass-as-learning).
+    Modifies ``connectivity`` in place. Per H3, runs every timestep
+    (forward-pass-as-learning).
     """
-    hebb = covariance_hebbian_update(activations, eta)
+    rho = rho_age(system_age)
+    hebb = covariance_hebbian_update(activations, eta=eta * rho)
+    # ``age_modulated_decay`` already scales by ρ internally.
     decay = age_modulated_decay(connectivity.W, system_age, lambda_base)
     connectivity.update_weights(hebb + decay)
