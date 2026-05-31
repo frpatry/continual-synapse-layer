@@ -1,0 +1,338 @@
+{
+  "config": {
+    "n_neurons": 500,
+    "M": 5,
+    "pattern_size": 10,
+    "K_per_pattern": 80,
+    "T_present": 15,
+    "T_rest": 60,
+    "T_settle": 30,
+    "seed": 42
+  },
+  "patterns": [
+    [
+      71,
+      109,
+      181,
+      205,
+      221,
+      290,
+      334,
+      375,
+      378,
+      434
+    ],
+    [
+      41,
+      55,
+      142,
+      145,
+      148,
+      182,
+      227,
+      292,
+      371,
+      408
+    ],
+    [
+      15,
+      63,
+      119,
+      209,
+      235,
+      251,
+      411,
+      418,
+      440,
+      456
+    ],
+    [
+      5,
+      54,
+      212,
+      220,
+      254,
+      255,
+      269,
+      297,
+      391,
+      478
+    ],
+    [
+      2,
+      94,
+      214,
+      244,
+      316,
+      324,
+      340,
+      345,
+      348,
+      374
+    ]
+  ],
+  "history": [
+    {
+      "stage": 0,
+      "trained_patterns_so_far": 1,
+      "P_counts": {
+        "P_pattern_0": 1,
+        "P_pattern_1": 0,
+        "P_pattern_2": 0,
+        "P_pattern_3": 0,
+        "P_pattern_4": 0,
+        "P_bridge_0_1": 0,
+        "P_bridge_0_2": 0,
+        "P_bridge_0_3": 0,
+        "P_bridge_0_4": 0,
+        "P_bridge_1_2": 0,
+        "P_bridge_1_3": 0,
+        "P_bridge_1_4": 0,
+        "P_bridge_2_3": 0,
+        "P_bridge_2_4": 0,
+        "P_bridge_3_4": 0,
+        "P_bridges_total": 0,
+        "P_other": 0,
+        "P_total": 1
+      },
+      "recalls": [
+        {
+          "pattern": 0,
+          "completion": 0.2
+        }
+      ],
+      "system_age": 6030.0
+    },
+    {
+      "stage": 1,
+      "trained_patterns_so_far": 2,
+      "P_counts": {
+        "P_pattern_0": 0,
+        "P_pattern_1": 3,
+        "P_pattern_2": 0,
+        "P_pattern_3": 0,
+        "P_pattern_4": 0,
+        "P_bridge_0_1": 0,
+        "P_bridge_0_2": 0,
+        "P_bridge_0_3": 0,
+        "P_bridge_0_4": 0,
+        "P_bridge_1_2": 0,
+        "P_bridge_1_3": 0,
+        "P_bridge_1_4": 0,
+        "P_bridge_2_3": 0,
+        "P_bridge_2_4": 0,
+        "P_bridge_3_4": 0,
+        "P_bridges_total": 0,
+        "P_other": 0,
+        "P_total": 3
+      },
+      "recalls": [
+        {
+          "pattern": 0,
+          "completion": 0.0
+        },
+        {
+          "pattern": 1,
+          "completion": 0.2
+        }
+      ],
+      "system_age": 12090.0
+    },
+    {
+      "stage": 2,
+      "trained_patterns_so_far": 3,
+      "P_counts": {
+        "P_pattern_0": 0,
+        "P_pattern_1": 3,
+        "P_pattern_2": 0,
+        "P_pattern_3": 0,
+        "P_pattern_4": 0,
+        "P_bridge_0_1": 0,
+        "P_bridge_0_2": 0,
+        "P_bridge_0_3": 0,
+        "P_bridge_0_4": 0,
+        "P_bridge_1_2": 2,
+        "P_bridge_1_3": 0,
+        "P_bridge_1_4": 0,
+        "P_bridge_2_3": 0,
+        "P_bridge_2_4": 0,
+        "P_bridge_3_4": 0,
+        "P_bridges_total": 2,
+        "P_other": 0,
+        "P_total": 5
+      },
+      "recalls": [
+        {
+          "pattern": 0,
+          "completion": 0.0
+        },
+        {
+          "pattern": 1,
+          "completion": 0.2
+        },
+        {
+          "pattern": 2,
+          "completion": 0.4
+        }
+      ],
+      "system_age": 18180.0
+    },
+    {
+      "stage": 3,
+      "trained_patterns_so_far": 4,
+      "P_counts": {
+        "P_pattern_0": 0,
+        "P_pattern_1": 3,
+        "P_pattern_2": 0,
+        "P_pattern_3": 2,
+        "P_pattern_4": 0,
+        "P_bridge_0_1": 0,
+        "P_bridge_0_2": 0,
+        "P_bridge_0_3": 0,
+        "P_bridge_0_4": 0,
+        "P_bridge_1_2": 2,
+        "P_bridge_1_3": 5,
+        "P_bridge_1_4": 0,
+        "P_bridge_2_3": 1,
+        "P_bridge_2_4": 0,
+        "P_bridge_3_4": 0,
+        "P_bridges_total": 8,
+        "P_other": 0,
+        "P_total": 13
+      },
+      "recalls": [
+        {
+          "pattern": 0,
+          "completion": 0.0
+        },
+        {
+          "pattern": 1,
+          "completion": 0.2
+        },
+        {
+          "pattern": 2,
+          "completion": 0.4
+        },
+        {
+          "pattern": 3,
+          "completion": 0.8
+        }
+      ],
+      "system_age": 24300.0
+    },
+    {
+      "stage": 4,
+      "trained_patterns_so_far": 5,
+      "P_counts": {
+        "P_pattern_0": 0,
+        "P_pattern_1": 3,
+        "P_pattern_2": 0,
+        "P_pattern_3": 4,
+        "P_pattern_4": 2,
+        "P_bridge_0_1": 0,
+        "P_bridge_0_2": 0,
+        "P_bridge_0_3": 0,
+        "P_bridge_0_4": 0,
+        "P_bridge_1_2": 2,
+        "P_bridge_1_3": 5,
+        "P_bridge_1_4": 3,
+        "P_bridge_2_3": 1,
+        "P_bridge_2_4": 3,
+        "P_bridge_3_4": 15,
+        "P_bridges_total": 29,
+        "P_other": 0,
+        "P_total": 38
+      },
+      "recalls": [
+        {
+          "pattern": 0,
+          "completion": 0.0
+        },
+        {
+          "pattern": 1,
+          "completion": 0.2
+        },
+        {
+          "pattern": 2,
+          "completion": 0.4
+        },
+        {
+          "pattern": 3,
+          "completion": 0.8
+        },
+        {
+          "pattern": 4,
+          "completion": 0.8
+        }
+      ],
+      "system_age": 30450.0
+    }
+  ],
+  "combined_tests": [
+    {
+      "n_combined": 2,
+      "activations_per_pattern": [
+        0.0,
+        1.0
+      ],
+      "mean_activation": 0.5,
+      "min_activation": 0.0
+    },
+    {
+      "n_combined": 3,
+      "activations_per_pattern": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "mean_activation": 0.3333333333333333,
+      "min_activation": 0.0
+    },
+    {
+      "n_combined": 4,
+      "activations_per_pattern": [
+        0.0,
+        1.0,
+        0.0,
+        1.0
+      ],
+      "mean_activation": 0.5,
+      "min_activation": 0.0
+    },
+    {
+      "n_combined": 5,
+      "activations_per_pattern": [
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        1.0
+      ],
+      "mean_activation": 0.6,
+      "min_activation": 0.0
+    }
+  ],
+  "final_summary": {
+    "pattern_p_counts": [
+      0,
+      3,
+      0,
+      4,
+      2
+    ],
+    "pattern_recalls": [
+      0.0,
+      0.2,
+      0.4,
+      0.8,
+      0.8
+    ],
+    "bridges_total": 29,
+    "avg_bridges_per_pair": 2.9,
+    "all_patterns_have_p": false,
+    "all_patterns_recall": false,
+    "bridges_modest": true
+  },
+  "verdict": "FAIL_capacity",
+  "reason": "Pattern(s) [0, 2] lost (almost) all their P entities \u2014 catastrophic forgetting under sequential training. Motivates Phase 6: S-level consolidation to protect established patterns from later training's decay."
+}
