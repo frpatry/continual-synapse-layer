@@ -1,0 +1,359 @@
+{
+  "config": {
+    "n_neurons": 500,
+    "M": 5,
+    "pattern_size": 10,
+    "K_per_pattern": 80,
+    "K_consolidate": 1500,
+    "rho_floor": 0.3,
+    "k_protect": 0,
+    "alpha_p_to_s": 0.3,
+    "gamma_s_to_p": 1.0,
+    "s_sparsity_target": 0.2,
+    "s_min_active": 1,
+    "s_max_active": 3,
+    "schedule": "Phase 6c interleaved",
+    "seed": 42
+  },
+  "history": [
+    {
+      "stage": 0,
+      "P_counts": [
+        4,
+        0,
+        0,
+        0,
+        0
+      ],
+      "recalls": [
+        0.6,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "bridges": 0,
+      "s_count": 1,
+      "s_active": 1,
+      "s_sizes": [
+        2
+      ],
+      "step_count": 7650,
+      "system_age": 7650.0
+    },
+    {
+      "stage": 1,
+      "P_counts": [
+        2,
+        6,
+        0,
+        0,
+        0
+      ],
+      "recalls": [
+        0.4,
+        0.4,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "bridges": 0,
+      "s_count": 1,
+      "s_active": 1,
+      "s_sizes": [
+        2
+      ],
+      "step_count": 15300,
+      "system_age": 15300.0
+    },
+    {
+      "stage": 2,
+      "P_counts": [
+        2,
+        3,
+        6,
+        0,
+        0
+      ],
+      "recalls": [
+        0.4,
+        0.2,
+        0.8,
+        0.0,
+        0.0
+      ],
+      "bridges": 7,
+      "s_count": 1,
+      "s_active": 1,
+      "s_sizes": [
+        2
+      ],
+      "step_count": 22950,
+      "system_age": 22950.0
+    },
+    {
+      "stage": 3,
+      "P_counts": [
+        2,
+        3,
+        3,
+        5,
+        0
+      ],
+      "recalls": [
+        0.4,
+        0.2,
+        0.6,
+        1.0,
+        0.0
+      ],
+      "bridges": 13,
+      "s_count": 1,
+      "s_active": 1,
+      "s_sizes": [
+        2
+      ],
+      "step_count": 30600,
+      "system_age": 30600.0
+    },
+    {
+      "stage": 4,
+      "P_counts": [
+        2,
+        3,
+        3,
+        4,
+        0
+      ],
+      "recalls": [
+        0.2,
+        0.2,
+        0.6,
+        0.8,
+        0.4
+      ],
+      "bridges": 24,
+      "s_count": 1,
+      "s_active": 1,
+      "s_sizes": [
+        2
+      ],
+      "step_count": 38250,
+      "system_age": 38250.0
+    }
+  ],
+  "final": {
+    "P_counts": [
+      2,
+      3,
+      3,
+      4,
+      0
+    ],
+    "recalls": [
+      0.2,
+      0.2,
+      0.6,
+      0.8,
+      0.4
+    ],
+    "bridges": 24,
+    "n_alive": 4,
+    "n_recall": 3,
+    "s_count": 1,
+    "s_active": 1,
+    "s_sizes": [
+      2
+    ]
+  },
+  "baselines": {
+    "5b": {
+      "counts": [
+        0,
+        3,
+        0,
+        4,
+        2
+      ],
+      "recalls": [
+        0.0,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ]
+    },
+    "6a": {
+      "counts": [
+        2,
+        5,
+        1,
+        5,
+        0
+      ],
+      "recalls": [
+        0.4,
+        0.2,
+        0.6,
+        1.0,
+        0.2
+      ]
+    },
+    "6b": {
+      "counts": [
+        2,
+        3,
+        2,
+        4,
+        2
+      ],
+      "recalls": [
+        0.0,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ]
+    },
+    "6c": {
+      "counts": [
+        2,
+        3,
+        2,
+        4,
+        1
+      ],
+      "recalls": [
+        0.4,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ]
+    },
+    "6d": {
+      "counts": [
+        2,
+        3,
+        2,
+        4,
+        2
+      ],
+      "recalls": [
+        0.0,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ]
+    },
+    "6e": {
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "recalls": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "6e'": {
+      "counts": [
+        0,
+        5,
+        1,
+        4,
+        0
+      ],
+      "recalls": [
+        0.2,
+        0.4,
+        0.4,
+        0.8,
+        0.4
+      ]
+    },
+    "6f": {
+      "counts": [
+        2,
+        3,
+        1,
+        4,
+        2
+      ],
+      "recalls": [
+        0.2,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ]
+    },
+    "6g": {
+      "counts": [
+        11,
+        27,
+        16,
+        0,
+        0
+      ],
+      "recalls": [
+        0.5,
+        0.8,
+        0.8,
+        0.4,
+        0.0
+      ]
+    },
+    "6h": {
+      "counts": [
+        2,
+        3,
+        1,
+        4,
+        1
+      ],
+      "recalls": [
+        0.4,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ]
+    }
+  },
+  "n_alive_by_phase": {
+    "5b": 3,
+    "6a": 3,
+    "6b": 5,
+    "6c": 4,
+    "6d": 5,
+    "6e": 0,
+    "6e'": 2,
+    "6f": 4,
+    "6g": 3,
+    "6h": 3,
+    "6i": 4
+  },
+  "n_recall_by_phase": {
+    "5b": 3,
+    "6a": 3,
+    "6b": 3,
+    "6c": 4,
+    "6d": 3,
+    "6e": 0,
+    "6e'": 4,
+    "6f": 3,
+    "6g": 4,
+    "6h": 4,
+    "6i": 3
+  },
+  "verdict": "WORSE_THAN_6C",
+  "reason": "4/3 worse than 6c's 4/4. S-level introduces interference. Possible: S\u2192P feedback boost destabilises P-level competition. Tune \u03b3_s_to_p down or restrict S emergence further."
+}

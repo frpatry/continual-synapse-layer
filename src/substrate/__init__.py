@@ -34,6 +34,14 @@ from .p_entity import PEntity
 from .p_plasticity import apply_pp_plasticity
 from .p_to_n_feedback import compute_p_to_n_feedback
 from .pass_tracker import PassTracker
+from .s_dynamics import (
+    compute_s_k,
+    propagate_s_activations,
+    s_winners_take_all,
+)
+from .s_entity import SEntity
+from .s_pass_tracker import SPassTracker
+from .s_to_p_feedback import compute_s_to_p_feedback
 from .plasticity import (
     age_modulated_decay,
     apply_plasticity,
@@ -50,16 +58,22 @@ __all__ = [
     "PConnectivity",
     "PEntity",
     "PassTracker",
+    "SEntity",
+    "SPassTracker",
     "Substrate",
     "age_modulated_decay",
     "apply_plasticity",
     "apply_pp_plasticity",
     "compute_p_input",
     "compute_p_to_n_feedback",
+    "compute_s_k",
+    "compute_s_to_p_feedback",
     "covariance_hebbian_update",
     "k_winners_take_all",
     "propagate_activation",
     "propagate_p_activations",
+    "propagate_s_activations",
     "rho_age",
+    "s_winners_take_all",
     "soft_threshold",
 ]

@@ -48,7 +48,11 @@ from .p_entity import PEntity
 from .p_plasticity import apply_pp_plasticity
 from .p_to_n_feedback import compute_p_to_n_feedback
 from .pass_tracker import PassTracker
-from .plasticity import apply_plasticity
+from .plasticity import apply_plasticity, rho_age
+from .s_dynamics import propagate_s_activations
+from .s_entity import SEntity
+from .s_pass_tracker import SPassTracker
+from .s_to_p_feedback import compute_s_to_p_feedback
 
 
 class Substrate:
@@ -106,6 +110,23 @@ class Substrate:
         rho_floor: float = 0.7,
         # ---- Phase 6f fresh-pattern protection ----
         k_protect: int = 5000,
+        # ---- Phase 6i S-level (third ontological tier) ----
+        theta_s_emergence: float = 0.5,
+        s_pass_boost: float = 0.1,
+        s_pass_decay: float = 0.95,
+        s_pass_theta_high: float = 0.1,
+        s_pass_theta_low: float = 0.05,
+        theta_s_growth: float = 0.3,
+        alpha_p_to_s: float = 0.3,
+        s_threshold: float = 0.2,
+        s_sparsity_target: float = 0.20,
+        s_min_active: int = 1,
+        s_max_active: int = 3,
+        s_background_noise_sigma: float = 0.01,
+        gamma_s_to_p: float = 1.0,
+        eta_s: float = 0.005,
+        lambda_s_decay: float = 0.001,
+        s_viability_threshold: float = 0.1,
         # -----------------------------------------
         seed: int = 42,
     ) -> None:
@@ -166,6 +187,42 @@ class Substrate:
         # ~30 min – 1 h post-induction. Set ``k_protect=0`` to disable
         # the protection mechanism.
         self.k_protect: int = int(k_protect)
+
+        # ---------- Phase 6i S-level (third ontological tier) ----------
+        self.theta_s_emergence: float = float(theta_s_emergence)
+        self.theta_s_growth: float = float(theta_s_growth)
+        self.alpha_p_to_s: float = float(alpha_p_to_s)
+        self.s_threshold: float = float(s_threshold)
+        self.s_sparsity_target: float = float(s_sparsity_target)
+        self.s_min_active: int = int(s_min_active)
+        self.s_max_active: int = int(s_max_active)
+        self.s_background_noise_sigma: float = float(s_background_noise_sigma)
+        self.gamma_s_to_p: float = float(gamma_s_to_p)
+        self.eta_s: float = float(eta_s)
+        self.lambda_s_decay: float = float(lambda_s_decay)
+        self.s_viability_threshold: float = float(s_viability_threshold)
+
+        # Live S entities, keyed by id. Emerges/dissolves dynamically.
+        self.s_entities: Dict[int, SEntity] = {}
+        self._next_s_id: int = 0
+        # Canonical (min_p_id, max_p_id) pairs that have already produced
+        # an S — prevents emergence of two S from the same P pair.
+        self.s_pairs_emerged: Set[Tuple[int, int]] = set()
+        # Emergence log for diagnostics.
+        self.s_emergence_history: List[dict] = []
+
+        # Tracker for P-P co-activation candidacy (for S emergence) and
+        # P-S co-activation candidacy (for S growth).
+        self.s_pass_tracker = SPassTracker(
+            boost=s_pass_boost,
+            decay=s_pass_decay,
+            theta_high=s_pass_theta_high,
+            theta_low=s_pass_theta_low,
+        )
+
+        # Independent RNG for S-level noise (reproducible + decoupled
+        # from N background and P-level RNGs).
+        self.s_rng: np.random.Generator = np.random.default_rng(self.seed + 3)
 
         # ---------- Phase 2a P-level state ----------
         self.theta_emergence: float = float(theta_emergence)
@@ -293,6 +350,15 @@ class Substrate:
         for (i, j) in candidates:
             self._emerge_p(i, j)
 
+        # ---------- Phase 6i: S → P feedback (computed BEFORE P propagation) ----
+        # Captures CURRENT (previous step's) S activations so S boost
+        # reflects the schema state at start-of-step. Empty dict if no S.
+        s_to_p_boost = compute_s_to_p_feedback(
+            s_entities=self.s_entities,
+            p_entities=self.p_entities,
+            gamma_s_to_p=self.gamma_s_to_p,
+        )
+
         # ---------- Phase 2b: P-level dynamics ----------
         # Synchronous update: each P sees its neighbours' OLD activations.
         if self.p_entities:
@@ -306,8 +372,15 @@ class Substrate:
                 p_background_noise_sigma=self.p_background_noise_sigma,
                 rng=self.p_rng,
             )
+            # Apply S → P feedback post-threshold (cf. s_to_p_feedback
+            # docstring: S boosts P that already cleared their own gate,
+            # rather than injecting new activity from scratch). Clip to
+            # the canonical [0, 1] activation range.
             for p_id, new_act in new_p_activations.items():
-                self.p_entities[p_id].activation = new_act
+                boosted = new_act + s_to_p_boost.get(p_id, 0.0)
+                self.p_entities[p_id].activation = float(
+                    max(0.0, min(1.0, boosted))
+                )
 
         # ---------- Phase 2b: P-P plasticity (Hebbian + creation gate) ----
         apply_pp_plasticity(
@@ -321,7 +394,56 @@ class Substrate:
         )
 
         # ---------- P weight decay + dissolution ----------
-        self._decay_and_dissolve_p()
+        dissolved_p_ids = self._decay_and_dissolve_p()
+
+        # ---------- Phase 6i: S-level update ----------
+        # 1. Update S pass tracker on current P + S activations.
+        # 2. Detect new S emergences (P-P pair candidacy) + growth
+        #    (P-S candidacy → add P to existing S).
+        # 3. Propagate S activations from (now-updated) P contents.
+        # 4. S plasticity (growth + age-modulated decay).
+        # 5. Dissolve unviable S.
+        # 6. Clean up s_pass_tracker for dissolved P + S.
+        self.s_pass_tracker.update(self.p_entities, self.s_entities)
+
+        s_emergence = self.s_pass_tracker.find_s_emergence_candidates(
+            theta_s_emergence=self.theta_s_emergence,
+            n_min_passes=self.n_min_passes,
+            existing_s_pairs=self.s_pairs_emerged,
+        )
+        for (p_a, p_b) in s_emergence:
+            self._emerge_s(p_a, p_b)
+
+        s_growth = self.s_pass_tracker.find_s_growth_candidates(
+            theta_growth=self.theta_s_growth,
+            n_min_passes=self.n_min_passes,
+        )
+        for (p_id, s_id) in s_growth:
+            if s_id in self.s_entities and p_id in self.p_entities:
+                self.s_entities[s_id].add_member(p_id)
+
+        if self.s_entities:
+            new_s_activations = propagate_s_activations(
+                s_entities=self.s_entities,
+                p_entities=self.p_entities,
+                alpha_p_to_s=self.alpha_p_to_s,
+                s_threshold=self.s_threshold,
+                s_sparsity_target=self.s_sparsity_target,
+                s_min_active=self.s_min_active,
+                s_max_active=self.s_max_active,
+                s_background_noise_sigma=self.s_background_noise_sigma,
+                rng=self.s_rng,
+            )
+            for s_id, new_act in new_s_activations.items():
+                self.s_entities[s_id].activation = new_act
+
+        self._update_s_plasticity()
+        dissolved_s_ids = self._dissolve_unviable_s()
+
+        if dissolved_p_ids:
+            self.s_pass_tracker.cleanup_dissolved_p(dissolved_p_ids)
+        if dissolved_s_ids:
+            self.s_pass_tracker.cleanup_dissolved_s(dissolved_s_ids)
 
         self.system_age += 1.0
         self.step_count += 1
@@ -362,7 +484,7 @@ class Substrate:
         )
         self._next_p_id += 1
 
-    def _decay_and_dissolve_p(self) -> None:
+    def _decay_and_dissolve_p(self) -> List[int]:
         """Hebb-like growth + age-modulated decay on every P; dissolve
         those whose weight falls below the viability threshold.
 
@@ -371,6 +493,10 @@ class Substrate:
         on the N edges. Phase 2a doesn't use ``p.weight`` for anything
         downstream, but the dynamics are wired now so Phase 2b can
         gate P-P propagation on weight.
+
+        Returns the list of dissolved P ids so Phase 6i's S-level
+        bookkeeping can clean up dependent entries (S contents membership
+        + s_pass_tracker pair/p_to_s candidacy).
         """
         # Age factor mirrors :func:`age_modulated_decay` on N edges.
         age_factor = 1.0 / (1.0 + math.log(1.0 + self.system_age))
@@ -393,7 +519,77 @@ class Substrate:
             # Phase 2b: cleanup every P-P connection touching this id
             # so the dynamic connectivity doesn't leak references.
             self.p_connectivity.remove_entity(p_id)
+            # Phase 6i: also remove this P from any S that contains it.
+            for s in self.s_entities.values():
+                s.remove_member(p_id)
             del self.p_entities[p_id]
+        # Return the dissolved id list so the substrate's S-level
+        # cleanup pass can prune dependent tracker entries.
+        return to_dissolve
+
+    # ---------- Phase 6i S-level helpers ----------
+
+    def _emerge_s(self, p_a: int, p_b: int) -> None:
+        """Create a fresh SEntity from a co-active P pair."""
+        contents = {int(p_a), int(p_b)}
+        # Derive initial activation as mean of the two seeding P entities.
+        seed_act_sum = 0.0
+        seed_n = 0
+        for p_id in contents:
+            if p_id in self.p_entities:
+                seed_act_sum += float(self.p_entities[p_id].activation)
+                seed_n += 1
+        seed_activation = seed_act_sum / seed_n if seed_n > 0 else 0.0
+
+        s = SEntity(
+            id=self._next_s_id,
+            contents=contents,
+            activation=float(seed_activation),
+            weight=1.0,
+            age_at_emergence=self.system_age,
+        )
+        self.s_entities[self._next_s_id] = s
+        canonical = (min(int(p_a), int(p_b)), max(int(p_a), int(p_b)))
+        self.s_pairs_emerged.add(canonical)
+        self.s_emergence_history.append(
+            {
+                "step": self.step_count,
+                "s_id": s.id,
+                "seed_pair": canonical,
+                "system_age": self.system_age,
+            }
+        )
+        self._next_s_id += 1
+
+    def _update_s_plasticity(self) -> None:
+        """Hebbian-like growth (eta_s · ρ · activation²) + age-modulated
+        decay (ρ · λ_s · weight) on every S weight."""
+        if not self.s_entities:
+            return
+        rho = rho_age(self.system_age, floor=self.rho_floor)
+        for s in self.s_entities.values():
+            growth = self.eta_s * rho * s.activation * s.activation
+            decay = rho * self.lambda_s_decay * s.weight
+            s.weight = max(0.0, s.weight + growth - decay)
+
+    def _dissolve_unviable_s(self) -> List[int]:
+        """Dissolve S whose weight has dropped below the viability
+        threshold. Also dissolves S with empty contents (e.g. when all
+        their member P were dissolved). Returns dissolved S ids."""
+        to_dissolve: List[int] = []
+        for s_id, s in self.s_entities.items():
+            if s.weight < self.s_viability_threshold or not s.contents:
+                to_dissolve.append(s_id)
+        for s_id in to_dissolve:
+            s = self.s_entities[s_id]
+            # Remove every pair-permutation among its contents from the
+            # emerged-pairs set so the same seed pair can re-emerge later.
+            contents_list = sorted(int(x) for x in s.contents)
+            for i, a in enumerate(contents_list):
+                for b in contents_list[i + 1:]:
+                    self.s_pairs_emerged.discard((a, b))
+            del self.s_entities[s_id]
+        return to_dissolve
 
     # ---------- diagnostics ----------
 
@@ -421,3 +617,14 @@ class Substrate:
             return 0.0
         active = sum(1 for p in self.p_entities.values() if p.activation > 0.0)
         return active / len(self.p_entities)
+
+    def s_count(self) -> int:
+        """Number of live S entities at this moment (Phase 6i)."""
+        return len(self.s_entities)
+
+    def s_sparsity(self) -> float:
+        """Fraction of live S entities with activation > 0 right now."""
+        if not self.s_entities:
+            return 0.0
+        active = sum(1 for s in self.s_entities.values() if s.activation > 0.0)
+        return active / len(self.s_entities)
