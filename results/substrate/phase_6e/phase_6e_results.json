@@ -1,0 +1,212 @@
+{
+  "config": {
+    "n_neurons": 500,
+    "M": 5,
+    "pattern_size": 10,
+    "n_rounds": 4,
+    "K_train_per_visit": 20,
+    "K_consolidate_per_round": 1875,
+    "total_train_per_pattern": 80,
+    "total_consolidation": 7500,
+    "rho_floor": 0.3,
+    "schedule": "round-robin: 4 rounds, each round trains each pattern K=20 then consolidates K=1875",
+    "seed": 42
+  },
+  "per_round_history": [
+    {
+      "round": 1,
+      "P_counts": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "recalls": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "bridges": 0,
+      "system_age": 9525.0
+    },
+    {
+      "round": 2,
+      "P_counts": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "recalls": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "bridges": 0,
+      "system_age": 19050.0
+    },
+    {
+      "round": 3,
+      "P_counts": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "recalls": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "bridges": 0,
+      "system_age": 28575.0
+    },
+    {
+      "round": 4,
+      "P_counts": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "recalls": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "bridges": 0,
+      "system_age": 38100.0
+    }
+  ],
+  "final": {
+    "P_counts": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "recalls": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bridges": 0,
+    "n_alive": 0,
+    "n_recall": 0
+  },
+  "baselines": {
+    "5b": {
+      "counts": [
+        0,
+        3,
+        0,
+        4,
+        2
+      ],
+      "recalls": [
+        0.0,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ]
+    },
+    "6a": {
+      "counts": [
+        2,
+        5,
+        1,
+        5,
+        0
+      ],
+      "recalls": [
+        0.4,
+        0.2,
+        0.6,
+        1.0,
+        0.2
+      ]
+    },
+    "6b": {
+      "counts": [
+        2,
+        3,
+        2,
+        4,
+        2
+      ],
+      "recalls": [
+        0.0,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ]
+    },
+    "6c": {
+      "counts": [
+        2,
+        3,
+        2,
+        4,
+        1
+      ],
+      "recalls": [
+        0.4,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ]
+    },
+    "6d": {
+      "counts": [
+        2,
+        3,
+        2,
+        4,
+        2
+      ],
+      "recalls": [
+        0.0,
+        0.2,
+        0.4,
+        0.8,
+        0.8
+      ]
+    }
+  },
+  "n_alive_by_phase": {
+    "5b": 3,
+    "6a": 3,
+    "6b": 5,
+    "6c": 4,
+    "6d": 5,
+    "6e": 0
+  },
+  "n_recall_by_phase": {
+    "5b": 3,
+    "6a": 3,
+    "6b": 3,
+    "6c": 4,
+    "6d": 3,
+    "6e": 0
+  },
+  "verdict": "MIXED",
+  "reason": "0 alive / 0 recall \u2014 outside clean verdict buckets. See per-round history for trajectory."
+}
